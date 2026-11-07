@@ -437,10 +437,22 @@ class MainWindow(QMainWindow):
         self.make_mesh(reset_camera=True)
 
     def make_mesh(self, reset_camera=False):
+        """gmsh はスレッドセーフでなく、macOS では別スレッドで動かすと落ちるため、メインスレッドで実行"""
         self.project.mesh_size = self.mesh_size.value()
         self.project.mesh_order = self.mesh_order.currentData()
-        self.start("メッシュを作成しています…", build_mesh, lambda m: self.on_mesh(m, reset_camera),
-                   self.project.geometry, self.project.mesh_size, self.project.mesh_order)
+        self.busy(True, "メッシュを作成しています…")
+        QApplication.processEvents()
+        try:
+            mesh = build_mesh(self.project.geometry, self.project.mesh_size, self.project.mesh_order,
+                              log=lambda m: (self.log(str(m)), QApplication.processEvents()))
+        except (GeometryError, ValueError, RuntimeError) as e:
+            self.on_failed(str(e))
+            return
+        except Exception:
+            self.on_failed(traceback.format_exc())
+            return
+        self.busy(False)
+        self.on_mesh(mesh, reset_camera)
 
     def on_mesh(self, mesh, reset_camera=False):
         self.mesh = mesh
@@ -976,7 +988,21 @@ def _labels(pl, pts, texts, size, color, point_colors=None):
         pl.add_point_labels(pts, texts, **kw)
 
 
+def _setup_crash_log():
+    """異常終了したときの原因を logs/crash.log に残す"""
+    import faulthandler
+    import datetime
+    d = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "logs")
+    os.makedirs(d, exist_ok=True)
+    f = open(os.path.join(d, "crash.log"), "a", buffering=1)
+    f.write(f"\n=== 起動 {datetime.datetime.now():%Y-%m-%d %H:%M:%S}  Python {sys.version.split()[0]} ===\n")
+    faulthandler.enable(file=f, all_threads=True)
+    return f
+
+
 def main():
+    os.environ.setdefault("QT_MAC_WANTS_LAYER", "1")
+    _crash = _setup_crash_log()  # noqa: F841
     try:
         pv.global_theme.allow_empty_mesh = True
     except Exception:

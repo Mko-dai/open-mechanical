@@ -6,3 +6,4 @@ results/
 *.vtu
 *.egg-info/
 .DS_Store
+logs/
