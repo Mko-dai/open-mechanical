@@ -102,36 +102,53 @@ def _D_of(D, elem_mat, sl):
     return D[elem_mat[sl]]
 
 
+def _element_K(X, De, dN, wts):
+    """要素剛性 (E, 3nn, 3nn) = Σ w detJ Bᵀ D B"""
+    Ke = None
+    for g, w in enumerate(wts):
+        dNdx, detJ = _dN_dx(X, dN[g])
+        if np.any(detJ <= 0):
+            raise ValueError("つぶれた（体積が0以下の）要素があります。メッシュを見直してください。")
+        B = _B_matrix(dNdx)
+        BtD = np.matmul(B.transpose(0, 2, 1), De)            # (E,3nn,6)
+        k = np.matmul(BtD * (w * detJ)[:, None, None], B)    # (E,3nn,3nn)
+        Ke = k if Ke is None else Ke + k
+    return Ke
+
+
 def assemble_stiffness(mesh: Mesh, D: np.ndarray, chunk: int = 20000,
                        progress=None, elem_mat=None) -> sp.csr_matrix:
+    """全体剛性マトリクス。要素をブロックに分けて並列（使用コア数）で計算する。"""
+    from .parallel import chunks, pmap
     nn = mesh.elems.shape[1]
     ndof = 3 * mesh.n_nodes
     pts, wts = _quadrature(nn)
     dN = [shape_dN_dxi(L, nn) for L in pts]
-    K = sp.csr_matrix((ndof, ndof))
     ne = mesh.n_elems
-    loc = np.arange(3 * nn)
-    ii, jj = np.meshgrid(loc, loc, indexing="ij")
-    for s in range(0, ne, chunk):
-        el = mesh.elems[s:s + chunk]
-        X = mesh.nodes[el]
-        Ke = np.zeros((len(el), 3 * nn, 3 * nn))
-        De = _D_of(D, elem_mat, slice(s, s + chunk))
-        for g, w in enumerate(wts):
-            dNdx, detJ = _dN_dx(X, dN[g])
-            if np.any(detJ <= 0):
-                raise ValueError("つぶれた（体積が0以下の）要素があります。メッシュを見直してください。")
-            B = _B_matrix(dNdx)
-            if De.ndim == 2:
-                Ke += np.einsum("e,eki,kl,elj->eij", w * detJ, B, De, B, optimize=True)
-            else:
-                Ke += np.einsum("e,eki,ekl,elj->eij", w * detJ, B, De, B, optimize=True)
-        dofs = (3 * el[:, :, None] + np.arange(3)).reshape(len(el), -1)
-        rows = dofs[:, ii].ravel()
-        cols = dofs[:, jj].ravel()
-        K = K + sp.csr_matrix((Ke.ravel(), (rows, cols)), shape=(ndof, ndof))
+    nloc = 3 * nn
+    blocks = chunks(ne, min_size=1000)
+    # ブロックが大きすぎるとメモリを使うので分割
+    blocks = [(a + i, min(b, a + i + chunk)) for a, b in blocks for i in range(0, b - a, chunk)]
+    data = np.empty(ne * nloc * nloc)
+    done = [0]
+
+    def work(ab):
+        a, b = ab
+        el = mesh.elems[a:b]
+        De = _D_of(D, elem_mat, slice(a, b))
+        if De.ndim == 2:
+            De = np.broadcast_to(De, (b - a, 6, 6))
+        data[a * nloc * nloc:b * nloc * nloc] = _element_K(mesh.nodes[el], De, dN, wts).ravel()
+        done[0] += b - a
         if progress:
-            progress(min(1.0, (s + chunk) / ne))
+            progress(min(1.0, done[0] / ne))
+
+    pmap(work, blocks)
+    dofs = (3 * mesh.elems[:, :, None] + np.arange(3)).reshape(ne, nloc).astype(np.int32)
+    rows = np.repeat(dofs, nloc, axis=1).ravel()
+    cols = np.tile(dofs, (1, nloc)).ravel()
+    K = sp.coo_matrix((data, (rows, cols)), shape=(ndof, ndof)).tocsr()
+    K.sum_duplicates()
     return K
 
 
@@ -373,33 +390,45 @@ class Result:
 
 
 def nodal_stress(mesh: Mesh, u: np.ndarray, D: np.ndarray, chunk: int = 50000, elem_mat=None):
-    """各要素の節点位置で応力を評価し、節点で平均化する。"""
+    """各要素の節点位置で応力を評価し、節点で平均化する（Ansys の節点平均と同じ）。"""
+    from .parallel import chunks, pmap
     nn = mesh.elems.shape[1]
     Lnodes = NODE_L10 if nn == 10 else NODE_L4
-    acc_s = np.zeros((mesh.n_nodes, 6))
-    acc_e = np.zeros((mesh.n_nodes, 6))
-    cnt = np.zeros(mesh.n_nodes)
+    dNa = [shape_dN_dxi(Lnodes[a], nn) for a in range(nn)]
     U = u.reshape(-1, 3)
-    for s in range(0, mesh.n_elems, chunk):
-        el = mesh.elems[s:s + chunk]
+    ne = mesh.n_elems
+    eps_all = np.empty((ne, nn, 6))
+    sig_all = np.empty((ne, nn, 6))
+
+    def work(ab):
+        a0, b0 = ab
+        el = mesh.elems[a0:b0]
         X = mesh.nodes[el]
         ue = U[el].reshape(len(el), -1)
+        De = _D_of(D, elem_mat, slice(a0, b0))
         for a in range(nn):
-            dNdx, _ = _dN_dx(X, shape_dN_dxi(Lnodes[a], nn))
-            B = _B_matrix(dNdx)
-            eps = np.einsum("eij,ej->ei", B, ue)
-            De = _D_of(D, elem_mat, slice(s, s + chunk))
-            sig = eps @ De.T if De.ndim == 2 else np.einsum("eij,ej->ei", De, eps)
-            np.add.at(acc_e, el[:, a], eps)
-            np.add.at(acc_s, el[:, a], sig)
-            np.add.at(cnt, el[:, a], 1)
-    cnt = np.maximum(cnt, 1)[:, None]
+            dNdx, _ = _dN_dx(X, dNa[a])
+            eps = np.einsum("eij,ej->ei", _B_matrix(dNdx), ue)
+            eps_all[a0:b0, a] = eps
+            sig_all[a0:b0, a] = eps @ De.T if De.ndim == 2 else np.einsum("eij,ej->ei", De, eps)
+
+    pmap(work, chunks(ne, min_size=2000))
+    idx = mesh.elems.ravel()
+    cnt = np.maximum(np.bincount(idx, minlength=mesh.n_nodes), 1)[:, None]
+    acc_s = np.column_stack([np.bincount(idx, sig_all[..., k].ravel(), mesh.n_nodes) for k in range(6)])
+    acc_e = np.column_stack([np.bincount(idx, eps_all[..., k].ravel(), mesh.n_nodes) for k in range(6)])
     return acc_s / cnt, acc_e / cnt
 
 
 def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=print,
-          method: str = "auto", elem_materials=None) -> Result:
-    """線形静解析を実行する。progress(0..1, メッセージ) を渡すと進捗を通知。"""
+          method: str = "auto", elem_materials=None, n_cores: int | None = None) -> Result:
+    """線形静解析を実行する。progress(0..1, メッセージ) を渡すと進捗を通知。
+
+    n_cores: 使用コア数（None = 現在の設定, 0 = すべて）
+    """
+    from .parallel import get_threads, set_threads
+    if n_cores is not None:
+        set_threads(n_cores)
     t0 = time.time()
 
     def prog(x, msg):
@@ -458,6 +487,7 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
     prog(1.0, "完了")
     info = {"自由度数": int(free.sum()), "節点数": mesh.n_nodes, "要素数": mesh.n_elems,
             "要素タイプ": "Tet10（2次）" if mesh.order == 2 else "Tet4（1次）",
+            "使用コア数": get_threads(), "ソルバー": choose_method(int(free.sum()), method),
             "組立時間 [s]": round(t_asm, 2), "求解時間 [s]": round(t_sol, 2),
             "合計時間 [s]": round(time.time() - t0, 2), "相対残差": float(res)}
     return Result(mesh, material, u.reshape(-1, 3), stress, strain, reactions, info, mats, elem_mat)
@@ -470,56 +500,151 @@ def _cg(A, b, M, tol=1e-10, maxiter=5000):
         return spla.cg(A, b, M=M, tol=tol, maxiter=maxiter)
 
 
+def _pcg(A, b, M, tol=1e-10, maxiter=3000):
+    """前処理付き共役勾配法（行列×ベクトル積を使用コア数で並列化）"""
+    from .parallel import ParallelMatvec
+    mv = ParallelMatvec(A)
+    nb = np.linalg.norm(b)
+    if nb == 0:
+        return np.zeros_like(b), 0, 0
+    x = np.zeros_like(b)
+    r = b.copy()
+    z = M(r)
+    p = z.copy()
+    rz = r @ z
+    for it in range(1, maxiter + 1):
+        Ap = mv(p)
+        alpha = rz / (p @ Ap)
+        x += alpha * p
+        r -= alpha * Ap
+        if np.linalg.norm(r) < tol * nb:
+            return x, 0, it
+        z = M(r)
+        rz_new = r @ z
+        p *= rz_new / rz
+        p += z
+        rz = rz_new
+    return x, 1, maxiter
+
+
 def _rel_res(A, x, b):
     return np.linalg.norm(A @ x - b) / max(np.linalg.norm(b), 1e-300)
 
 
+def _rigid_modes(coords, n):
+    """剛体モード（並進3＋回転3）。AMG の収束を大幅に速くする"""
+    x, comp = coords[:, :3], coords[:, 3].astype(int)
+    x = x - x.mean(axis=0)
+    B = np.zeros((n, 6))
+    B[np.arange(n), comp] = 1.0
+    for k, (a, c) in enumerate([(1, 2), (2, 0), (0, 1)]):
+        B[comp == a, 3 + k] = -x[comp == a, c]
+        B[comp == c, 3 + k] = x[comp == c, a]
+    return B
+
+
+def _direct_backend():
+    """利用できる高速な直接法（スパースコレスキー）"""
+    try:
+        import pypardiso  # noqa: F401
+        return "pardiso"
+    except ImportError:
+        pass
+    try:
+        from sksparse.cholmod import cholesky  # noqa: F401
+        return "cholmod"
+    except ImportError:
+        pass
+    try:
+        import cholespy  # noqa: F401
+        return "cholespy"
+    except ImportError:
+        pass
+    return "superlu"
+
+
+def _amg_available():
+    try:
+        import pyamg  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+# 自動選択のしきい値（自由度）: これより大きいと反復法（AMG-CG）。Mac での実測で決定
+AUTO_ITERATIVE_DOF = {"pardiso": 400_000, "cholmod": 400_000, "cholespy": 150_000, "superlu": 15_000}
+
+
+def choose_method(n: int, method: str = "auto") -> str:
+    method = {"scipy": "direct", "direct": "direct", None: "auto"}.get(method, method)
+    if method in ("pardiso", "cholmod", "cholespy", "superlu", "amg"):
+        return method
+    d = _direct_backend()
+    if method == "direct":
+        return d
+    if n > AUTO_ITERATIVE_DOF[d] and _amg_available():
+        return "amg"
+    return d
+
+
 def _linear_solve(A: sp.csc_matrix, b: np.ndarray, log=print, coords=None,
                   method: str = "auto") -> np.ndarray:
-    """利用できる最速のソルバーを自動で選ぶ。
+    """連立方程式 A x = b（A は対称正定値）を解く。
 
-    優先順: PARDISO (pypardiso) → CHOLMOD (scikit-sparse) → AMG-CG (pyamg, 大規模時)
-            → SciPy SuperLU（RCM 並べ替え＋対称モード）
-    coords: 自由度ごとの (x,y,z, 成分) 情報（AMG の剛体モード用, (n,4)）
+    method: "auto"（自由度と利用できるライブラリから自動選択）/ "direct"（直接法）/ "amg"（反復法）
+            または "pardiso" / "cholmod" / "cholespy" / "superlu"
+    直接法: PARDISO (Intel MKL) → CHOLMOD (scikit-sparse / cholespy) → SciPy SuperLU
+    反復法: AMG 前処理付き共役勾配法（相対残差 1e-10 まで → 直接法と同じ精度）
     """
     n = A.shape[0]
-    if method in ("auto", "pardiso"):
-        try:
-            import pypardiso  # Intel MKL（Intel Mac / Windows / Linux）
-            log("ソルバー: PARDISO")
-            return pypardiso.spsolve(A.tocsr(), b)
-        except ImportError:
-            pass
-    if method in ("auto", "cholmod"):
-        try:
-            from sksparse.cholmod import cholesky  # SuiteSparse（Apple Silicon でも高速）
-            log("ソルバー: CHOLMOD")
-            return cholesky(A)(b)
-        except ImportError:
-            pass
-        except Exception as e:  # 正定値でない＝拘束不足
-            log(f"CHOLMOD 失敗: {e}")
-            return np.full(n, np.nan)
-    if method in ("auto", "amg") and (n > 30_000 or method == "amg"):
+    m = choose_method(n, method)
+    if m == "amg":
         try:
             import pyamg
-            log("ソルバー: AMG前処理付き共役勾配法 (pyamg)")
-            B = None
-            if coords is not None:
-                # 剛体モード（並進3＋回転3）を与えると収束が大幅に速くなる
-                x, comp = coords[:, :3], coords[:, 3].astype(int)
-                B = np.zeros((n, 6))
-                B[np.arange(n), comp] = 1.0
-                rot = [(1, 2), (2, 0), (0, 1)]  # 回転軸まわりの (a,b) 成分
-                for k, (a, c) in enumerate(rot):
-                    B[comp == a, 3 + k] = -x[comp == a, c]
-                    B[comp == c, 3 + k] = x[comp == c, a]
+            log("ソルバー: 反復法（AMG 前処理付き共役勾配法）")
+            B = _rigid_modes(coords, n) if coords is not None else None
             ml = pyamg.smoothed_aggregation_solver(A.tocsr(), B=B, symmetry="hermitian",
-                                                   strength="symmetric", max_coarse=500)
-            xsol, info = _cg(A, b, ml.aspreconditioner(cycle="V"), tol=1e-10, maxiter=2000)
-            if info == 0 and _rel_res(A, xsol, b) < 1e-6:
+                                                   strength="symmetric", max_coarse=1000)
+            xsol, info, it = _pcg(A.tocsr(), b, ml.aspreconditioner(cycle="V"), tol=1e-10)
+            if info == 0 and _rel_res(A, xsol, b) < 1e-8:
+                log(f"  反復回数 {it}")
                 return xsol
-            log("AMG が収束しなかったため直接法に切り替えます")
+            log("反復法が収束しなかったため直接法に切り替えます")
+        except ImportError:
+            pass
+        m = _direct_backend()
+    if m == "pardiso":
+        try:
+            import pypardiso
+            log("ソルバー: 直接法（PARDISO）")
+            return pypardiso.spsolve(A.tocsr(), b)
+        except ImportError:
+            m = "cholmod"
+    if m == "cholmod":
+        try:
+            from sksparse.cholmod import cholesky
+            log("ソルバー: 直接法（CHOLMOD）")
+            try:
+                return cholesky(A.tocsc())(b)
+            except Exception as e:  # 正定値でない＝拘束不足
+                log(f"CHOLMOD 失敗: {e}")
+                return np.full(n, np.nan)
+        except ImportError:
+            m = "cholespy"
+    if m == "cholespy":
+        try:
+            from cholespy import CholeskySolverD, MatrixType
+            log("ソルバー: 直接法（CHOLMOD / cholespy）")
+            C = A.tocoo()
+            try:
+                solver = CholeskySolverD(n, C.row.astype(np.int32), C.col.astype(np.int32),
+                                         C.data.astype(np.float64), MatrixType.COO)
+                x = np.zeros(n)
+                solver.solve(np.ascontiguousarray(b, dtype=np.float64), x)
+                return x
+            except Exception as e:
+                log(f"cholespy 失敗: {e}")
+                return np.full(n, np.nan)
         except ImportError:
             pass
     # SciPy 直接法（RCM で帯幅を減らし、対称モードで分解）

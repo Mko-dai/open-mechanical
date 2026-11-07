@@ -8,5 +8,9 @@ $PY -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
+while read -r pkg; do
+  [ -z "$pkg" ] || [ "${pkg:0:1}" = "#" ] && continue
+  pip install "$pkg" || echo "（$pkg は省略）"
+done < requirements-fast.txt
 echo ""
 echo "セットアップ完了。 ./run.sh で起動できます。"

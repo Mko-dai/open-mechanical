@@ -35,6 +35,18 @@ class Project:
     contacts: list = field(default_factory=list)        # ContactRegion（接続 → 接触）
     contact_tolerance: float = 0.0                      # 自動検出の許容距離（0 = 自動）
     settings: AnalysisSettings = field(default_factory=AnalysisSettings)
+    # 節点共有（Ansys のトポロジ共有）: "none" = しない / "all" = 接するボディすべて / "parts" = パートごと
+    share_topology: str = "none"
+    parts: list = field(default_factory=list)           # [{"name": 名, "bodies": [ボディ番号...]}]
+
+    def share_map(self) -> dict:
+        """{ボディ番号: パート番号}（節点を共有するボディのグループ）"""
+        if self.share_topology == "all":
+            return {"*": 0}
+        if self.share_topology == "parts":
+            return {int(b): i for i, p in enumerate(self.parts) for b in p.get("bodies", [])
+                    if len(p.get("bodies", [])) > 1}
+        return {}
 
     # ------------------------------------------------------------- ボディ属性・材料
     def assignment(self, body: int) -> dict:
@@ -103,7 +115,8 @@ class Project:
                 "materials": {k: m.to_dict() for k, m in self.materials.items()},
                 "body_attrs": self.body_attrs, "body_assign": self.body_assign,
                 "contacts": [c.to_dict() for c in self.contacts], "contact_tolerance": self.contact_tolerance,
-                "settings": self.settings.to_dict()}
+                "settings": self.settings.to_dict(),
+                "share_topology": self.share_topology, "parts": self.parts}
 
     @staticmethod
     def from_dict(d) -> "Project":
@@ -121,7 +134,8 @@ class Project:
                        body_assign=d.get("body_assign", {}),
                        contacts=[ContactRegion.from_dict(c) for c in d.get("contacts", [])],
                        contact_tolerance=d.get("contact_tolerance", 0.0),
-                       settings=AnalysisSettings.from_dict(d.get("settings", {})))
+                       settings=AnalysisSettings.from_dict(d.get("settings", {})),
+                       share_topology=d.get("share_topology", "none"), parts=d.get("parts", []))
 
     def save(self, path):
         with open(path, "w", encoding="utf-8") as f:
@@ -134,7 +148,7 @@ class Project:
 
     def mesh(self, log=print):
         return build_mesh(self.geometry, self.mesh_size, self.mesh_order, log=log,
-                          local_sizes=self.local_sizes)
+                          local_sizes=self.local_sizes, share=self.share_map())
 
     def needs_nonlinear_solver(self, mesh) -> bool:
         s = self.settings
@@ -151,7 +165,7 @@ class Project:
         em = self.elem_materials(mesh)
         if not self.needs_nonlinear_solver(mesh):
             return [solve(mesh, self.material, self.bcs, progress=progress, log=log, elem_materials=em,
-                          method=self.settings.solver_type)]
+                          method=self.settings.solver_type, n_cores=self.settings.n_cores)]
         if not self.contacts and mesh.elem_body is not None and len(mesh.body_ids()) > 1:
             from .contact import detect_contacts
             self.contacts = detect_contacts(mesh, self.contact_tolerance)

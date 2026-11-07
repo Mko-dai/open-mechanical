@@ -36,7 +36,8 @@ class AnalysisSettings:
     min_substeps: int = 1
     max_substeps: int = 10
     # ソルバー制御
-    solver_type: str = "auto"             # auto / scipy（直接法）/ amg（反復法）
+    solver_type: str = "auto"             # auto / direct（直接法）/ amg（反復法）
+    n_cores: int = 0                      # 使用コア数（0 = すべて）
     weak_springs: bool = False
     large_deflection: bool = False
     # 非線形制御
@@ -245,7 +246,10 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
         diagK = (K_lin.diagonal() if K_lin is not None else assemble_stiffness(mesh, D, elem_mat=elem_mat).diagonal())
         k_weak = 1e-8 * float(np.mean(np.abs(diagK)))
     W = sp.identity(ndof, format="csr") * k_weak if k_weak > 0 else None
-    method = settings.solver_type
+    from .parallel import set_threads
+    set_threads(settings.n_cores)
+    # 接触の剛性で条件が悪くなるため、非線形では既定で直接法
+    method = "direct" if settings.solver_type == "auto" else settings.solver_type
 
     def internal(u):
         if LD:

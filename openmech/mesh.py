@@ -99,13 +99,26 @@ class Mesh:
         new.body_names = self.body_names
         return new
 
-    def split_body_interfaces(self) -> "Mesh":
+    def split_body_interfaces(self, share: dict | None = None) -> "Mesh":
         """ボディ同士で共有している節点を複製し、ボディごとに独立したメッシュにする。
 
         Ansys と同じく、ボディ間のつながりは「接触（結合を含む）」で与えるため。
         複製した節点は同じ座標なので、接触面は節点どうしがぴったり向かい合います。
+
+        share: {ボディ番号: パート番号}。同じパートのボディ同士は節点を共有したまま
+               （Ansys の「トポロジ共有」、Femtet の節点共有）。接触は作られません。
         """
-        if self.elem_body is None or len(np.unique(self.elem_body)) <= 1:
+        share = share or {}
+        if self.elem_body is not None:
+            # パート単位で分割する（パートに属さないボディはそれぞれ単独）
+            ub = np.unique(self.elem_body)
+            gid = {}
+            for b in ub.tolist():
+                g = share.get("*", share.get(int(b)))
+                gid[b] = ("p", g) if g is not None else ("b", b)
+            keys = {k: i for i, k in enumerate(sorted(set(gid.values()), key=str))}
+            group = np.array([keys[gid[b]] for b in self.elem_body.tolist()]) if len(self.elem_body) else None
+        if self.elem_body is None or len(np.unique(group)) <= 1:
             out = self
             out.node_origin = np.arange(self.n_nodes)
             return out
@@ -114,8 +127,8 @@ class Mesh:
         origin = [np.arange(self.n_nodes)]
         elems = self.elems.copy()
         nxt = self.n_nodes
-        for b in np.unique(self.elem_body):
-            em = self.elem_body == b
+        for b in np.unique(group):
+            em = group == b
             nb = np.unique(self.elems[em])
             taken = owner[nb] >= 0
             owner[nb[~taken]] = b

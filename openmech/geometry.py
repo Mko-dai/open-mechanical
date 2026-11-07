@@ -391,7 +391,7 @@ def _reorder_tet10(nodes: np.ndarray, el: np.ndarray) -> np.ndarray:
     return np.hstack([el[:, :4], np.take_along_axis(el[:, 4:], pick, axis=1)])
 
 
-def _extract_mesh(gmsh) -> Mesh:
+def _extract_mesh(gmsh, share: dict | None = None) -> Mesh:
     tags, coords, _ = gmsh.model.mesh.getNodes()
     coords = coords.reshape(-1, 3)
     tag2idx = np.full(int(tags.max()) + 1, -1, dtype=np.int64)
@@ -424,7 +424,7 @@ def _extract_mesh(gmsh) -> Mesh:
     mesh = Mesh(nodes, elems)
     mesh.elem_body = elem_body
     # ボディ同士の境界の節点を分ける（つながりは接触で与える）
-    mesh = mesh.split_body_interfaces()
+    mesh = mesh.split_body_interfaces(share)
 
     # CAD のサーフェスを「面」として割り当てる
     surfs = sorted(gmsh.model.getEntities(2), key=lambda e: e[1])
@@ -490,7 +490,7 @@ def _apply_local_sizes(gmsh, h, local_sizes):
 
 
 def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 12,
-               log=print, local_sizes: list | None = None) -> Mesh:
+               log=print, local_sizes: list | None = None, share: dict | None = None) -> Mesh:
     """形状 spec からメッシュを作る。
 
     spec 例: {"kind": "box", "lx": 100, "ly": 20, "lz": 10}
@@ -547,7 +547,7 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
         if order == 2:
             gmsh.option.setNumber("Mesh.SecondOrderLinear", 0)  # 曲面に沿わせる
             gmsh.model.mesh.setOrder(2)
-        mesh = _extract_mesh(gmsh)
+        mesh = _extract_mesh(gmsh, share)
         if np.any(mesh.element_volumes() <= 0):
             raise GeometryError("不正な要素ができました。要素サイズを小さくして再試行してください。")
         log(f"メッシュ完了: 節点 {mesh.n_nodes:,} / 要素 {mesh.n_elems:,} / 面 {mesh.n_faces}")
