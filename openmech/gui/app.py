@@ -680,6 +680,7 @@ class MainWindow(QMainWindow):
             self.bc_name.setEditText(name)
         self._fill_attr_combos()
         self.invalidate()
+        self.build_details()
         self.refresh_view()
 
     def edit_attr(self):
@@ -1079,7 +1080,7 @@ class MainWindow(QMainWindow):
         if g.get("kind") == "model":
             n = len(g.get("features", []))
             self._row(s, "フィーチャー数", n)
-            self._row(s, "", "リボンの「モデリング」タブで形状を追加します" if n == 0
+            self._row(s, "", "リボンの［モデル］タブの「作成」で形状を作ります" if n == 0
                       else "ツリーのフィーチャーを選ぶと寸法を編集できます")
         elif g.get("kind") == "file":
             self._row(s, "ファイル", os.path.basename(g.get("path", "")))
@@ -1999,9 +2000,10 @@ class MainWindow(QMainWindow):
             pl.add_mesh(pv.Arrow(start=(0, 0, 0), direction=d, scale=60, tip_length=0.15, shaft_radius=0.01,
                                  tip_radius=0.03), color=col, pickable=False)
         _labels(pl, [(66, 0, 0), (0, 66, 0), (0, 0, 66)], ["X", "Y", "Z"], 14, "black")
-        self._set_overlay("<b>新しいモデル</b><br>リボンの「モデリング」タブから<br>"
-                          "直方体・円柱などを追加して形を作ります。<br>"
-                          "穴は「切り取り」→「穴」。CAD は「STEP 取込」")
+        self._set_overlay("<b>新しいモデル</b><br>リボンの［モデル］タブの「作成」から<br>"
+                          "直方体・円柱などを作ります（それぞれ別のボディになります）。<br>"
+                          "ボディを選んで ボディ属性名・材料名 を入力し［設定］。<br>"
+                          "面を選んで 境界条件名 を入力し［設定］。")
         pl.view_isometric()
         pl.reset_camera()
         pl.render()
