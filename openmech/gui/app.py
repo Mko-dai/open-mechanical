@@ -2457,7 +2457,20 @@ class MainWindow(QMainWindow):
         poly.cell_data["rgb"] = (rgb * 255).astype(np.uint8)
         self._main_actor = pl.add_mesh(poly, scalars="rgb", rgb=True, show_edges=show_mesh,
                                        edge_color="#303030", line_width=0.6, show_scalar_bar=False,
-                                       smooth_shading=False, ambient=0.25, diffuse=0.8)
+                                       smooth_shading=False, ambient=0.25, diffuse=0.8,
+                                       opacity=0.3 if k in ("connections", "contacts", "contact") else 1.0)
+        if k in ("connections", "contacts", "contact"):
+            # 接触面は部品の内側にあることが多いので、他を半透明にして接触面だけ不透明で描く
+            hl = np.zeros(len(src), bool)
+            for c in self.project.contacts:
+                if not c.suppressed:
+                    hl |= np.isin(fid, c.contact_faces) | np.isin(fid, c.target_faces)
+            hl |= np.isin(fid, self.selected_faces)
+            if hl.any():
+                fc = np.asarray(poly.faces).reshape(-1, 4)[:, 1:]
+                sub = pv.PolyData(poly.points, faces=np.c_[np.full(hl.sum(), 3), fc[hl]].ravel())
+                sub.cell_data["rgb"] = (rgb[hl] * 255).astype(np.uint8)
+                pl.add_mesh(sub, scalars="rgb", rgb=True, pickable=False, show_scalar_bar=False)
         fe = feature_edges(mesh)
         if fe is not None:
             pl.add_mesh(fe, color="black", line_width=1.5, pickable=False)
@@ -2563,6 +2576,17 @@ class MainWindow(QMainWindow):
         if key == "接触:接触状態":
             n_colors, vmin, vmax = 4, -0.5, 3.5
         show_el = self.edges_combo.currentIndex() == 2
+        if key.startswith("接触:"):
+            # 接触面だけをコンター表示し、他は半透明（接触面は部品の内側にあるため）
+            fc = np.asarray(poly.faces).reshape(-1, 4)[:, 1:]
+            mask = np.all(np.isfinite(vals[fc]), axis=1)
+            rest = pv.PolyData(poly.points, faces=np.c_[np.full((~mask).sum(), 3), fc[~mask]].ravel())
+            if rest.n_cells:
+                pl.add_mesh(rest, color="#bfc4ca", opacity=0.12, pickable=False, show_scalar_bar=False)
+            sub = pv.PolyData(poly.points, faces=np.c_[np.full(mask.sum(), 3), fc[mask]].ravel())
+            sub.point_data[en] = vals
+            poly = sub
+            self._tri_src = src[mask]
         self._main_actor = pl.add_mesh(
             poly, scalars=en, cmap=cmap, n_colors=n_colors, clim=[vmin, vmax], show_edges=show_el,
             edge_color="#303030", line_width=0.4, smooth_shading=False, nan_color="#d9d9d9",
