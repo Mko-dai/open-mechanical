@@ -197,7 +197,11 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
         elem_mat = np.asarray(elem_mat, dtype=np.int64)
     else:
         mats, elem_mat = [material], np.zeros(mesh.n_elems, dtype=np.int64)
-    D = np.stack([elasticity_matrix(m.E, m.nu) for m in mats])
+    from .solver import material_D, material_eps_th, thermal_load_vector
+    D = np.stack([material_D(m) for m in mats])
+    eps_th_m = np.stack([material_eps_th(m) for m in mats])
+    has_th = bool(np.any(eps_th_m))
+    plastic = any(getattr(m, "plastic", False) for m in mats)
     rho_e = np.array([m.density_t_mm3 for m in mats])[elem_mat]
     ndof = 3 * mesh.n_nodes
 
@@ -205,9 +209,20 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
     per_bc = [build_load_and_constraints(mesh, mats[0], [bc], rho_e=rho_e) for bc in bcs]
     ends = settings.end_times()
 
+    th_bcs = [bc for bc in bcs if bc.kind == "thermal"]
+    F_th = thermal_load_vector(mesh, D, elem_mat, eps_th_m) if (has_th and not plastic) else None
+
+    def th_factor(t):
+        """熱ひずみの倍率（熱条件のステップ倍率。熱条件が無く材料温度だけなら 1 で一定）"""
+        if not th_bcs:
+            return 1.0
+        return _step_factor(th_bcs[0], t, ends)
+
     def loads_at(t):
         F = np.zeros(ndof)
         fixed = {}
+        if F_th is not None:
+            F += th_factor(t) * F_th
         for bc, (Fi, fx) in zip(bcs, per_bc):
             f = _step_factor(bc, t, ends)
             if bc.kind in ("fixed",):
@@ -240,7 +255,16 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
     h_char = float(np.cbrt(np.median(vol) * 6 * np.sqrt(2))) if len(vol) else 1.0
     pen_tol = settings.penetration_tolerance * h_char
 
-    K_lin = None if LD else assemble_stiffness(mesh, D, elem_mat=elem_mat)
+    if plastic and LD:
+        raise ValueError("塑性と大変形の組み合わせにはまだ対応していません。解析設定の「大変形」をオフにしてください。")
+    if LD and has_th:
+        raise ValueError("熱ひずみと大変形の組み合わせにはまだ対応していません。")
+    ps = None
+    if plastic:
+        from .plasticity import PlasticSolid
+        ps = PlasticSolid(mesh, mats, elem_mat, D, eps_th_m)
+        log("塑性材料あり: 弾塑性（ミーゼス）で解きます")
+    K_lin = None if (LD or plastic) else assemble_stiffness(mesh, D, elem_mat=elem_mat)
     k_weak = 0.0
     if settings.weak_springs:
         diagK = (K_lin.diagonal() if K_lin is not None else assemble_stiffness(mesh, D, elem_mat=elem_mat).diagonal())
@@ -251,12 +275,16 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
     # 接触の剛性で条件が悪くなるため、非線形では既定で直接法
     method = "direct" if settings.solver_type == "auto" else settings.solver_type
 
+    cur_t = [0.0]
+
     def internal(u):
         if LD:
             return tl_internal(mesh, D, elem_mat, u)
+        if ps is not None:
+            return ps.internal(u, th_factor(cur_t[0]))
         return K_lin @ u, K_lin
 
-    nonlinear = LD or nonlinear_contact or al
+    nonlinear = LD or nonlinear_contact or al or plastic
     history = []
     results: list[Result] = []
     u = np.zeros(ndof)
@@ -273,22 +301,29 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
     def equilibrium(t, u0):
         """時刻 t の釣り合いを解く。収束しなければ ConvergenceError"""
         u = u0.copy()
+        cur_t[0] = t
         F, fixed = loads_at(t)
         vals = np.array([fixed.get(int(d), 0.0) for d in cdofs])
         u[cdofs] = vals
         max_it = settings.max_iterations if nonlinear else 1
         for it in range(1, max_it + 1):
-            fint, KT = internal(u)
+            # 塑性: 1回目は前の釣り合い位置の接線で、強制変位の増分を全体に広げる（弾性予測子）。
+            # 境界の節点だけを動かして評価すると局所的に大きな塑性ひずみが出てニュートン法が発散するため
+            predictor = ps is not None and it == 1
+            ue = u0 if predictor else u
+            fint, KT = internal(ue)
             if pairs:
-                Kc, fc = contact_system(pairs, contacts, ndof, u)
+                Kc, fc = contact_system(pairs, contacts, ndof, ue)
             else:
                 Kc, fc = None, np.zeros(ndof)
             Kt = KT if Kc is None else (KT + Kc)
             if W is not None:
                 Kt = Kt + W
-            R = F + fc - fint - (Kc @ u if Kc is not None else 0.0)
+            R = F + fc - fint - (Kc @ ue if Kc is not None else 0.0)
             if W is not None:
-                R = R - W @ u
+                R = R - W @ ue
+            if predictor and len(cdofs):
+                R = R - Kt[:, cdofs] @ (vals - u0[cdofs])
             Rf = R[free]
             ref = max(np.linalg.norm(F[free]), np.linalg.norm(R[~free]), 1e-12)
             Kff = Kt[free][:, free].tocsc()
@@ -315,7 +350,7 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
             if not nonlinear:
                 crit = _rel_res(Kff, du_f, Rf)
             else:
-                fint2 = internal(u)[0] if LD else K_lin @ u
+                fint2 = internal(u)[0] if (LD or ps is not None) else K_lin @ u
                 R2 = F - fint2
                 if pairs:
                     Kc2, fc2 = contact_system(pairs, contacts, ndof, u)
@@ -336,7 +371,7 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
             ok_contact = changed <= max(0, int(0.01 * n_cn)) and (not al or pen <= pen_tol)
             if not nonlinear:
                 return u, F
-            if it > 1 or not LD:
+            if it > 1 or not (LD or ps is not None):
                 if ok_force and ok_disp and ok_contact:
                     log(f"  時間 {t:g}: {it} 回で収束（力の残差比 {crit:.2e}、貫通 {pen:.2e} mm）")
                     return u, F
@@ -368,13 +403,18 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
             u, t = u_new, t_next
             if pairs:
                 commit_states(pairs, contacts, u)
+            if ps is not None:
+                ps.internal(u, th_factor(t))
+                ps.commit()
             n_done += 1
             if progress:
                 progress(min(0.95, t / ends[-1]), f"時間 {t:g} / {ends[-1]:g}")
         t_prev = t_end
         if settings.store_results == "all" or si == len(ends) - 1:
+            cur_t[0] = t_end
             results.append(_make_result(mesh, mats, elem_mat, D, u, bcs, per_bc, loads_at(t_end)[0], pairs,
-                                        contacts, LD, internal, t_end, si + 1, settings))
+                                        contacts, LD, internal, t_end, si + 1, settings, ps,
+                                        eps_th_m * th_factor(t_end) if has_th else None))
     info_common = {"自由度数": int(free.sum()), "節点数": mesh.n_nodes, "要素数": mesh.n_elems,
                    "要素タイプ": "Tet10（2次）" if mesh.order == 2 else "Tet4（1次）",
                    "大変形": "オン" if LD else "オフ", "接触領域数": len(contacts),
@@ -386,11 +426,17 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
     return results
 
 
-def _make_result(mesh, mats, elem_mat, D, u, bcs, per_bc, F, pairs, contacts, LD, internal, t, step, settings):
+def _make_result(mesh, mats, elem_mat, D, u, bcs, per_bc, F, pairs, contacts, LD, internal, t, step, settings,
+                 ps=None, eps_th=None):
+    extra = {}
     if LD:
         stress, strain = tl_cauchy_nodal(mesh, u, D, elem_mat)
     else:
-        stress, strain = nodal_stress(mesh, u, D, elem_mat=elem_mat)
+        stress, strain = nodal_stress(mesh, u, D, elem_mat=elem_mat, eps_th_m=eps_th)
+    if ps is not None:
+        internal(u)
+        stress, peeq = ps.nodal()
+        extra["相当塑性ひずみ"] = peeq
     fint, _ = internal(u)
     Rv = fint - F
     if pairs:
@@ -407,5 +453,6 @@ def _make_result(mesh, mats, elem_mat, D, u, bcs, per_bc, F, pairs, contacts, LD
     r = Result(mesh, mats[0], u.reshape(-1, 3).copy(), stress, strain, reactions,
                {"時間 [s]": t, "ステップ": step}, mats, elem_mat)
     r.time = t
+    r.extra = extra
     r.contact = contact_results(pairs, contacts, mesh.n_nodes) if (pairs and settings.calc_contact) else {}
     return r

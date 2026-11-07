@@ -95,6 +95,39 @@ def _quadrature(nn):
 
 # ---------------------------------------------------------------------------- 組み立て
 
+def material_D(m) -> np.ndarray:
+    """材料の剛性マトリクス（温度・向き・異方性を反映した MaterialState なら Dm）"""
+    Dm = getattr(m, "Dm", None)
+    return np.asarray(Dm, float) if Dm is not None else elasticity_matrix(m.E, m.nu)
+
+
+def material_eps_th(m) -> np.ndarray:
+    e = getattr(m, "eps_th", None)
+    return np.zeros(6) if e is None else np.asarray(e, float)
+
+
+def thermal_load_vector(mesh: Mesh, D, elem_mat, eps_th_m):
+    """熱ひずみ ε_th による等価節点力 Σ Bᵀ D ε_th dV（要素ごとの材料番号 elem_mat、材料ごとの eps_th_m (M,6)）"""
+    nn = mesh.elems.shape[1]
+    pts, wts = _quadrature(nn)
+    F = np.zeros(3 * mesh.n_nodes)
+    em = elem_mat if elem_mat is not None else np.zeros(mesh.n_elems, dtype=np.int64)
+    sel = np.nonzero(np.any(eps_th_m[em] != 0, axis=1))[0]
+    if len(sel) == 0:
+        return F
+    el = mesh.elems[sel]
+    X = mesh.nodes[el]
+    De = D if D.ndim == 2 else D[em[sel]]
+    sig = np.einsum("eij,ej->ei", np.broadcast_to(De, (len(sel), 6, 6)), eps_th_m[em[sel]])
+    fe = np.zeros((len(sel), 3 * nn))
+    for g, w in enumerate(wts):
+        dNdx, detJ = _dN_dx(X, shape_dN_dxi(pts[g], nn))
+        fe += np.einsum("e,eki,ek->ei", w * detJ, _B_matrix(dNdx), sig)
+    dofs = (3 * el[:, :, None] + np.arange(3)).reshape(len(sel), -1)
+    np.add.at(F, dofs.ravel(), fe.ravel())
+    return F
+
+
 def _D_of(D, elem_mat, sl):
     """要素ごとの弾性マトリクス。D が (6,6) なら共通、(M,6,6) なら elem_mat で引く"""
     if D.ndim == 2:
@@ -284,6 +317,8 @@ def build_load_and_constraints(mesh: Mesh, material: Material, bcs: list[BC], rh
             f = wi[:, None] * np.cross(omega, r)
             for c in range(3):
                 F[3 * idx + c] += f[:, c]
+        elif bc.kind == "thermal":
+            pass   # 熱条件は材料（温度での物性と熱ひずみ）として扱う
         elif bc.kind == "gravity":
             acc = np.asarray(bc.values, float)
             if rho_e is None:
@@ -374,6 +409,7 @@ class Result:
         sf = self.safety_factor
         if sf is not None:
             out["安全率（降伏基準）"] = sf
+        out.update(getattr(self, "extra", None) or {})
         return out
 
     def summary(self) -> dict:
@@ -397,7 +433,7 @@ class Result:
         return d
 
 
-def nodal_stress(mesh: Mesh, u: np.ndarray, D: np.ndarray, chunk: int = 50000, elem_mat=None):
+def nodal_stress(mesh: Mesh, u: np.ndarray, D: np.ndarray, chunk: int = 50000, elem_mat=None, eps_th_m=None):
     """各要素の節点位置で応力を評価し、節点で平均化する（Ansys の節点平均と同じ）。"""
     from .parallel import chunks, pmap
     nn = mesh.elems.shape[1]
@@ -418,6 +454,8 @@ def nodal_stress(mesh: Mesh, u: np.ndarray, D: np.ndarray, chunk: int = 50000, e
             dNdx, _ = _dN_dx(X, dNa[a])
             eps = np.einsum("eij,ej->ei", _B_matrix(dNdx), ue)
             eps_all[a0:b0, a] = eps
+            if eps_th_m is not None:
+                eps = eps - eps_th_m[elem_mat[a0:b0] if elem_mat is not None else 0]
             sig_all[a0:b0, a] = eps @ De.T if De.ndim == 2 else np.einsum("eij,ej->ei", De, eps)
 
     pmap(work, chunks(ne, min_size=2000))
@@ -450,16 +488,22 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
         # elem_materials = (材料リスト, 要素ごとの番号)  ボディごとに材料が違う場合
         mats, elem_mat = elem_materials
         elem_mat = np.asarray(elem_mat, dtype=np.int64)
-        D = np.stack([elasticity_matrix(m.E, m.nu) for m in mats])
+        D = np.stack([material_D(m) for m in mats])
         rho_e = np.array([m.density_t_mm3 for m in mats])[elem_mat]
         material = mats[0]
     else:
-        D = elasticity_matrix(material.E, material.nu)
+        mats, elem_mat = [material], np.zeros(mesh.n_elems, dtype=np.int64)
+        D = material_D(material)
+    eps_th_m = np.stack([material_eps_th(m) for m in mats])
+    if not np.any(eps_th_m):
+        eps_th_m = None
     prog(0.02, "剛性マトリクスを組み立て中…")
     K = assemble_stiffness(mesh, D, progress=lambda x: prog(0.02 + 0.4 * x, "剛性マトリクスを組み立て中…"),
                            elem_mat=elem_mat)
     t_asm = time.time() - t0
     F, fixed = build_load_and_constraints(mesh, material, bcs, rho_e=rho_e)
+    if eps_th_m is not None:
+        F = F + thermal_load_vector(mesh, D, elem_mat, eps_th_m)
     ndof = K.shape[0]
     cdofs = np.fromiter(fixed.keys(), dtype=np.int64)
     cvals = np.fromiter(fixed.values(), dtype=float)
@@ -485,7 +529,7 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
     u[free] = uf
     t_sol = time.time() - t1
     prog(0.85, "応力を計算中…")
-    stress, strain = nodal_stress(mesh, u, D, elem_mat=elem_mat)
+    stress, strain = nodal_stress(mesh, u, D, elem_mat=elem_mat, eps_th_m=eps_th_m)
     R = K @ u - F
     reactions = {}
     for i, bc in enumerate(bcs):
