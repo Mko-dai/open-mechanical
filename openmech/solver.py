@@ -648,6 +648,8 @@ def _linear_solve(A: sp.csc_matrix, b: np.ndarray, log=print, coords=None,
     反復法: AMG 前処理付き共役勾配法（相対残差 1e-10 まで → 直接法と同じ精度）
     """
     n = A.shape[0]
+    if n == 0:
+        return np.zeros(0)
     m = choose_method(n, method)
     if m == "amg":
         try:

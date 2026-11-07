@@ -111,11 +111,12 @@ class PlasticSolid:
         self.eps_th_m = eps_th_m if eps_th_m is not None else np.zeros((len(mats), 6))
         # 積分点ごとの B・重み（毎回作り直さないよう保存）
         X = mesh.nodes[mesh.elems]
-        self.B, self.wd = [], []
+        self.B, self.wd, self.dNdX = [], [], []
         for g in range(ng):
             dNdx, detJ = _dN_dx(X, self.dN[g])
             self.B.append(_B_matrix(dNdx))
             self.wd.append(self.wts[g] * detJ)
+            self.dNdX.append(dNdx)
         self.ep = np.zeros((ng, E, 6))
         self.alpha = np.zeros((ng, E, 6))
         self.pbar = np.zeros((ng, E))
@@ -127,8 +128,14 @@ class PlasticSolid:
         self.rows = dofs[:, ii].ravel()
         self.cols = dofs[:, jj].ravel()
 
-    def internal(self, u, th_scale=1.0):
-        """内力と接線剛性。th_scale = 熱ひずみの倍率（荷重ステップのランプ）"""
+    def internal(self, u, th_scale=1.0, large=False):
+        """内力と接線剛性。th_scale = 熱ひずみの倍率（荷重ステップのランプ）
+
+        large=True: 大変形（Total Lagrangian）。グリーン・ラグランジュひずみ E = Ee + Ep の加法分解で
+        第2ピオラ・キルヒホッフ応力 S にリターンマッピングする（大回転・中程度のひずみ向け）。
+        """
+        if large:
+            return self._internal_large(u, th_scale)
         mesh = self.mesh
         E = mesh.n_elems
         ue = u[self.dofs]
@@ -154,6 +161,49 @@ class PlasticSolid:
             sig_all[g] = sig
             fe += np.einsum("e,eki,ek->ei", wd, B, sig)
             Ke += np.einsum("e,eki,ekl,elj->eij", wd, B, Ct, B, optimize=True)
+        self.trial = (ep_n, al_n, pb_n, sig_all)
+        f = np.zeros(3 * mesh.n_nodes)
+        np.add.at(f, self.dofs.ravel(), fe.ravel())
+        K = sp.coo_matrix((Ke.ravel(), (self.rows, self.cols)), shape=(f.size, f.size)).tocsr()
+        return f, K
+
+    def _internal_large(self, u, th_scale):
+        from .nonlinear import _green, _tl_BL
+        mesh = self.mesh
+        E = mesh.n_elems
+        nn = self.nn
+        Ue = u.reshape(-1, 3)[mesh.elems]
+        fe = np.zeros((E, 3 * nn))
+        Ke = np.zeros((E, 3 * nn, 3 * nn))
+        ep_n, al_n, pb_n = self.ep.copy(), self.alpha.copy(), self.pbar.copy()
+        sig_all = np.zeros((len(self.wts), E, 6))
+        eth = self.eps_th_m[self.elem_mat] * th_scale
+        for g in range(len(self.wts)):
+            dNdX, wd = self.dNdX[g], self.wd[g]
+            F = np.eye(3) + np.einsum("eak,eal->ekl", Ue, dNdX)
+            Eg = _green(F) - eth
+            Ct = self.D[self.elem_mat].copy() if self.D.ndim == 3 else np.broadcast_to(self.D, (E, 6, 6)).copy()
+            S = np.einsum("eij,ej->ei", Ct, Eg)
+            for mi, model in self.models.items():
+                sel = np.nonzero(self.elem_mat == mi)[0]
+                if len(sel) == 0:
+                    continue
+                s_M, e_M, a_M, pb, C_M = model.update(Eg[sel] * W_EPS, self.ep[g, sel], self.alpha[g, sel],
+                                                      self.pbar[g, sel])
+                S[sel] = s_M / W_SIG
+                Ct[sel] = C_M / W_SIG[None, :, None] * W_EPS[None, None, :]
+                ep_n[g, sel], al_n[g, sel], pb_n[g, sel] = e_M, a_M, pb
+            B = _tl_BL(F, dNdX)
+            fe += np.einsum("e,eki,ek->ei", wd, B, S)
+            Ke += np.einsum("e,eki,ekl,elj->eij", wd, B, Ct, B, optimize=True)
+            Sm = np.stack([S[:, [0, 3, 5]], S[:, [3, 1, 4]], S[:, [5, 4, 2]]], axis=1)
+            Gm = np.einsum("eai,eij,ebj->eab", dNdX, Sm, dNdX) * wd[:, None, None]
+            for k in range(3):
+                Ke[:, k::3, k::3] += Gm
+            # 表示用のコーシー応力 σ = F S Fᵀ / J
+            J = np.linalg.det(F)
+            sg = np.einsum("eik,ekl,ejl->eij", F, Sm, F) / J[:, None, None]
+            sig_all[g] = np.stack([sg[:, 0, 0], sg[:, 1, 1], sg[:, 2, 2], sg[:, 0, 1], sg[:, 1, 2], sg[:, 0, 2]], 1)
         self.trial = (ep_n, al_n, pb_n, sig_all)
         f = np.zeros(3 * mesh.n_nodes)
         np.add.at(f, self.dofs.ravel(), fe.ravel())

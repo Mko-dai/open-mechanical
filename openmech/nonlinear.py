@@ -255,15 +255,13 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
     h_char = float(np.cbrt(np.median(vol) * 6 * np.sqrt(2))) if len(vol) else 1.0
     pen_tol = settings.penetration_tolerance * h_char
 
-    if plastic and LD:
-        raise ValueError("塑性と大変形の組み合わせにはまだ対応していません。解析設定の「大変形」をオフにしてください。")
-    if LD and has_th:
-        raise ValueError("熱ひずみと大変形の組み合わせにはまだ対応していません。")
+    if LD and has_th and not plastic:
+        raise ValueError("熱ひずみと大変形の組み合わせ（弾性材料のみ）にはまだ対応していません。")
     ps = None
     if plastic:
         from .plasticity import PlasticSolid
         ps = PlasticSolid(mesh, mats, elem_mat, D, eps_th_m)
-        log("塑性材料あり: 弾塑性（ミーゼス）で解きます")
+        log("塑性材料あり: 弾塑性（ミーゼス）" + ("＋大変形" if LD else "") + "で解きます")
     K_lin = None if (LD or plastic) else assemble_stiffness(mesh, D, elem_mat=elem_mat)
     k_weak = 0.0
     if settings.weak_springs:
@@ -278,10 +276,10 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
     cur_t = [0.0]
 
     def internal(u):
+        if ps is not None:
+            return ps.internal(u, th_factor(cur_t[0]), large=LD)
         if LD:
             return tl_internal(mesh, D, elem_mat, u)
-        if ps is not None:
-            return ps.internal(u, th_factor(cur_t[0]))
         return K_lin @ u, K_lin
 
     nonlinear = LD or nonlinear_contact or al or plastic
@@ -404,7 +402,7 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
             if pairs:
                 commit_states(pairs, contacts, u)
             if ps is not None:
-                ps.internal(u, th_factor(t))
+                ps.internal(u, th_factor(t), large=LD)
                 ps.commit()
             n_done += 1
             if progress:
@@ -429,11 +427,13 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
 def _make_result(mesh, mats, elem_mat, D, u, bcs, per_bc, F, pairs, contacts, LD, internal, t, step, settings,
                  ps=None, eps_th=None):
     extra = {}
-    if LD:
+    if LD and ps is None:
         stress, strain = tl_cauchy_nodal(mesh, u, D, elem_mat)
-    else:
+    elif ps is None:
         stress, strain = nodal_stress(mesh, u, D, elem_mat=elem_mat, eps_th_m=eps_th)
-    if ps is not None:
+    else:
+        strain = (tl_cauchy_nodal(mesh, u, D, elem_mat)[1] if LD
+                  else nodal_stress(mesh, u, D, elem_mat=elem_mat)[1])
         internal(u)
         stress, peeq = ps.nodal()
         extra["相当塑性ひずみ"] = peeq

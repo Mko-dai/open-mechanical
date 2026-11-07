@@ -82,3 +82,34 @@ def test_kinematic_bauschinger():
     sk = _uniaxial(kin, [0.05, e2 * 10])
     si = _uniaxial(iso, [0.05, e2 * 10])
     assert sk[1] > si[1] + 10                  # 移動硬化は早く逆降伏する（圧縮応力の絶対値が小さい）
+
+
+def test_plastic_large_deflection_objective():
+    """塑性＋大変形: 伸ばしたあと 90° 回転させても応力・塑性ひずみは同じ（客観性）"""
+    m, on, sym = _bar()
+    mat = Material("p", 200000, 0.3, 7850, 250, plasticity="bilinear_iso", tangent_modulus=2000)
+    X = m.nodes
+    out = []
+    for ang in (0, 90):
+        th = np.radians(ang)
+        Rz = np.array([[np.cos(th), -np.sin(th), 0], [np.sin(th), np.cos(th), 0], [0, 0, 1]])
+        U = (X @ np.diag([1.01, 0.997, 0.997]).T) @ Rz.T - X
+        bcs = [BC("displacement", [], list(U[i]), nodes=[i]) for i in range(len(X))]
+        s = AnalysisSettings(initial_substeps=1, auto_time_stepping="off", large_deflection=True)
+        r = solve_static(m, mat, bcs, settings=s, elem_materials=_em(m, mat.state()), log=lambda *a: None)[-1]
+        out.append((r.von_mises.mean(), r.fields()["相当塑性ひずみ"].mean()))
+    assert np.allclose(out[0], out[1], rtol=1e-8)
+    assert out[0][1] > 0
+
+
+def test_plastic_large_deflection_cantilever():
+    """塑性＋大変形の片持ち梁: 収束し、幾何学的な剛性で微小変形の解よりたわみが小さい"""
+    m = structured_box(100, 10, 10, 20, 2, 2).to_quadratic()
+    mat = Material("p", 200000, 0.3, 7850, 250, plasticity="bilinear_iso", tangent_modulus=2000)
+    bcs = [BC("fixed", [0]), BC("force", [1], [0, 0, -1500.0])]
+    tips = []
+    for LD in (False, True):
+        s = AnalysisSettings(initial_substeps=10, max_substeps=100, large_deflection=LD)
+        r = solve_static(m, mat, bcs, settings=s, elem_materials=_em(m, mat.state()), log=lambda *a: None)[-1]
+        tips.append(-r.u[:, 2].min())
+    assert tips[1] < 0.7 * tips[0]
