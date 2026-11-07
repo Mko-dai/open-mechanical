@@ -56,10 +56,10 @@ FEATURES = {
     "import": ("インポート", "読", [("path", "ファイル", ""),
                                  ("dx", "移動 X [mm]", 0.0), ("dy", "移動 Y [mm]", 0.0), ("dz", "移動 Z [mm]", 0.0)]),
 }
-OPS = {"add": "追加", "cut": "切り取り", "intersect": "交差"}
+OPS = {"new": "新規ボディ", "add": "結合", "cut": "除去（切り取り）", "intersect": "交差"}
 
 
-def new_feature(ftype, op="add", **over):
+def new_feature(ftype, op="new", **over):
     f = {"type": ftype, "op": op}
     for k, _, d in FEATURES[ftype][2]:
         f[k] = d
@@ -139,30 +139,106 @@ def _make_feature(gmsh, f):
 
 
 def _build_features(gmsh, features):
+    """フィーチャー履歴からボディを作る（Femtet と同じく、作成した形状はそれぞれ別のボディ）。
+
+    op:
+      new        新しいボディを作る（既定）
+      add        対象ボディ target に結合（旧形式。target 省略時は直前のボディ）
+      cut        対象ボディ targets から切り取る（省略時は全ボディ）
+      intersect  全ボディとの共通部分を残す
+    type="bool": ボディ同士のブール演算 {"op": "union"|"cut", "target": k, "tools": [k, ...]}
+
+    重なったボディは最後に分割（fragment）し、重なり部分はボディ番号の小さい方に属させます
+    （Femtet の自動干渉除去と同じルール）。接している面は節点を共有するのでつながって計算されます。
+    """
     occ = gmsh.model.occ
-    body = []
+    bodies: dict[int, list] = {}
+    nkey = 0
+    last = None
     for i, f in enumerate(features):
         if f.get("suppressed"):
             continue
-        tool = _make_feature(gmsh, f)
-        if not tool:
-            continue
-        op = f.get("op", "add")
+        t = f["type"]
+        op = f.get("op", "new")
+        label = f"フィーチャー {i + 1}（{FEATURES.get(t, ('ブール演算',))[0]}）"
         try:
-            if op == "add" or not body:
-                if op != "add" and not body:
-                    occ.remove(tool, recursive=True)   # 削る相手がまだ無い
+            if t == "bool":
+                tgt = int(f.get("target", -1))
+                tools = [int(k) for k in f.get("tools", []) if int(k) in bodies and int(k) != tgt]
+                if tgt not in bodies or not tools:
                     continue
-                body = tool if not body else occ.fuse(body, tool)[0]
+                tool_tags = [dt for k in tools for dt in bodies[k]]
+                if op == "union":
+                    bodies[tgt] = occ.fuse(bodies[tgt], tool_tags)[0]
+                else:
+                    bodies[tgt] = occ.cut(bodies[tgt], tool_tags)[0]
+                for k in tools:
+                    bodies.pop(k, None)
+                continue
+            tool = _make_feature(gmsh, f)
+            if not tool:
+                continue
+            if op == "new" or (op == "add" and not bodies):
+                bodies[nkey] = tool
+                last = nkey
+                nkey += 1
+            elif op == "add":
+                tgt = int(f.get("target", last if last is not None else -1))
+                tgt = tgt if tgt in bodies else max(bodies)
+                bodies[tgt] = occ.fuse(bodies[tgt], tool)[0]
             elif op == "cut":
-                body = occ.cut(body, tool)[0]
+                targets = [int(k) for k in (f.get("targets") or list(bodies)) if int(k) in bodies]
+                for k in targets:
+                    bodies[k] = occ.cut(bodies[k], tool, removeTool=False)[0]
+                occ.remove(tool, recursive=True)
             elif op == "intersect":
-                body = occ.intersect(body, tool)[0]
+                for k in list(bodies):
+                    cp = occ.copy(tool)
+                    bodies[k] = occ.intersect(bodies[k], cp)[0]
+                occ.remove(tool, recursive=True)
+        except GeometryError:
+            raise
         except Exception as e:
-            raise GeometryError(f"フィーチャー {i + 1}（{FEATURES[f['type']][0]}）の{OPS.get(op, op)}に失敗しました: {e}")
+            raise GeometryError(f"{label}の{OPS.get(op, op)}に失敗しました: {e}")
+    bodies = {k: [dt for dt in v if dt[0] == 3] for k, v in bodies.items()}
+    bodies = {k: v for k, v in bodies.items() if v}
+    if not bodies:
+        occ.synchronize()
+        raise GeometryError("ソリッドがありません。形状を作成してください。")
+    objs, owner = [], []
+    for k in sorted(bodies):
+        for dt in bodies[k]:
+            objs.append(dt)
+            owner.append(k)
+    groups: dict[int, list] = {}
+    if len(objs) > 1:
+        _, omap = occ.fragment(objs[:1], objs[1:])
+        assign = {}
+        for idx, children in enumerate(omap):
+            for dt in children:
+                if dt[0] == 3 and (dt not in assign or owner[idx] < assign[dt]):
+                    assign[dt] = owner[idx]
+        for dt, k in assign.items():
+            groups.setdefault(k, []).append(dt[1])
+    else:
+        groups[owner[0]] = [objs[0][1]]
     occ.synchronize()
-    if not gmsh.model.getEntities(3):
-        raise GeometryError("ソリッドがありません。フィーチャーを追加してください。")
+    for k, tags in groups.items():
+        gmsh.model.addPhysicalGroup(3, sorted(set(tags)), tag=k + 1)
+
+
+def feature_body_keys(features) -> dict:
+    """フィーチャー番号 → それが作ったボディ番号（_build_features と同じ規則）"""
+    out, nkey, have = {}, 0, False
+    for i, f in enumerate(features):
+        if f.get("suppressed") or f.get("type") == "bool":
+            continue
+        op = f.get("op", "new")
+        if op == "new" or (op == "add" and not have):
+            out[i] = nkey
+            nkey += 1
+            have = True
+    return out
 
 
 def primitive_to_features(spec):
@@ -321,15 +397,22 @@ def _extract_mesh(gmsh) -> Mesh:
     tag2idx = np.full(int(tags.max()) + 1, -1, dtype=np.int64)
     tag2idx[tags.astype(np.int64)] = np.arange(len(tags))
 
-    etypes, _, enodes = gmsh.model.mesh.getElements(3)
-    elems = None
-    for t, en in zip(etypes, enodes):
-        if t == 4:
-            elems = tag2idx[en.astype(np.int64)].reshape(-1, 4)
-        elif t == 11:
-            elems = tag2idx[en.astype(np.int64)].reshape(-1, 10)
-    if elems is None or len(elems) == 0:
+    blocks, bodies = [], []
+    for _, vtag in gmsh.model.getEntities(3):
+        phys = gmsh.model.getPhysicalGroupsForEntity(3, vtag)
+        body = int(phys[0]) - 1 if len(phys) else 0
+        etypes, _, enodes = gmsh.model.mesh.getElements(3, vtag)
+        for t, en in zip(etypes, enodes):
+            npe = {4: 4, 11: 10}.get(int(t))
+            if npe is None:
+                continue
+            b = tag2idx[en.astype(np.int64)].reshape(-1, npe)
+            blocks.append(b)
+            bodies.append(np.full(len(b), body, dtype=np.int64))
+    if not blocks:
         raise GeometryError("四面体メッシュを作成できませんでした。メッシュサイズを変えて試してください。")
+    elems = np.vstack(blocks)
+    elem_body = np.concatenate(bodies)
     # 使われている節点だけ残す
     used = np.unique(elems)
     remap = np.full(len(coords), -1, dtype=np.int64)
@@ -339,6 +422,7 @@ def _extract_mesh(gmsh) -> Mesh:
     if elems.shape[1] == 10:
         elems = _reorder_tet10(nodes, elems)
     mesh = Mesh(nodes, elems)
+    mesh.elem_body = elem_body
 
     # CAD のサーフェスを「面」として割り当てる
     key_of = {}

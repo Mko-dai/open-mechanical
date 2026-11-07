@@ -95,8 +95,15 @@ def _quadrature(nn):
 
 # ---------------------------------------------------------------------------- 組み立て
 
+def _D_of(D, elem_mat, sl):
+    """要素ごとの弾性マトリクス。D が (6,6) なら共通、(M,6,6) なら elem_mat で引く"""
+    if D.ndim == 2:
+        return D
+    return D[elem_mat[sl]]
+
+
 def assemble_stiffness(mesh: Mesh, D: np.ndarray, chunk: int = 20000,
-                       progress=None) -> sp.csr_matrix:
+                       progress=None, elem_mat=None) -> sp.csr_matrix:
     nn = mesh.elems.shape[1]
     ndof = 3 * mesh.n_nodes
     pts, wts = _quadrature(nn)
@@ -109,12 +116,16 @@ def assemble_stiffness(mesh: Mesh, D: np.ndarray, chunk: int = 20000,
         el = mesh.elems[s:s + chunk]
         X = mesh.nodes[el]
         Ke = np.zeros((len(el), 3 * nn, 3 * nn))
+        De = _D_of(D, elem_mat, slice(s, s + chunk))
         for g, w in enumerate(wts):
             dNdx, detJ = _dN_dx(X, dN[g])
             if np.any(detJ <= 0):
                 raise ValueError("つぶれた（体積が0以下の）要素があります。メッシュを見直してください。")
             B = _B_matrix(dNdx)
-            Ke += np.einsum("e,eki,kl,elj->eij", w * detJ, B, D, B, optimize=True)
+            if De.ndim == 2:
+                Ke += np.einsum("e,eki,kl,elj->eij", w * detJ, B, De, B, optimize=True)
+            else:
+                Ke += np.einsum("e,eki,ekl,elj->eij", w * detJ, B, De, B, optimize=True)
         dofs = (3 * el[:, :, None] + np.arange(3)).reshape(len(el), -1)
         rows = dofs[:, ii].ravel()
         cols = dofs[:, jj].ravel()
@@ -125,7 +136,10 @@ def assemble_stiffness(mesh: Mesh, D: np.ndarray, chunk: int = 20000,
 
 
 def body_force_vector(mesh: Mesh, b: np.ndarray) -> np.ndarray:
-    """体積力 b [N/mm^3]（= 密度×加速度）の等価節点力。"""
+    """体積力 b [N/mm^3]（= 密度×加速度）の等価節点力。 b は (3,) または要素ごと (E,3)"""
+    b = np.asarray(b, float)
+    if b.ndim == 1:
+        b = np.broadcast_to(b, (mesh.n_elems, 3))
     nn = mesh.elems.shape[1]
     pts, wts = GAUSS4, GAUSS4_W  # 2次の形状関数まで厳密に積分できる
     X = mesh.nodes[mesh.elems]
@@ -135,7 +149,7 @@ def body_force_vector(mesh: Mesh, b: np.ndarray) -> np.ndarray:
         N = shape_N(L, nn)
         contrib = (w * detJ)[:, None] * N[None, :]          # (E,nn)
         for c in range(3):
-            np.add.at(F[:, c], mesh.elems.ravel(), (contrib * b[c]).ravel())
+            np.add.at(F[:, c], mesh.elems.ravel(), (contrib * b[:, c:c + 1]).ravel())
     return F.ravel()
 
 
@@ -202,7 +216,7 @@ class BC:
         return f"{name}{f}{v}"
 
 
-def build_load_and_constraints(mesh: Mesh, material: Material, bcs: list[BC]):
+def build_load_and_constraints(mesh: Mesh, material: Material, bcs: list[BC], rho_e=None):
     ndof = 3 * mesh.n_nodes
     F = np.zeros(ndof)
     fixed = {}  # dof -> value
@@ -243,8 +257,11 @@ def build_load_and_constraints(mesh: Mesh, material: Material, bcs: list[BC]):
             for c in range(3):
                 F[3 * idx + c] += f[:, c]
         elif bc.kind == "gravity":
-            b = material.density_t_mm3 * np.asarray(bc.values, float)
-            F += body_force_vector(mesh, b)
+            acc = np.asarray(bc.values, float)
+            if rho_e is None:
+                F += body_force_vector(mesh, material.density_t_mm3 * acc)
+            else:
+                F += body_force_vector(mesh, rho_e[:, None] * acc[None, :])
         else:
             raise ValueError(f"未対応の境界条件: {bc.kind}")
     return F, fixed
@@ -261,6 +278,17 @@ class Result:
     strain: np.ndarray       # (N,6) 節点ひずみ（工学ひずみ）
     reactions: dict          # BC index -> 反力ベクトル [N]
     info: dict
+    mats: list | None = None       # ボディごと等の材料リスト
+    elem_mat: np.ndarray | None = None  # 要素 → mats の番号
+
+    def _node_yield(self):
+        if self.mats is None or self.elem_mat is None:
+            return None
+        ys = np.array([m.yield_strength if m.yield_strength > 0 else np.inf for m in self.mats])
+        ye = ys[self.elem_mat]
+        ny = np.full(self.mesh.n_nodes, np.inf)
+        np.minimum.at(ny, self.mesh.elems.ravel(), np.repeat(ye, self.mesh.elems.shape[1]))
+        return ny
 
     @property
     def disp_mag(self):
@@ -286,10 +314,15 @@ class Result:
 
     @property
     def safety_factor(self):
+        ny = self._node_yield()
+        vm = self.von_mises
+        if ny is not None:
+            if not np.isfinite(ny).any():
+                return None
+            return np.minimum(15.0, np.where(np.isfinite(ny), ny, 15.0 * vm) / np.maximum(vm, 1e-12))
         sy = self.material.yield_strength
         if sy <= 0:
             return None
-        vm = self.von_mises
         return np.minimum(15.0, sy / np.maximum(vm, 1e-12))
 
     def fields(self) -> dict:
@@ -328,11 +361,15 @@ class Result:
         sf = self.safety_factor
         if sf is not None:
             d["最小安全率"] = float(sf.min())
-        d["質量 [kg]"] = self.mesh.volume() * self.material.density_t_mm3 * 1000
+        if self.mats is not None and self.elem_mat is not None:
+            rho = np.array([m.density_t_mm3 for m in self.mats])[self.elem_mat]
+            d["質量 [kg]"] = float((self.mesh.element_volumes() * rho).sum() * 1000)
+        else:
+            d["質量 [kg]"] = self.mesh.volume() * self.material.density_t_mm3 * 1000
         return d
 
 
-def nodal_stress(mesh: Mesh, u: np.ndarray, D: np.ndarray, chunk: int = 50000):
+def nodal_stress(mesh: Mesh, u: np.ndarray, D: np.ndarray, chunk: int = 50000, elem_mat=None):
     """各要素の節点位置で応力を評価し、節点で平均化する。"""
     nn = mesh.elems.shape[1]
     Lnodes = NODE_L10 if nn == 10 else NODE_L4
@@ -348,7 +385,8 @@ def nodal_stress(mesh: Mesh, u: np.ndarray, D: np.ndarray, chunk: int = 50000):
             dNdx, _ = _dN_dx(X, shape_dN_dxi(Lnodes[a], nn))
             B = _B_matrix(dNdx)
             eps = np.einsum("eij,ej->ei", B, ue)
-            sig = eps @ D.T
+            De = _D_of(D, elem_mat, slice(s, s + chunk))
+            sig = eps @ De.T if De.ndim == 2 else np.einsum("eij,ej->ei", De, eps)
             np.add.at(acc_e, el[:, a], eps)
             np.add.at(acc_s, el[:, a], sig)
             np.add.at(cnt, el[:, a], 1)
@@ -357,7 +395,7 @@ def nodal_stress(mesh: Mesh, u: np.ndarray, D: np.ndarray, chunk: int = 50000):
 
 
 def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=print,
-          method: str = "auto") -> Result:
+          method: str = "auto", elem_materials=None) -> Result:
     """線形静解析を実行する。progress(0..1, メッセージ) を渡すと進捗を通知。"""
     t0 = time.time()
 
@@ -367,11 +405,21 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
 
     if not any(b.kind in ("fixed", "displacement") for b in bcs):
         raise ValueError("拘束（固定支持 または 強制変位）がありません。少なくとも1つ設定してください。")
-    D = elasticity_matrix(material.E, material.nu)
+    mats, elem_mat, rho_e = None, None, None
+    if elem_materials is not None:
+        # elem_materials = (材料リスト, 要素ごとの番号)  ボディごとに材料が違う場合
+        mats, elem_mat = elem_materials
+        elem_mat = np.asarray(elem_mat, dtype=np.int64)
+        D = np.stack([elasticity_matrix(m.E, m.nu) for m in mats])
+        rho_e = np.array([m.density_t_mm3 for m in mats])[elem_mat]
+        material = mats[0]
+    else:
+        D = elasticity_matrix(material.E, material.nu)
     prog(0.02, "剛性マトリクスを組み立て中…")
-    K = assemble_stiffness(mesh, D, progress=lambda x: prog(0.02 + 0.4 * x, "剛性マトリクスを組み立て中…"))
+    K = assemble_stiffness(mesh, D, progress=lambda x: prog(0.02 + 0.4 * x, "剛性マトリクスを組み立て中…"),
+                           elem_mat=elem_mat)
     t_asm = time.time() - t0
-    F, fixed = build_load_and_constraints(mesh, material, bcs)
+    F, fixed = build_load_and_constraints(mesh, material, bcs, rho_e=rho_e)
     ndof = K.shape[0]
     cdofs = np.fromiter(fixed.keys(), dtype=np.int64)
     cvals = np.fromiter(fixed.values(), dtype=float)
@@ -397,7 +445,7 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
     u[free] = uf
     t_sol = time.time() - t1
     prog(0.85, "応力を計算中…")
-    stress, strain = nodal_stress(mesh, u, D)
+    stress, strain = nodal_stress(mesh, u, D, elem_mat=elem_mat)
     R = K @ u - F
     reactions = {}
     for i, bc in enumerate(bcs):
@@ -409,7 +457,7 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
             "要素タイプ": "Tet10（2次）" if mesh.order == 2 else "Tet4（1次）",
             "組立時間 [s]": round(t_asm, 2), "求解時間 [s]": round(t_sol, 2),
             "合計時間 [s]": round(time.time() - t0, 2), "相対残差": float(res)}
-    return Result(mesh, material, u.reshape(-1, 3), stress, strain, reactions, info)
+    return Result(mesh, material, u.reshape(-1, 3), stress, strain, reactions, info, mats, elem_mat)
 
 
 def _cg(A, b, M, tol=1e-10, maxiter=5000):

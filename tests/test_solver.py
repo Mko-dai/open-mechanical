@@ -124,3 +124,25 @@ def test_export(tmp_path):
     write_csv(tmp_path / "r.csv", r)
     write_report(tmp_path / "r.html", r, bcs)
     assert (tmp_path / "r.html").stat().st_size > 1000
+
+
+def test_two_materials_in_series():
+    """鋼とアルミを直列につないだ棒: 伸び = F L1/(E1 A) + F L2/(E2 A)"""
+    L, a, F = 100.0, 10.0, 1000.0
+    m = structured_box(L, a, a, 20, 2, 2).to_quadratic()
+    cx = m.nodes[m.elems[:, :4]].mean(axis=1)[:, 0]
+    elem_mat = (cx > L / 2).astype(int)
+    al = Material("al", 70000.0, 0.3, 2700.0, 100.0)
+    x0, x1 = face_at(m, 0, 0.0), face_at(m, 0, L)
+    y0, z0 = face_at(m, 1, 0.0), face_at(m, 2, 0.0)
+    bcs = [BC("displacement", [x0], [0.0, None, None]), BC("displacement", [y0], [None, 0.0, None]),
+           BC("displacement", [z0], [None, None, 0.0]), BC("force", [x1], [F, 0, 0])]
+    r = solve(m, STEEL, bcs, log=lambda *a: None, elem_materials=([STEEL, al], elem_mat))
+    d = F * (L / 2) / (STEEL.E * a * a) + F * (L / 2) / (al.E * a * a)
+    assert r.u[:, 0].max() == pytest.approx(d, rel=0.01)  # 境界面の横方向拘束でわずかに剛くなる
+    assert r.summary()["質量 [kg]"] == pytest.approx(50 * a * a * (7850 + 2700) * 1e-9, rel=1e-6)
+    sf = r.safety_factor
+    far = m.nodes[:, 0] > 0.8 * L   # 境界面から離れたアルミ側: σ=10MPa, 降伏100 → 安全率10
+    assert np.median(sf[far]) == pytest.approx(10.0, rel=1e-2)
+    near_steel = m.nodes[:, 0] < 0.2 * L   # 鋼側: 降伏250 → 25 だが上限15
+    assert np.median(sf[near_steel]) == pytest.approx(15.0)

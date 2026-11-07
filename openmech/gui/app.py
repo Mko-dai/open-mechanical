@@ -37,10 +37,11 @@ from pyvistaqt import QtInteractor
 from .. import __version__
 from ..export import write_csv, write_report, write_vtu
 from ..geometry import (AXES, CAD_EXT, FEATURES, OPS, PLANES, PRIMITIVES, GeometryError, build_mesh,
-                        gmsh_available, new_feature, primitive_to_features)
+                        feature_body_keys, gmsh_available, new_feature, primitive_to_features)
 from ..materials import LIBRARY, Material
 from ..project import Project
 from ..solver import BC, solve
+from .femtet_dialogs import BCDialog, BodyAttrDialog, FeatureDialog, MaterialDialog
 from .viewer import FIELD_EN, feature_edges, surface_polydata
 
 # ---------------------------------------------------------------------------- 定義
@@ -67,7 +68,8 @@ RESULT_TYPE_JP = {
     "全変形 [mm]": "全変形", "相当応力（ミーゼス） [MPa]": "相当 (von-Mises) 応力",
     "安全率（降伏基準）": "安全率（最大相当応力基準）",
 }
-OP_COLORS = {"add": "#4a78c2", "cut": "#c0392b", "intersect": "#8e44ad"}
+OP_COLORS = {"new": "#4a78c2", "add": "#2c7fb8", "cut": "#c0392b", "intersect": "#8e44ad", "union": "#2c7fb8"}
+MAT_PALETTE = ["#8fb8de", "#e5b25d", "#a7d3a6", "#d9a0c8", "#9fd6d2", "#e8a08f", "#b9b3e6", "#c9d68a"]
 GEOM_COLOR = "#c9cdd3"
 SELECT_COLOR = "#33d633"
 STATUS_OK, STATUS_PENDING, STATUS_ERROR, STATUS_NONE = "ok", "pending", "error", ""
@@ -260,6 +262,7 @@ class MainWindow(QMainWindow):
         self.solve_error = ""
         self.solver_log: list[str] = []
         self.selected_faces: list[int] = []
+        self.selected_bodies: list[int] = []
         self.worker: Worker | None = None
         self.current = ("geometry",)
         self._tri_src = None
@@ -286,6 +289,7 @@ class MainWindow(QMainWindow):
         self.tree.setHeaderHidden(True)
         self.tree.setIconSize(QSize(20, 20))
         self.tree.itemSelectionChanged.connect(self.on_tree_select)
+        self.tree.itemDoubleClicked.connect(self.on_tree_double)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.on_tree_menu)
         self.tree.setStyleSheet("QTreeWidget::item { padding: 2px; }")
@@ -314,7 +318,8 @@ class MainWindow(QMainWindow):
         g = QGridLayout(gfx)
         g.setContentsMargins(0, 0, 0, 0)
         g.addWidget(self._graphics_toolbar(), 0, 0)
-        g.addWidget(self.plotter.interactor, 1, 0)
+        g.addWidget(self._attr_bar(), 1, 0)
+        g.addWidget(self.plotter.interactor, 2, 0)
         self.overlay = QLabel(self.plotter.interactor)
         self.overlay.setStyleSheet("background: rgba(255,255,255,215); color:#111; padding:6px;"
                                    "border:1px solid #bbb; font-size:12px;")
@@ -397,21 +402,25 @@ class MainWindow(QMainWindow):
         R.button(g, "レポート", make_icon("#7a5cc2", "報"), self.export_report)
         R.button(g, "VTU", make_icon("#7a5cc2", "V"), self.export_vtu)
         R.button(g, "CSV", make_icon("#7a5cc2", "表"), self.export_csv)
-        # --- モデリング
-        t = R.add_tab("モデリング")
-        g = R.add_group(t, "作成（追加）")
+        # --- モデル（Femtet と同じ: 作成した形状はそれぞれ別のボディ）
+        t = R.add_tab("モデル")
+        g = R.add_group(t, "作成")
         for ft in ["box", "cylinder", "pipe", "cone", "sphere", "extrude"]:
-            R.button(g, FEATURES[ft][0], make_icon(OP_COLORS["add"], FEATURES[ft][1]),
-                     lambda _=False, ft=ft: self.add_feature(ft, "add"))
-        g = R.add_group(t, "切り取り")
-        R.button(g, "穴", make_icon(OP_COLORS["cut"], "穴"), lambda: self.add_feature("cylinder", "cut", hole=True))
-        R.button(g, "直方体で切取", make_icon(OP_COLORS["cut"], "箱"), lambda: self.add_feature("box", "cut"))
-        R.button(g, "押し出しで切取", make_icon(OP_COLORS["cut"], "押"), lambda: self.add_feature("extrude", "cut"))
-        g = R.add_group(t, "取り込み")
-        R.button(g, "STEP 取込", make_icon(OP_COLORS["add"], "読"), self.add_import_feature)
+            R.button(g, FEATURES[ft][0], make_icon(OP_COLORS["new"], FEATURES[ft][1]),
+                     lambda _=False, ft=ft: self.create_body(ft))
+        g = R.add_group(t, "ブール演算")
+        R.button(g, "結合", make_icon(OP_COLORS["union"], "∪"), lambda: self.boolean("union"))
+        R.button(g, "除去", make_icon(OP_COLORS["cut"], "−"), lambda: self.boolean("cut"))
+        R.button(g, "穴", make_icon(OP_COLORS["cut"], "穴"), self.create_hole)
+        g = R.add_group(t, "インポート")
+        R.button(g, "STEP", make_icon(OP_COLORS["new"], "読"), self.add_import_feature)
         g = R.add_group(t, "編集")
+        R.button(g, "形状編集", make_icon("#5d6d7e", "編"), self.edit_selected_body)
         R.button(g, "削除", make_icon("#888888", "×"), self.delete_current)
-        R.button(g, "生成", make_icon("#3a8fa8", "⟳"), lambda: self.remesh())
+        R.button(g, "再生成", make_icon("#3a8fa8", "⟳"), lambda: self.remesh())
+        g = R.add_group(t, "属性")
+        R.button(g, "ボディ属性\n材料定数", make_icon("#b07b2c", "材"), lambda: self.set_attr_mode(0))
+        R.button(g, "境界条件", make_icon(BC_COLORS["fixed"], "境"), lambda: self.set_attr_mode(1))
         self.tab_model = R.count() - 1
         # --- 環境（静的構造）
         t = R.add_tab("環境")
@@ -485,9 +494,11 @@ class MainWindow(QMainWindow):
         self.sel_face_btn = Ribbon.button(h, "面", make_icon(SELECT_COLOR, "面"), checkable=True, big=False)
         self.sel_body_btn = Ribbon.button(h, "ボディ", make_icon("#888888", "体"), checkable=True, big=False)
         self.sel_face_btn.setChecked(True)
-        self.sel_face_btn.clicked.connect(lambda: (self.sel_face_btn.setChecked(True), self.sel_body_btn.setChecked(False)))
-        self.sel_body_btn.clicked.connect(self.select_body)
-        Ribbon.button(h, "選択解除", make_icon("#888888", "×"), lambda: self.set_selection([]), big=False)
+        self.sel_face_btn.clicked.connect(lambda: self.set_select_mode("face"))
+        self.sel_body_btn.clicked.connect(lambda: self.set_select_mode("body"))
+        Ribbon.button(h, "全選択", make_icon("#888888", "全"), self.select_body, big=False)
+        Ribbon.button(h, "選択解除", make_icon("#888888", "×"),
+                      lambda: (self.set_selection([]), self.set_body_selection([])), big=False)
         self.face_list_btn = Ribbon.button(h, "面の一覧", make_icon("#888888", "≡"), self.face_list_menu, big=False)
         sep = QFrame()
         sep.setFrameShape(QFrame.VLine)
@@ -495,12 +506,237 @@ class MainWindow(QMainWindow):
         for text, fn in [("等角", lambda: self.plotter.view_isometric()),
                          ("全体", lambda: self.plotter.reset_camera())]:
             Ribbon.button(h, text, make_icon("#5d6d7e", text[0]), fn, big=False)
-        hint = QLabel("　左クリック: 面を選択　Ctrl(⌘)+クリック: 追加選択　左ドラッグ: 回転　"
+        hint = QLabel("　クリック: 選択　Ctrl(⌘)+クリック: 追加　ドラッグ: 回転　"
                       "Shift+ドラッグ: 移動　ホイール: 拡大縮小")
         hint.setStyleSheet("color:#666")
         h.addWidget(hint)
         h.addStretch()
         return bar
+
+    # ---------------------------------------------------------------- Femtet 風 属性入力バー
+    def _attr_bar(self):
+        """Femtet の［モデル］タブと同じ属性入力欄。
+
+        ボディ属性/材料定数: ボディを選択 → ボディ属性名・材料名を入力 → ［設定］
+        境界条件          : 面を選択 → 境界条件名を入力 → ［設定］（新しい名前なら編集画面が開く）
+        """
+        bar = QFrame()
+        bar.setStyleSheet("QFrame{background:#f4f6f9;border-top:1px solid #d5dbe3;border-bottom:1px solid #d5dbe3}"
+                          "QLabel{border:none;background:transparent}")
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(6, 3, 6, 3)
+        h.setSpacing(4)
+        self.attr_mode = QComboBox()
+        self.attr_mode.addItems(["ボディ属性/材料定数", "境界条件"])
+        self.attr_mode.currentIndexChanged.connect(self._attr_mode_changed)
+        h.addWidget(self.attr_mode)
+        # ボディ属性・材料
+        self.body_attr_w = QWidget()
+        hb = QHBoxLayout(self.body_attr_w)
+        hb.setContentsMargins(0, 0, 0, 0)
+        hb.addWidget(QLabel("ボディ属性名"))
+        self.attr_name = QComboBox()
+        self.attr_name.setEditable(True)
+        self.attr_name.setMinimumWidth(130)
+        hb.addWidget(self.attr_name)
+        b = QPushButton("編集")
+        b.clicked.connect(self.edit_attr)
+        hb.addWidget(b)
+        hb.addSpacing(10)
+        hb.addWidget(QLabel("材料名"))
+        self.mat_name = QComboBox()
+        self.mat_name.setEditable(True)
+        self.mat_name.setMinimumWidth(170)
+        hb.addWidget(self.mat_name)
+        b = QPushButton("編集")
+        b.clicked.connect(self.edit_material)
+        hb.addWidget(b)
+        h.addWidget(self.body_attr_w)
+        # 境界条件
+        self.bc_attr_w = QWidget()
+        hc = QHBoxLayout(self.bc_attr_w)
+        hc.setContentsMargins(0, 0, 0, 0)
+        hc.addWidget(QLabel("境界条件名"))
+        self.bc_name = QComboBox()
+        self.bc_name.setEditable(True)
+        self.bc_name.setMinimumWidth(170)
+        hc.addWidget(self.bc_name)
+        b = QPushButton("編集")
+        b.clicked.connect(self.edit_bc_by_name)
+        hc.addWidget(b)
+        h.addWidget(self.bc_attr_w)
+        self.bc_attr_w.hide()
+        self.attr_set_btn = QPushButton("設定")
+        self.attr_set_btn.setStyleSheet("font-weight:bold;padding:2px 14px")
+        self.attr_set_btn.clicked.connect(self.apply_attr)
+        h.addWidget(self.attr_set_btn)
+        self.attr_hint = QLabel("")
+        self.attr_hint.setStyleSheet("color:#555")
+        h.addWidget(self.attr_hint)
+        h.addStretch()
+        self._fill_attr_combos()
+        return bar
+
+    def set_attr_mode(self, idx):
+        self.attr_mode.setCurrentIndex(idx)
+        self._attr_mode_changed(idx)
+
+    def _attr_mode_changed(self, idx):
+        self.body_attr_w.setVisible(idx == 0)
+        self.bc_attr_w.setVisible(idx == 1)
+        self.set_select_mode("body" if idx == 0 else "face")
+
+    def set_select_mode(self, mode):
+        self.sel_body_btn.setChecked(mode == "body")
+        self.sel_face_btn.setChecked(mode == "face")
+        if mode == "body":
+            self.selected_faces = []
+            self.attr_hint.setText("ボディをクリックして選び、名前を入力して［設定］")
+        else:
+            self.selected_bodies = []
+            self.attr_hint.setText("面をクリックして選び、名前を入力して［設定］")
+        if getattr(self, "attr_mode", None) is not None:
+            want = 0 if mode == "body" else 1
+            if self.attr_mode.currentIndex() != want:
+                self.attr_mode.blockSignals(True)
+                self.attr_mode.setCurrentIndex(want)
+                self.attr_mode.blockSignals(False)
+                self.body_attr_w.setVisible(want == 0)
+                self.bc_attr_w.setVisible(want == 1)
+        self._update_sel_status()
+        self.refresh_view()
+
+    def _fill_attr_combos(self):
+        p = self.project
+        for combo, items in [(self.attr_name, list(p.body_attrs.keys())),
+                             (self.mat_name, list(p.materials.keys()) + [n for n in LIBRARY if n not in p.materials]),
+                             (self.bc_name, [b.name for b in p.bcs if b.name and b.kind != "gravity"])]:
+            cur = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(items)
+            combo.setEditText(cur)
+            combo.blockSignals(False)
+
+    def _sync_attr_from_selection(self):
+        """選択したボディの現在の名前を表示（Femtet と同じく、複数で違う場合は空欄）"""
+        if not self.selected_bodies:
+            return
+        attrs = {self.project.assignment(b).get("attr", "") for b in self.selected_bodies}
+        mats = {self.project.assignment(b).get("mat", "") for b in self.selected_bodies}
+        self.attr_name.setEditText(attrs.pop() if len(attrs) == 1 else "")
+        self.mat_name.setEditText(mats.pop() if len(mats) == 1 else "")
+
+    def _ensure_material(self, name) -> bool:
+        if name in self.project.materials:
+            return True
+        if name in LIBRARY:
+            self.project.materials[name] = Material(**LIBRARY[name].to_dict())
+            self.log(f"材料DBから「{name}」を読み込みました")
+            return True
+        dlg = MaterialDialog(name, None, self)
+        if not dlg.exec():
+            return False
+        m = dlg.material()
+        m.name = m.name or name
+        self.project.materials[m.name] = m
+        if m.name != name:
+            self.mat_name.setEditText(m.name)
+        return True
+
+    def apply_attr(self):
+        if self.attr_mode.currentIndex() == 0:
+            if self.mesh is None or not self.selected_bodies:
+                QMessageBox.information(self, "ボディを選択", "グラフィックスでボディをクリックして選んでから［設定］を押してください。")
+                return
+            attr = self.attr_name.currentText().strip()
+            mat = self.mat_name.currentText().strip()
+            if not attr and not mat:
+                QMessageBox.information(self, "名前を入力", "ボディ属性名と材料名を入力してください。")
+                return
+            if mat and not self._ensure_material(mat):
+                return
+            mat = self.mat_name.currentText().strip()
+            self.project.assign(self.selected_bodies, attr=attr or None, mat=mat or None)
+            self.log(f"ボディ {', '.join(f'B{b}' for b in self.selected_bodies)} に "
+                     f"ボディ属性「{attr or '（変更なし）'}」/ 材料「{mat or '（変更なし）'}」を設定しました")
+        else:
+            if self.mesh is None or not self.selected_faces:
+                QMessageBox.information(self, "面を選択", "グラフィックスで面をクリックして選んでから［設定］を押してください。")
+                return
+            name = self.bc_name.currentText().strip() or f"境界条件{len(self.project.bcs) + 1}"
+            idx = next((i for i, b in enumerate(self.project.bcs) if b.name == name), None)
+            if idx is not None:
+                bc = self.project.bcs[idx]
+                bc.faces = sorted(set(bc.faces) | set(self.selected_faces))
+                self.log(f"境界条件「{name}」に面を追加しました（計 {len(bc.faces)} 面）")
+            else:
+                dlg = BCDialog(name, "displacement", None, self, n_faces=len(self.selected_faces))
+                if not dlg.exec():
+                    return
+                name, kind, vals = dlg.result()
+                self.project.bcs.append(BC(kind, list(self.selected_faces), vals, name))
+                self.log(f"境界条件「{name}」を作成しました")
+            self.bc_name.setEditText(name)
+        self._fill_attr_combos()
+        self.invalidate()
+        self.refresh_view()
+
+    def edit_attr(self):
+        name = self.attr_name.currentText().strip() or f"Body_{len(self.project.body_attrs) + 1}"
+        props = self.project.body_attrs.get(name, {"mesh_size": 0.0})
+        dlg = BodyAttrDialog(name, props, self)
+        if not dlg.exec():
+            return
+        new, props2 = dlg.result()
+        new = new or name
+        if new != name and name in self.project.body_attrs:
+            del self.project.body_attrs[name]
+            for d in self.project.body_assign.values():
+                if d.get("attr") == name:
+                    d["attr"] = new
+        changed = self.project.body_attrs.get(new, {}).get("mesh_size") != props2["mesh_size"]
+        self.project.body_attrs[new] = props2
+        self.attr_name.setEditText(new)
+        self._fill_attr_combos()
+        self.invalidate(mesh=changed)
+        self.refresh_view()
+
+    def edit_material(self, name=None):
+        name = name or self.mat_name.currentText().strip() or f"材料{len(self.project.materials) + 1}"
+        mat = self.project.materials.get(name) or (LIBRARY.get(name) and Material(**LIBRARY[name].to_dict()))
+        dlg = MaterialDialog(name, mat, self)
+        if not dlg.exec():
+            return
+        m = dlg.material()
+        m.name = m.name or name
+        if m.name != name and name in self.project.materials:
+            del self.project.materials[name]
+            for d in self.project.body_assign.values():
+                if d.get("mat") == name:
+                    d["mat"] = m.name
+        self.project.materials[m.name] = m
+        self.mat_name.setEditText(m.name)
+        self._fill_attr_combos()
+        self.invalidate()
+        if self.current[0] in ("mat", "mats"):
+            self.select_node(("mat", m.name))
+
+    def edit_bc_by_name(self):
+        name = self.bc_name.currentText().strip()
+        idx = next((i for i, b in enumerate(self.project.bcs) if b.name == name), None)
+        if idx is None:
+            QMessageBox.information(self, "境界条件", "その名前の境界条件はまだありません。\n"
+                                    "面を選んで名前を入力し［設定］を押すと作成されます。")
+            return
+        bc = self.project.bcs[idx]
+        dlg = BCDialog(bc.name, bc.kind, bc.values, self, n_faces=len(bc.faces))
+        if dlg.exec():
+            bc.name, bc.kind, bc.values = dlg.result()
+            self.bc_name.setEditText(bc.name)
+            self._fill_attr_combos()
+            self.invalidate()
+            self.refresh_view()
 
     def _build_menu(self):
         mb = self.menuBar()
@@ -563,6 +799,16 @@ class MainWindow(QMainWindow):
             return STATUS_OK if self.mesh is not None else STATUS_ERROR
         if k == "material":
             return STATUS_OK if self.project.material.E > 0 else STATUS_ERROR
+        if k == "mats":
+            if self.mesh is None:
+                return STATUS_NONE
+            try:
+                self.project.elem_materials(self.mesh)
+                return STATUS_OK
+            except ValueError:
+                return STATUS_ERROR
+        if k == "body":
+            return STATUS_OK if self.project.assignment(node[1]).get("mat") in self.project.materials else STATUS_ERROR
         if k in ("mesh", "sizing"):
             if k == "sizing" and not self.project.local_sizes[node[1]]["faces"]:
                 return STATUS_ERROR
@@ -604,16 +850,39 @@ class MainWindow(QMainWindow):
         model = add(proj, "モデル (A4)", ("model",), "#6c7a89", "M")
         geo = add(model, "ジオメトリ", ("geometry",), "#4a78c2", "G")
         gk = self.project.geometry.get("kind")
+        live = set(self.mesh.body_ids().tolist()) if self.mesh is not None else set()
         if gk == "model":
-            for i, f in enumerate(self.project.geometry.get("features", [])):
+            feats = self.project.geometry.get("features", [])
+            keys = feature_body_keys(feats)
+            for i, f in enumerate(feats):
+                op = f.get("op", "new")
+                if f["type"] == "bool":
+                    tools = ", ".join(f"B{k}" for k in f.get("tools", []))
+                    label = f"{'結合' if op == 'union' else '除去'}: B{f.get('target')} ← {tools}"
+                    add(geo, label, ("feature", i), OP_COLORS.get(op, "#888"), "∪" if op == "union" else "−")
+                    continue
                 name, ch, _ = FEATURES[f["type"]]
-                op = f.get("op", "add")
-                label = f"{name}{i + 1}" + ("" if op == "add" else f"（{OPS[op]}）")
-                add(geo, label, ("feature", i), OP_COLORS[op], ch)
+                if i in keys:
+                    k = keys[i]
+                    a = self.project.assignment(k)
+                    label = (f"B{k}: {name}" + ("" if k in live or self.mesh is None else "（結合済み）")
+                             + f"　[{a.get('attr') or '未定義'} / {a.get('mat') or '未定義'}]")
+                    it = add(geo, label, ("feature", i), OP_COLORS["new"], ch)
+                    if k in live:
+                        it.setIcon(0, make_icon(OP_COLORS["new"], ch, self.status_of(("body", k))))
+                else:
+                    add(geo, f"{OPS.get(op, op)}: {name}{i + 1}", ("feature", i), OP_COLORS.get(op, "#888"), ch)
         else:
             add(geo, self.project.geometry_desc() if gk != "file"
                 else os.path.basename(self.project.geometry.get("path", "")), ("geometry",), "#7f9cc9", "体")
-        add(model, "材料", ("material",), "#b07b2c", "材")
+        at = add(model, "ボディ属性", ("attrs",), "#7a8a99", "属")
+        for name in self.project.body_attrs:
+            n = sum(1 for b in live if self.project.assignment(b).get("attr") == name)
+            add(at, f"{name}（{n} ボディ）", ("attr", name), "#7a8a99", "属")
+        mt = add(model, "材料定数", ("mats",), "#b07b2c", "材")
+        for name in self.project.materials:
+            n = sum(1 for b in live if self.project.assignment(b).get("mat") == name)
+            add(mt, f"{name}（{n} ボディ）", ("mat", name), "#b07b2c", "材")
         add(model, "座標系", ("coords",), "#6c7a89", "XY")
         mesh = add(model, "メッシュ", ("mesh",), "#3a8fa8", "網")
         for i, ls in enumerate(self.project.local_sizes):
@@ -665,13 +934,33 @@ class MainWindow(QMainWindow):
         self.probe_text = None
         self.build_details()
         k = self.current[0]
-        if k in ("feature",) or (k == "geometry" and self.project.geometry.get("kind") == "model"):
+        if k in ("feature", "attrs", "attr", "mats", "mat") or (k == "geometry" and self.project.geometry.get("kind") == "model"):
             self.ribbon.setCurrentIndex(self.tab_model)
+            if k in ("attr", "mat", "attrs", "mats"):
+                self.set_attr_mode(0)
+                if k == "attr":
+                    self.attr_name.setEditText(self.current[1])
+                if k == "mat":
+                    self.mat_name.setEditText(self.current[1])
         elif k in ("analysis", "bc", "settings"):
             self.ribbon.setCurrentIndex(self.tab_env)
         elif k in ("solution", "result", "info"):
             self.ribbon.setCurrentIndex(self.tab_res)
         self.refresh_view()
+
+    def on_tree_double(self, item, _col=0):
+        node = tuple(item.data(0, Qt.UserRole))
+        if node[0] == "feature":
+            self._later(lambda: self.edit_feature(node[1]))
+        elif node[0] == "mat":
+            self._later(lambda: self.edit_material(node[1]))
+        elif node[0] == "attr":
+            self._later(lambda: (self.attr_name.setEditText(node[1]), self.edit_attr()))
+        elif node[0] == "bc":
+            bc = self.project.bcs[node[1]]
+            if bc.name and bc.kind != "gravity":
+                self.bc_name.setEditText(bc.name)
+                self._later(self.edit_bc_by_name)
 
     def on_tree_menu(self, pos):
         it = self.tree.itemAt(pos)
@@ -698,16 +987,21 @@ class MainWindow(QMainWindow):
             menu_action(m, "メッシュを生成", lambda: self.remesh())
             menu_action(m, "挿入 → 面サイズ指定", self.add_sizing)
         if k in ("geometry", "feature"):
-            ins = m.addMenu("挿入（追加）")
+            ins = m.addMenu("作成")
             for ft in ["box", "cylinder", "pipe", "cone", "sphere", "extrude"]:
-                menu_action(ins, FEATURES[ft][0], lambda ft=ft: self.add_feature(ft, "add"))
-            cut = m.addMenu("挿入（切り取り）")
-            menu_action(cut, "穴", lambda: self.add_feature("cylinder", "cut", hole=True))
-            menu_action(cut, "直方体", lambda: self.add_feature("box", "cut"))
-            menu_action(cut, "押し出し", lambda: self.add_feature("extrude", "cut"))
+                menu_action(ins, FEATURES[ft][0], lambda ft=ft: self.create_body(ft))
+            menu_action(m, "穴をあける…", self.create_hole)
+            menu_action(m, "結合（選択ボディ）", lambda: self.boolean("union"))
+            menu_action(m, "除去（選択ボディ）", lambda: self.boolean("cut"))
+            if k == "feature":
+                menu_action(m, "形状を編集…", lambda: self.edit_feature(node[1]))
             menu_action(m, "STEP を取り込む…", self.add_import_feature)
             menu_action(m, "ジオメトリを置き換え（STEP / STL）…", self.import_file)
-        if k in ("bc", "result", "sizing", "feature"):
+        if k in ("mats", "mat"):
+            menu_action(m, "新しい材料定数…", lambda: self.edit_material(f"材料{len(self.project.materials) + 1}"))
+        if k in ("attrs", "attr"):
+            menu_action(m, "新しいボディ属性…", lambda: (self.attr_name.setEditText(""), self.edit_attr()))
+        if k in ("bc", "result", "sizing", "feature", "attr", "mat"):
             m.addSeparator()
             menu_action(m, "削除", self.delete_current)
         if not m.isEmpty():
@@ -723,7 +1017,12 @@ class MainWindow(QMainWindow):
                  "info": "解析情報", "project": "プロジェクト", "model": "モデル (A4)", "coords": "座標系"}
         if k == "feature":
             f = self.project.geometry["features"][self.current[1]]
-            name = f"{FEATURES[f['type']][0]}{self.current[1] + 1}"
+            name = (f"{FEATURES[f['type']][0]}{self.current[1] + 1}" if f["type"] in FEATURES
+                    else "ブール演算")
+        elif k in ("attr", "mat"):
+            name = self.current[1]
+        elif k in ("attrs", "mats"):
+            name = "ボディ属性" if k == "attrs" else "材料定数"
         elif k == "bc":
             bc = self.project.bcs[self.current[1]]
             name = bc.name or BC_JP[bc.kind]
@@ -844,31 +1143,88 @@ class MainWindow(QMainWindow):
         self.project.geometry = {"kind": "model", "features": feats}
         return True
 
-    def add_feature(self, ftype, op="add", hole=False):
+    def _selected_bounds(self):
+        """選択中のボディ（無ければ全体）の範囲"""
+        if self.mesh is None:
+            return None
+        if self.selected_bodies and self.mesh.elem_body is not None:
+            m = np.isin(self.mesh.elem_body, self.selected_bodies)
+            pts = self.mesh.nodes[np.unique(self.mesh.elems[m])]
+            return pts.min(axis=0), pts.max(axis=0)
+        return self.mesh.bounds()
+
+    def create_body(self, ftype):
+        """［作成］→ ダイアログで基準点と寸法を入力 → 新しいボディ"""
         if not self._ensure_model():
             return
-        f = new_feature(ftype, op)
-        if self.mesh is not None and (hole or op != "add"):
-            # 既存の形状を貫く位置・大きさに自動配置
-            lo, hi = self.mesh.bounds()
-            c, sz = 0.5 * (lo + hi), hi - lo
-            if ftype == "cylinder":
-                f.update(x=float(c[0]), y=float(c[1]), z=float(lo[2] - 1), axis="Z", h=float(sz[2] + 2),
-                         r=float(max(min(sz[0], sz[1]) / 6, 0.5)))
-            elif ftype == "box":
-                f.update(x=float(c[0]), y=float(lo[1] - 1), z=float(c[2]), dx=float(sz[0] / 2 + 1),
-                         dy=float(sz[1] + 2), dz=float(sz[2] / 2 + 1))
-        elif self.mesh is not None and op == "add":
-            # 既存形状の +X 側に並べて置く（重なると自動で結合されます）
+        f = new_feature(ftype, "new")
+        if self.mesh is not None:
             lo, hi = self.mesh.bounds()
             if "x" in f:
-                f["x"] = float(hi[0])
+                f["x"] = float(hi[0])      # 既存形状の +X 側に並べる（重ねると接合されます）
             if ftype == "extrude":
                 f["offset"] = float(hi[2])
+        dlg = FeatureDialog(ftype, f, "の作成", self)
+        if not dlg.exec():
+            return
+        f.update(dlg.values())
         self._features().append(f)
-        self.selected_faces = []
+        self.selected_faces, self.selected_bodies = [], []
         self.current = ("feature", len(self._features()) - 1)
         self.remesh(reset_camera=len(self._features()) == 1)
+
+    def create_hole(self):
+        """選択したボディ（未選択なら全ボディ）に円柱の穴をあける"""
+        if self.mesh is None or not self._ensure_model():
+            QMessageBox.information(self, "穴", "先に形状を作成してください。")
+            return
+        lo, hi = self._selected_bounds()
+        c, sz = 0.5 * (lo + hi), hi - lo
+        f = new_feature("cylinder", "cut", x=float(c[0]), y=float(c[1]), z=float(lo[2] - 1), axis="Z",
+                        h=float(sz[2] + 2), r=float(max(min(sz[0], sz[1]) / 6, 0.5)))
+        targets = list(self.selected_bodies)
+        txt = ("対象ボディ: " + ", ".join(f"B{b}" for b in targets)) if targets else "対象ボディ: すべて"
+        dlg = FeatureDialog("cylinder", f, "（穴）", self, targets_text=txt)
+        if not dlg.exec():
+            return
+        f.update(dlg.values())
+        if targets:
+            f["targets"] = targets
+        self._features().append(f)
+        self.current = ("feature", len(self._features()) - 1)
+        self.remesh()
+
+    def boolean(self, op):
+        """結合 / 除去: 最初に選んだボディが対象、残りがツール（Femtet と同じ）"""
+        if len(self.selected_bodies) < 2:
+            QMessageBox.information(self, "ブール演算",
+                                    "ボディ選択モードで、まず対象ボディ、続けて Ctrl(⌘)+クリックで\n"
+                                    "ツールボディを選んでから押してください。")
+            return
+        tgt, tools = self.selected_bodies[0], self.selected_bodies[1:]
+        self._features().append({"type": "bool", "op": op, "target": int(tgt), "tools": [int(t) for t in tools]})
+        self.log(f"{'結合' if op == 'union' else '除去'}: B{tgt} ← {', '.join(f'B{t}' for t in tools)}")
+        self.selected_bodies = [tgt]
+        self.current = ("feature", len(self._features()) - 1)
+        self.remesh()
+
+    def edit_feature(self, i):
+        f = self._features()[i]
+        if f["type"] not in FEATURES:
+            return
+        dlg = FeatureDialog(f["type"], f, "の編集", self)
+        if dlg.exec():
+            f.update(dlg.values())
+            self.remesh()
+
+    def edit_selected_body(self):
+        if self.current[0] == "feature":
+            return self.edit_feature(self.current[1])
+        if self.selected_bodies and self.project.geometry.get("kind") == "model":
+            keys = {v: k for k, v in feature_body_keys(self._features()).items()}
+            if self.selected_bodies[0] in keys:
+                return self.edit_feature(keys[self.selected_bodies[0]])
+        QMessageBox.information(self, "形状編集", "ツリーで形状を選ぶか、ボディを1つ選んでから押してください。")
 
     def add_import_feature(self):
         path, _ = QFileDialog.getOpenFileName(self, "STEP を取り込む", "", "CAD (*.step *.stp *.STEP *.STP *.igs *.iges *.brep)")
@@ -883,9 +1239,29 @@ class MainWindow(QMainWindow):
     def _details_feature(self):
         i = self.current[1]
         f = self._features()[i]
+        if f["type"] == "bool":
+            s = self._section("ブール演算")
+            self._row(s, "種類", "結合" if f.get("op") == "union" else "除去")
+            self._row(s, "対象ボディ", f"B{f.get('target')}")
+            self._row(s, "ツールボディ", ", ".join(f"B{k}" for k in f.get("tools", [])))
+            b = QPushButton("この操作を取り消す（削除）")
+            b.clicked.connect(lambda: self._later(self.delete_current))
+            self._row(s, "", b)
+            return
         name, _, params = FEATURES[f["type"]]
+        keys = feature_body_keys(self._features())
+        if i in keys:
+            k = keys[i]
+            a = self.project.assignment(k)
+            s0 = self._section("ボディ")
+            self._row(s0, "ボディキー", f"B{k}")
+            self._row(s0, "ボディ属性名", a.get("attr") or "未定義")
+            self._row(s0, "材料名", a.get("mat") or "未定義")
         s = self._section("フィーチャー")
         self._row(s, "タイプ", name)
+        eb = QPushButton("形状を編集（ダイアログ）…")
+        eb.clicked.connect(lambda: self._later(lambda: self.edit_feature(i)))
+        self._row(s, "", eb)
         op = QComboBox()
         for k, v in OPS.items():
             op.addItem(v, k)
@@ -949,6 +1325,62 @@ class MainWindow(QMainWindow):
             self._regen_timer.setSingleShot(True)
             self._regen_timer.timeout.connect(lambda: self.remesh())
         self._regen_timer.start(350)
+
+    def _details_mats(self):
+        s = self._section("材料定数")
+        self._row(s, "登録数", len(self.project.materials))
+        if self.mesh is not None:
+            s2 = self._section("ボディへの割り当て")
+            for b in self.mesh.body_ids():
+                a = self.project.assignment(b)
+                self._row(s2, f"B{b}", f"{a.get('attr') or '未定義'} / {a.get('mat') or '未定義'}")
+        b = QPushButton("新しい材料定数…")
+        b.clicked.connect(lambda: self._later(lambda: self.edit_material(f"材料{len(self.project.materials) + 1}")))
+        self._row(self._section("操作"), "", b)
+
+    def _details_attrs(self):
+        s = self._section("ボディ属性")
+        self._row(s, "登録数", len(self.project.body_attrs))
+        self._row(s, "", "ボディを選び、上の欄に名前を入力して［設定］")
+
+    def _details_mat(self):
+        name = self.current[1]
+        m = self.project.materials.get(name)
+        if m is None:
+            return
+        s = self._section("材料定数")
+        self._row(s, "材料名", name)
+        for attr, label, lo, hi, dec, step in [("E", "ヤング率 [MPa]", 1e-3, 1e8, 1, 1000),
+                                               ("nu", "ポアソン比", 0, 0.4999, 4, 0.01),
+                                               ("density", "密度 [kg/m³]", 0, 1e6, 1, 10),
+                                               ("yield_strength", "引張降伏応力 [MPa]", 0, 1e6, 1, 5),
+                                               ("tensile_strength", "引張強さ [MPa]", 0, 1e6, 1, 5)]:
+            sp = dspin(getattr(m, attr), lo, hi, dec, step)
+            sp.valueChanged.connect(lambda v, attr=attr: (setattr(m, attr, v), self.invalidate()))
+            self._row(s, label, sp)
+        if self.mesh is not None:
+            used = [f"B{b}" for b in self.mesh.body_ids() if self.project.assignment(b).get("mat") == name]
+            self._row(self._section("使用しているボディ"), "", ", ".join(used) or "なし")
+        b = QPushButton("編集（名前変更・材料DB）…")
+        b.clicked.connect(lambda: self._later(lambda: self.edit_material(name)))
+        self._row(self._section("操作"), "", b)
+
+    def _details_attr(self):
+        name = self.current[1]
+        props = self.project.body_attrs.get(name, {})
+        s = self._section("Body 属性")
+        self._row(s, "ボディ属性名", name)
+        sp = dspin(float(props.get("mesh_size", 0) or 0), 0, 1e6, 3, 0.5, "mm")
+        sp.setSpecialValueText("自動")
+
+        def setsize(v):
+            self.project.body_attrs.setdefault(name, {})["mesh_size"] = v
+            self.invalidate(mesh=True)
+        sp.valueChanged.connect(setsize)
+        self._row(s, "メッシュサイズ", sp)
+        if self.mesh is not None:
+            used = [f"B{b}" for b in self.mesh.body_ids() if self.project.assignment(b).get("attr") == name]
+            self._row(self._section("使用しているボディ"), "", ", ".join(used) or "なし")
 
     def _details_material(self):
         m = self.project.material
@@ -1207,9 +1639,50 @@ class MainWindow(QMainWindow):
     def delete_current(self):
         k = self.current[0]
         if k == "feature":
-            del self._features()[self.current[1]]
+            i = self.current[1]
+            feats = self._features()
+            keys = feature_body_keys(feats)
+            gone = keys.get(i)
+            del feats[i]
+            if gone is not None:
+                # 後ろのボディ番号を詰める（属性の割り当てと参照を付け替え）
+                ba = {}
+                for kk, v in self.project.body_assign.items():
+                    kk = int(kk)
+                    if kk == gone:
+                        continue
+                    ba[str(kk - 1 if kk > gone else kk)] = v
+                self.project.body_assign = ba
+                fix = lambda x: x - 1 if x > gone else x  # noqa: E731
+                for f in feats:
+                    if f.get("type") == "bool":
+                        f["target"] = fix(int(f["target"]))
+                        f["tools"] = [fix(int(t)) for t in f.get("tools", []) if int(t) != gone]
+                    if f.get("targets"):
+                        f["targets"] = [fix(int(t)) for t in f["targets"] if int(t) != gone]
             self.current = ("geometry",)
+            self.selected_bodies = []
             self.remesh()
+            return
+        if k == "attr":
+            name = self.current[1]
+            self.project.body_attrs.pop(name, None)
+            for d in self.project.body_assign.values():
+                if d.get("attr") == name:
+                    d.pop("attr", None)
+            self._fill_attr_combos()
+            self.invalidate(mesh=True)
+            self.select_node(("attrs",))
+            return
+        if k == "mat":
+            name = self.current[1]
+            self.project.materials.pop(name, None)
+            for d in self.project.body_assign.values():
+                if d.get("mat") == name:
+                    d.pop("mat", None)
+            self._fill_attr_combos()
+            self.invalidate()
+            self.select_node(("mats",))
             return
         if k == "bc":
             del self.project.bcs[self.current[1]]
@@ -1255,13 +1728,15 @@ class MainWindow(QMainWindow):
             self.mesh_dirty = False
             self.result = None
             self.selected_faces = []
+            self.selected_bodies = []
+            self._fill_attr_combos()
             self.rebuild_tree()
             self.refresh_view()
             return False
         try:
             mesh = build_mesh(self.project.geometry, self.project.mesh_size, self.project.mesh_order,
                               log=lambda m: (self.log(str(m)), QApplication.processEvents()),
-                              local_sizes=self.project.local_sizes)
+                              local_sizes=self.project.local_sizes + self.project.body_local_sizes(self.mesh))
         except Exception as e:
             self._busy(False)
             msg = str(e) if isinstance(e, (GeometryError, ValueError, RuntimeError)) else traceback.format_exc()
@@ -1273,6 +1748,13 @@ class MainWindow(QMainWindow):
         self.mesh = mesh
         self.mesh_dirty = False
         mesh.face_info()
+        p = self.project
+        if not p.body_assign and not p.materials and p.geometry.get("kind") != "model":
+            # 旧形式（材料が1つ）のプロジェクト: すべてのボディに同じ材料を割り当て
+            p.materials[p.material.name] = p.material
+            p.assign(mesh.body_ids().tolist(), mat=p.material.name)
+        self.selected_bodies = [b for b in self.selected_bodies if b in set(mesh.body_ids().tolist())]
+        self._fill_attr_combos()
         self.selected_faces = [f for f in self.selected_faces if f < mesh.n_faces]
         self.result = None
         self.solve_error = ""
@@ -1309,10 +1791,17 @@ class MainWindow(QMainWindow):
         if self.mesh is None or self.mesh_dirty:
             if not self.remesh():
                 return
+        try:
+            em = self.project.elem_materials(self.mesh)
+        except ValueError as e:
+            QMessageBox.warning(self, "材料定数", str(e))
+            self.set_attr_mode(0)
+            self.ribbon.setCurrentIndex(self.tab_model)
+            return
         self.solver_log = []
         self._busy(True, "解析を実行しています…")
         self.worker = Worker(solve, self.mesh, self.project.material, list(self.project.bcs),
-                             method=self.project.solver)
+                             method=self.project.solver, elem_materials=em)
         self.worker.log.connect(lambda m: (self.solver_log.append(m), self.log(m)))
         self.worker.done.connect(self._on_solved)
         self.worker.failed.connect(self._on_solve_failed)
@@ -1382,11 +1871,19 @@ class MainWindow(QMainWindow):
         if cell < 0:
             if not add:
                 self.set_selection([])
+                self.set_body_selection([])
             return
-        f = int(self.mesh.face_ids[self._tri_src[cell]])
+        tri = self._tri_src[cell]
         if self.sel_body_btn.isChecked():
-            self.select_body()
+            b = int(self.mesh.tri_body()[tri])
+            sel = list(self.selected_bodies)
+            if add:
+                sel.remove(b) if b in sel else sel.append(b)
+            else:
+                sel = [b]
+            self.set_body_selection(sel)
             return
+        f = int(self.mesh.face_ids[tri])
         sel = list(self.selected_faces)
         if add:
             sel.remove(f) if f in sel else sel.append(f)
@@ -1413,13 +1910,38 @@ class MainWindow(QMainWindow):
         m.exec(self.face_list_btn.mapToGlobal(self.face_list_btn.rect().bottomLeft()))
 
     def select_body(self):
+        """全選択（ボディモードなら全ボディ、面モードなら全ての面）"""
         if self.mesh is None:
             return
-        self.sel_body_btn.setChecked(True)
-        self.sel_face_btn.setChecked(False)
-        self.set_selection(list(range(self.mesh.n_faces)))
+        if self.sel_body_btn.isChecked():
+            self.set_body_selection(self.mesh.body_ids().tolist())
+        else:
+            self.set_selection(list(range(self.mesh.n_faces)))
 
-    def set_selection(self, faces):
+    def set_body_selection(self, bodies):
+        seen = []
+        for b in bodies:   # 選んだ順を保つ（ブール演算の「対象」は最初のボディ）
+            if int(b) not in seen:
+                seen.append(int(b))
+        self.selected_bodies = seen
+        self._sync_attr_from_selection()
+        self._update_sel_status()
+        self.refresh_view()
+
+    def _update_sel_status(self):
+        if self.sel_body_btn.isChecked():
+            if self.selected_bodies:
+                names = []
+                for b in self.selected_bodies:
+                    a = self.project.assignment(b)
+                    names.append(f"B{b}[{a.get('attr') or '未定義'}/{a.get('mat') or '未定義'}]")
+                self.sel_status.setText(f"{len(self.selected_bodies)} ボディを選択中: " + "  ".join(names))
+            else:
+                self.sel_status.setText("選択なし（ボディ選択モード）")
+            return
+        self.set_selection(self.selected_faces, refresh=False)
+
+    def set_selection(self, faces, refresh=True):
         self.selected_faces = sorted(set(int(f) for f in faces))
         if self.mesh is not None and self.selected_faces:
             info = {f["id"]: f for f in self.mesh.face_info()}
@@ -1431,7 +1953,8 @@ class MainWindow(QMainWindow):
         else:
             txt = "選択なし"
         self.sel_status.setText(txt)
-        self.refresh_view()
+        if refresh:
+            self.refresh_view()
 
     # ======================================================================= 描画
     def _deform_scale(self):
@@ -1510,6 +2033,26 @@ class MainWindow(QMainWindow):
         elif k == "sizing":
             for f in self.project.local_sizes[self.current[1]]["faces"]:
                 rgb[fid == f] = _hex("#3a8fa8")
+        elif k in ("geometry", "feature", "attrs", "attr", "mats", "mat", "model", "project", "coords") \
+                and mesh.elem_body is not None:
+            # ボディごとに材料の色で塗り分け（未定義は灰色）
+            tb = mesh.tri_body()[src]
+            mats = list(self.project.materials.keys())
+            for b in mesh.body_ids():
+                a = self.project.assignment(b)
+                col = (MAT_PALETTE[mats.index(a["mat"]) % len(MAT_PALETTE)]
+                       if a.get("mat") in self.project.materials else GEOM_COLOR)
+                if k == "attr" and a.get("attr") == self.current[1]:
+                    col = "#3a8fa8"
+                if k == "mat" and a.get("mat") != self.current[1]:
+                    col = "#e0e0e0"
+                rgb[tb == b] = _hex(col)
+                a_txt = f"{a.get('attr') or '未定義'} / {a.get('mat') or '未定義'}"
+                sw = col if a.get("mat") in self.project.materials else "#999999"
+                overlay.append(f"<span style='color:{sw}'>■</span> B{b}: {a_txt}")
+            if self.selected_bodies:
+                for b in self.selected_bodies:
+                    rgb[tb == b] = _hex(SELECT_COLOR)
         for f in self.selected_faces:
             rgb[fid == f] = _hex(SELECT_COLOR)
         poly.cell_data["rgb"] = (rgb * 255).astype(np.uint8)
@@ -1524,6 +2067,8 @@ class MainWindow(QMainWindow):
                 _labels(pl, pts, labs, 14, "white", bg="#333333")
             head = "<b>静的構造</b><br>" + datetime.datetime.now().strftime("%Y/%m/%d %H:%M") + "<br>"
             self._set_overlay(head + "<br>".join(overlay))
+        elif overlay:
+            self._set_overlay("<b>ボディ</b>（ボディ属性 / 材料）<br>" + "<br>".join(overlay))
         elif k in ("mesh", "sizing"):
             self._set_overlay(f"<b>メッシュ</b><br>節点 {mesh.n_nodes:,}<br>要素 {mesh.n_elems:,}"
                               + ("<br><span style='color:#b8860b'>⚡ 再生成が必要</span>" if self.mesh_dirty else ""))

@@ -30,6 +30,9 @@ class Mesh:
     _btri: np.ndarray | None = field(default=None, repr=False)
     _btri_full: np.ndarray | None = field(default=None, repr=False)
     face_ids: np.ndarray | None = None   # 境界三角形ごとの面番号
+    elem_body: np.ndarray | None = None  # 要素ごとのボディ番号（ボディキー）
+    body_names: dict | None = None       # ボディ番号 → 表示名
+    _btri_owner: np.ndarray | None = field(default=None, repr=False)
 
     def __post_init__(self):
         self.nodes = np.asarray(self.nodes, dtype=float)
@@ -91,6 +94,8 @@ class Mesh:
         if self.face_ids is not None:
             # 頂点番号は変わらないので境界三角形の並びも同じ
             new.set_face_ids(self.face_ids.copy())
+        new.elem_body = None if self.elem_body is None else self.elem_body.copy()
+        new.body_names = self.body_names
         return new
 
     # ------------------------------------------------------------------ 境界
@@ -101,6 +106,7 @@ class Mesh:
         _, idx, counts = np.unique(key, axis=0, return_index=True, return_counts=True)
         once = idx[counts == 1]
         self._btri = faces[once]
+        self._btri_owner = once % len(e)
         if self.order == 2:
             full = np.concatenate([e[:, TET10_FACES[k]] for k in range(4)])
             self._btri_full = full[once]
@@ -189,6 +195,33 @@ class Mesh:
                          "normal": nn / nl if nl > 1e-12 else np.zeros(3),
                          "flat": bool(nl / A > 0.999) if A > 0 else False})
         return info
+
+    @property
+    def boundary_owner(self) -> np.ndarray:
+        """境界三角形ごとの所属要素番号"""
+        if self._btri is None:
+            self._compute_boundary()
+        return self._btri_owner
+
+    @property
+    def n_bodies(self) -> int:
+        return 1 if self.elem_body is None else int(self.elem_body.max()) + 1
+
+    def body_ids(self) -> np.ndarray:
+        """ボディ番号の一覧（存在するもの）"""
+        return np.array([0]) if self.elem_body is None else np.unique(self.elem_body)
+
+    def tri_body(self) -> np.ndarray:
+        """境界三角形ごとのボディ番号"""
+        if self.elem_body is None:
+            return np.zeros(len(self.boundary_tris), dtype=int)
+        return self.elem_body[self.boundary_owner]
+
+    def body_faces(self, body) -> list[int]:
+        """ボディの外側の面番号"""
+        if self.face_ids is None:
+            self.group_faces()
+        return sorted(set(self.face_ids[self.tri_body() == body].tolist()))
 
     def face_tris(self, face_id: int, full: bool = True) -> np.ndarray:
         if self.face_ids is None:
