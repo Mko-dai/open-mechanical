@@ -24,7 +24,9 @@ Ansys Mechanical の代わりに使える、**無料の静的構造解析ソフ�
 
 ## インストール（Mac）
 
-ターミナルで：
+Finder で `start.command` を**ダブルクリック**するだけで起動します（初回は自動でセットアップ）。
+
+ターミナルから起動する場合：
 
 ```bash
 cd ~/kouchan_program/open-mechanical
