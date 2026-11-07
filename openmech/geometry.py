@@ -30,6 +30,168 @@ PRIMITIVES = {
     "sphere": ("球", [("r", "半径 [mm]", 25.0)]),
 }
 
+# ---------------------------------------------------------------------------- モデリング（フィーチャー）
+# Ansys DesignModeler と同じく、形状を「フィーチャー」の積み重ねで作る。
+# 各フィーチャーは 操作 op = add（追加）/ cut（切り取り）/ intersect（交差）を持つ。
+AXES = ["X", "Y", "Z"]
+PLANES = ["XY", "YZ", "ZX"]
+FEATURES = {
+    # type: (表示名, アイコン文字, [(キー, 表示名, 既定値)])  値が文字列の項目は選択肢
+    "box": ("直方体", "箱", [("x", "原点 X [mm]", 0.0), ("y", "原点 Y [mm]", 0.0), ("z", "原点 Z [mm]", 0.0),
+                          ("dx", "長さ X [mm]", 100.0), ("dy", "幅 Y [mm]", 50.0), ("dz", "高さ Z [mm]", 20.0)]),
+    "cylinder": ("円柱", "円", [("x", "底面中心 X [mm]", 0.0), ("y", "底面中心 Y [mm]", 0.0),
+                              ("z", "底面中心 Z [mm]", 0.0), ("axis", "軸方向", "Z"),
+                              ("r", "半径 [mm]", 10.0), ("h", "長さ [mm]", 50.0)]),
+    "pipe": ("パイプ", "管", [("x", "底面中心 X [mm]", 0.0), ("y", "底面中心 Y [mm]", 0.0),
+                           ("z", "底面中心 Z [mm]", 0.0), ("axis", "軸方向", "Z"),
+                           ("ro", "外半径 [mm]", 20.0), ("ri", "内半径 [mm]", 15.0), ("h", "長さ [mm]", 100.0)]),
+    "cone": ("円錐", "錐", [("x", "底面中心 X [mm]", 0.0), ("y", "底面中心 Y [mm]", 0.0),
+                          ("z", "底面中心 Z [mm]", 0.0), ("axis", "軸方向", "Z"),
+                          ("r1", "底面半径 [mm]", 20.0), ("r2", "上面半径 [mm]", 5.0), ("h", "高さ [mm]", 40.0)]),
+    "sphere": ("球", "球", [("x", "中心 X [mm]", 0.0), ("y", "中心 Y [mm]", 0.0), ("z", "中心 Z [mm]", 0.0),
+                          ("r", "半径 [mm]", 25.0)]),
+    "extrude": ("押し出し", "押", [("plane", "スケッチ平面", "XY"), ("offset", "平面の位置 [mm]", 0.0),
+                               ("points", "頂点 (u,v; u,v; …) [mm]", "0,0; 80,0; 80,10; 10,10; 10,60; 0,60"),
+                               ("h", "押し出し長さ [mm]", 30.0)]),
+    "import": ("インポート", "読", [("path", "ファイル", ""),
+                                 ("dx", "移動 X [mm]", 0.0), ("dy", "移動 Y [mm]", 0.0), ("dz", "移動 Z [mm]", 0.0)]),
+}
+OPS = {"add": "追加", "cut": "切り取り", "intersect": "交差"}
+
+
+def new_feature(ftype, op="add", **over):
+    f = {"type": ftype, "op": op}
+    for k, _, d in FEATURES[ftype][2]:
+        f[k] = d
+    f.update(over)
+    return f
+
+
+def _axis_vec(axis, h):
+    return {"X": (h, 0, 0), "Y": (0, h, 0), "Z": (0, 0, h)}[str(axis).upper()]
+
+
+def parse_points(text):
+    pts = []
+    for chunk in str(text).replace("\n", ";").split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        a = [float(v) for v in chunk.replace(" ", ",").split(",") if v.strip()]
+        if len(a) != 2:
+            raise GeometryError(f"頂点の書式が正しくありません: 「{chunk}」（例: 0,0; 50,0; 50,20）")
+        pts.append(a)
+    if len(pts) < 3:
+        raise GeometryError("押し出しには 3 点以上の頂点が必要です")
+    return pts
+
+
+def _make_feature(gmsh, f):
+    occ = gmsh.model.occ
+    t = f["type"]
+    g = lambda k: float(f.get(k, 0.0))  # noqa: E731
+    if t == "box":
+        if min(g("dx"), g("dy"), g("dz")) <= 0:
+            raise GeometryError("直方体の寸法は正の値にしてください")
+        return [(3, occ.addBox(g("x"), g("y"), g("z"), g("dx"), g("dy"), g("dz")))]
+    if t == "cylinder":
+        return [(3, occ.addCylinder(g("x"), g("y"), g("z"), *_axis_vec(f.get("axis", "Z"), g("h")), g("r")))]
+    if t == "pipe":
+        if g("ri") >= g("ro"):
+            raise GeometryError("パイプの内半径は外半径より小さくしてください")
+        a = occ.addCylinder(g("x"), g("y"), g("z"), *_axis_vec(f.get("axis", "Z"), g("h")), g("ro"))
+        if g("ri") <= 0:
+            return [(3, a)]
+        b = occ.addCylinder(g("x"), g("y"), g("z"), *_axis_vec(f.get("axis", "Z"), g("h")), g("ri"))
+        out, _ = occ.cut([(3, a)], [(3, b)])
+        return out
+    if t == "cone":
+        return [(3, occ.addCone(g("x"), g("y"), g("z"), *_axis_vec(f.get("axis", "Z"), g("h")), g("r1"), g("r2")))]
+    if t == "sphere":
+        return [(3, occ.addSphere(g("x"), g("y"), g("z"), g("r")))]
+    if t == "extrude":
+        pts = parse_points(f.get("points", ""))
+        off, h, pl = g("offset"), g("h"), f.get("plane", "XY")
+        to3 = {"XY": lambda u, v: (u, v, off), "YZ": lambda u, v: (off, u, v),
+               "ZX": lambda u, v: (v, off, u)}[pl]
+        vec = {"XY": (0, 0, h), "YZ": (h, 0, 0), "ZX": (0, h, 0)}[pl]
+        ptags = [occ.addPoint(*to3(u, v)) for u, v in pts]
+        lines = [occ.addLine(ptags[i], ptags[(i + 1) % len(ptags)]) for i in range(len(ptags))]
+        loop = occ.addCurveLoop(lines)
+        surf = occ.addPlaneSurface([loop])
+        ext = occ.extrude([(2, surf)], *vec)
+        return [e for e in ext if e[0] == 3]
+    if t == "import":
+        path = f.get("path", "")
+        ext = os.path.splitext(path)[1].lower()
+        if ext in PARASOLID_EXT:
+            raise GeometryError(PARASOLID_MESSAGE)
+        if ext not in CAD_EXT:
+            raise GeometryError("モデリングに取り込めるのは STEP / IGES / BREP です（STL は「ジオメトリ → インポート」で）")
+        if not os.path.exists(path):
+            raise GeometryError(f"ファイルが見つかりません: {path}")
+        gmsh.option.setString("Geometry.OCCTargetUnit", "MM")
+        out = [e for e in occ.importShapes(path) if e[0] == 3]
+        if g("dx") or g("dy") or g("dz"):
+            occ.translate(out, g("dx"), g("dy"), g("dz"))
+        return out
+    raise GeometryError(f"未知のフィーチャー: {t}")
+
+
+def _build_features(gmsh, features):
+    occ = gmsh.model.occ
+    body = []
+    for i, f in enumerate(features):
+        if f.get("suppressed"):
+            continue
+        tool = _make_feature(gmsh, f)
+        if not tool:
+            continue
+        op = f.get("op", "add")
+        try:
+            if op == "add" or not body:
+                if op != "add" and not body:
+                    occ.remove(tool, recursive=True)   # 削る相手がまだ無い
+                    continue
+                body = tool if not body else occ.fuse(body, tool)[0]
+            elif op == "cut":
+                body = occ.cut(body, tool)[0]
+            elif op == "intersect":
+                body = occ.intersect(body, tool)[0]
+        except Exception as e:
+            raise GeometryError(f"フィーチャー {i + 1}（{FEATURES[f['type']][0]}）の{OPS.get(op, op)}に失敗しました: {e}")
+    occ.synchronize()
+    if not gmsh.model.getEntities(3):
+        raise GeometryError("ソリッドがありません。フィーチャーを追加してください。")
+
+
+def primitive_to_features(spec):
+    """「簡単形状」をフィーチャーに変換（モデリングで編集できるようにする）"""
+    k = spec.get("kind")
+    g = lambda key: float(spec.get(key, dict((a, d) for a, _, d in PRIMITIVES[k][1])[key]))  # noqa: E731
+    if k == "box":
+        return [new_feature("box", dx=g("lx"), dy=g("ly"), dz=g("lz"))]
+    if k == "cylinder":
+        return [new_feature("cylinder", r=g("r"), h=g("h"))]
+    if k == "pipe":
+        return [new_feature("pipe", ro=g("ro"), ri=g("ri"), h=g("h"))]
+    if k == "sphere":
+        return [new_feature("sphere", r=g("r"))]
+    if k == "plate_hole":
+        lx, ly, t, d = g("lx"), g("ly"), g("t"), g("d")
+        return [new_feature("box", dx=lx, dy=ly, dz=t),
+                new_feature("cylinder", "cut", x=lx / 2, y=ly / 2, z=-1.0, r=d / 2, h=t + 2)]
+    if k == "l_bracket":
+        a, b, w, t, d = g("a"), g("b"), g("w"), g("t"), g("d")
+        out = [new_feature("box", dx=a, dy=w, dz=t), new_feature("box", dx=t, dy=w, dz=b)]
+        if d > 0:
+            out.append(new_feature("cylinder", "cut", x=t + (a - t) * 0.6, y=w / 2, z=-1.0, r=d / 2, h=t + 2))
+        return out
+    if k == "file" and os.path.splitext(spec.get("path", ""))[1].lower() in CAD_EXT:
+        return [new_feature("import", path=spec["path"])]
+    return None
+
+
 CAD_EXT = (".step", ".stp", ".igs", ".iges", ".brep", ".brp")
 MESH_EXT = (".stl",)
 PARASOLID_EXT = (".x_t", ".x_b", ".xmt_txt", ".xmt_bin")
@@ -257,7 +419,9 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
 
     gmsh = _gmsh_init()
     try:
-        if kind in PRIMITIVES:
+        if kind == "model":
+            _build_features(gmsh, spec.get("features", []))
+        elif kind in PRIMITIVES:
             _build_primitive(gmsh, kind, spec)
         elif kind == "file":
             if not os.path.exists(path):

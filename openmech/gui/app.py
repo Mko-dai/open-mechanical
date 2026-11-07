@@ -25,7 +25,7 @@ import traceback
 import numpy as np
 from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QFont, QIcon, QKeySequence, QPainter, QPixmap
-from PySide6.QtWidgets import (QApplication, QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
                                QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
                                QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
                                QPushButton, QSplitter, QTabWidget, QToolButton, QTreeWidget,
@@ -36,7 +36,8 @@ from pyvistaqt import QtInteractor
 
 from .. import __version__
 from ..export import write_csv, write_report, write_vtu
-from ..geometry import CAD_EXT, PRIMITIVES, GeometryError, build_mesh, gmsh_available
+from ..geometry import (AXES, CAD_EXT, FEATURES, OPS, PLANES, PRIMITIVES, GeometryError, build_mesh,
+                        gmsh_available, new_feature, primitive_to_features)
 from ..materials import LIBRARY, Material
 from ..project import Project
 from ..solver import BC, solve
@@ -66,6 +67,7 @@ RESULT_TYPE_JP = {
     "全変形 [mm]": "全変形", "相当応力（ミーゼス） [MPa]": "相当 (von-Mises) 応力",
     "安全率（降伏基準）": "安全率（最大相当応力基準）",
 }
+OP_COLORS = {"add": "#4a78c2", "cut": "#c0392b", "intersect": "#8e44ad"}
 GEOM_COLOR = "#c9cdd3"
 SELECT_COLOR = "#33d633"
 STATUS_OK, STATUS_PENDING, STATUS_ERROR, STATUS_NONE = "ok", "pending", "error", ""
@@ -271,6 +273,8 @@ class MainWindow(QMainWindow):
         if not gmsh_available():
             self.log("⚠ gmsh が見つかりません。直方体以外の形状と CAD 読込には `pip install gmsh` が必要です。")
         self.remesh(reset_camera=True)
+        if self.mesh is None:
+            self.ribbon.setCurrentIndex(self.tab_model)
 
     # ======================================================================= UI 構築
     def _build_ui(self):
@@ -393,6 +397,22 @@ class MainWindow(QMainWindow):
         R.button(g, "レポート", make_icon("#7a5cc2", "報"), self.export_report)
         R.button(g, "VTU", make_icon("#7a5cc2", "V"), self.export_vtu)
         R.button(g, "CSV", make_icon("#7a5cc2", "表"), self.export_csv)
+        # --- モデリング
+        t = R.add_tab("モデリング")
+        g = R.add_group(t, "作成（追加）")
+        for ft in ["box", "cylinder", "pipe", "cone", "sphere", "extrude"]:
+            R.button(g, FEATURES[ft][0], make_icon(OP_COLORS["add"], FEATURES[ft][1]),
+                     lambda _=False, ft=ft: self.add_feature(ft, "add"))
+        g = R.add_group(t, "切り取り")
+        R.button(g, "穴", make_icon(OP_COLORS["cut"], "穴"), lambda: self.add_feature("cylinder", "cut", hole=True))
+        R.button(g, "直方体で切取", make_icon(OP_COLORS["cut"], "箱"), lambda: self.add_feature("box", "cut"))
+        R.button(g, "押し出しで切取", make_icon(OP_COLORS["cut"], "押"), lambda: self.add_feature("extrude", "cut"))
+        g = R.add_group(t, "取り込み")
+        R.button(g, "STEP 取込", make_icon(OP_COLORS["add"], "読"), self.add_import_feature)
+        g = R.add_group(t, "編集")
+        R.button(g, "削除", make_icon("#888888", "×"), self.delete_current)
+        R.button(g, "生成", make_icon("#3a8fa8", "⟳"), lambda: self.remesh())
+        self.tab_model = R.count() - 1
         # --- 環境（静的構造）
         t = R.add_tab("環境")
         g = R.add_group(t, "静的構造")
@@ -583,8 +603,16 @@ class MainWindow(QMainWindow):
         proj = add(None, "プロジェクト", ("project",), "#6c7a89", "P", bold=True)
         model = add(proj, "モデル (A4)", ("model",), "#6c7a89", "M")
         geo = add(model, "ジオメトリ", ("geometry",), "#4a78c2", "G")
-        add(geo, self.project.geometry_desc() if self.project.geometry.get("kind") != "file"
-            else os.path.basename(self.project.geometry.get("path", "")), ("geometry",), "#7f9cc9", "体")
+        gk = self.project.geometry.get("kind")
+        if gk == "model":
+            for i, f in enumerate(self.project.geometry.get("features", [])):
+                name, ch, _ = FEATURES[f["type"]]
+                op = f.get("op", "add")
+                label = f"{name}{i + 1}" + ("" if op == "add" else f"（{OPS[op]}）")
+                add(geo, label, ("feature", i), OP_COLORS[op], ch)
+        else:
+            add(geo, self.project.geometry_desc() if gk != "file"
+                else os.path.basename(self.project.geometry.get("path", "")), ("geometry",), "#7f9cc9", "体")
         add(model, "材料", ("material",), "#b07b2c", "材")
         add(model, "座標系", ("coords",), "#6c7a89", "XY")
         mesh = add(model, "メッシュ", ("mesh",), "#3a8fa8", "網")
@@ -637,7 +665,9 @@ class MainWindow(QMainWindow):
         self.probe_text = None
         self.build_details()
         k = self.current[0]
-        if k in ("analysis", "bc", "settings"):
+        if k in ("feature",) or (k == "geometry" and self.project.geometry.get("kind") == "model"):
+            self.ribbon.setCurrentIndex(self.tab_model)
+        elif k in ("analysis", "bc", "settings"):
             self.ribbon.setCurrentIndex(self.tab_env)
         elif k in ("solution", "result", "info"):
             self.ribbon.setCurrentIndex(self.tab_res)
@@ -667,9 +697,17 @@ class MainWindow(QMainWindow):
         if k in ("mesh", "sizing"):
             menu_action(m, "メッシュを生成", lambda: self.remesh())
             menu_action(m, "挿入 → 面サイズ指定", self.add_sizing)
-        if k in ("geometry",):
-            menu_action(m, "ジオメトリをインポート…", self.import_file)
-        if k in ("bc", "result", "sizing"):
+        if k in ("geometry", "feature"):
+            ins = m.addMenu("挿入（追加）")
+            for ft in ["box", "cylinder", "pipe", "cone", "sphere", "extrude"]:
+                menu_action(ins, FEATURES[ft][0], lambda ft=ft: self.add_feature(ft, "add"))
+            cut = m.addMenu("挿入（切り取り）")
+            menu_action(cut, "穴", lambda: self.add_feature("cylinder", "cut", hole=True))
+            menu_action(cut, "直方体", lambda: self.add_feature("box", "cut"))
+            menu_action(cut, "押し出し", lambda: self.add_feature("extrude", "cut"))
+            menu_action(m, "STEP を取り込む…", self.add_import_feature)
+            menu_action(m, "ジオメトリを置き換え（STEP / STL）…", self.import_file)
+        if k in ("bc", "result", "sizing", "feature"):
             m.addSeparator()
             menu_action(m, "削除", self.delete_current)
         if not m.isEmpty():
@@ -683,7 +721,10 @@ class MainWindow(QMainWindow):
         title = {"geometry": "ジオメトリ", "material": "材料", "mesh": "メッシュ", "sizing": "面サイズ指定",
                  "analysis": "静的構造 (A5)", "settings": "解析設定", "solution": "解析結果 (A6)",
                  "info": "解析情報", "project": "プロジェクト", "model": "モデル (A4)", "coords": "座標系"}
-        if k == "bc":
+        if k == "feature":
+            f = self.project.geometry["features"][self.current[1]]
+            name = f"{FEATURES[f['type']][0]}{self.current[1] + 1}"
+        elif k == "bc":
             bc = self.project.bcs[self.current[1]]
             name = bc.name or BC_JP[bc.kind]
         elif k == "result":
@@ -729,13 +770,19 @@ class MainWindow(QMainWindow):
         g = self.project.geometry
         s = self._section("定義")
         kind = QComboBox()
+        kind.addItem("モデリング（フィーチャー）", "model")
         for k, (name, _) in PRIMITIVES.items():
-            kind.addItem(name, k)
-        kind.addItem("CAD ファイル", "file")
+            kind.addItem("簡単形状: " + name, k)
+        kind.addItem("CAD ファイル（STEP / STL）", "file")
         kind.setCurrentIndex(max(0, kind.findData(g.get("kind"))))
         kind.currentIndexChanged.connect(lambda _: self._later(lambda d=kind.currentData(): self._geometry_kind_changed(d)))
         self._row(s, "形状", kind)
-        if g.get("kind") == "file":
+        if g.get("kind") == "model":
+            n = len(g.get("features", []))
+            self._row(s, "フィーチャー数", n)
+            self._row(s, "", "リボンの「モデリング」タブで形状を追加します" if n == 0
+                      else "ツリーのフィーチャーを選ぶと寸法を編集できます")
+        elif g.get("kind") == "file":
             self._row(s, "ファイル", os.path.basename(g.get("path", "")))
             b = QPushButton("別のファイルを読み込む…")
             b.clicked.connect(self.import_file)
@@ -766,6 +813,10 @@ class MainWindow(QMainWindow):
         if kind == "file":
             self.import_file()
             return
+        if kind == "model":
+            feats = primitive_to_features(self.project.geometry) or []
+            self._set_geometry({"kind": "model", "features": feats}, keep_bcs=True)
+            return
         spec = {"kind": kind, **{k: d for k, _, d in PRIMITIVES[kind][1]}}
         self._set_geometry(spec)
 
@@ -773,6 +824,131 @@ class MainWindow(QMainWindow):
         spec = dict(self.project.geometry)
         spec[key] = v
         self._set_geometry(spec, keep_bcs=True)
+
+    # ---------------------------------------------------------------- モデリング
+    def _features(self):
+        return self.project.geometry.setdefault("features", [])
+
+    def _ensure_model(self):
+        """簡単形状・STEP をフィーチャーに変換してモデリングできるようにする"""
+        g = self.project.geometry
+        if g.get("kind") == "model":
+            return True
+        feats = primitive_to_features(g)
+        if feats is None:
+            r = QMessageBox.question(self, "モデリング", "現在の形状（STL など）はモデリングで編集できません。\n"
+                                     "形状を消して新しくモデリングを始めますか？")
+            if r != QMessageBox.Yes:
+                return False
+            feats = []
+        self.project.geometry = {"kind": "model", "features": feats}
+        return True
+
+    def add_feature(self, ftype, op="add", hole=False):
+        if not self._ensure_model():
+            return
+        f = new_feature(ftype, op)
+        if self.mesh is not None and (hole or op != "add"):
+            # 既存の形状を貫く位置・大きさに自動配置
+            lo, hi = self.mesh.bounds()
+            c, sz = 0.5 * (lo + hi), hi - lo
+            if ftype == "cylinder":
+                f.update(x=float(c[0]), y=float(c[1]), z=float(lo[2] - 1), axis="Z", h=float(sz[2] + 2),
+                         r=float(max(min(sz[0], sz[1]) / 6, 0.5)))
+            elif ftype == "box":
+                f.update(x=float(c[0]), y=float(lo[1] - 1), z=float(c[2]), dx=float(sz[0] / 2 + 1),
+                         dy=float(sz[1] + 2), dz=float(sz[2] / 2 + 1))
+        elif self.mesh is not None and op == "add":
+            # 既存形状の +X 側に並べて置く（重なると自動で結合されます）
+            lo, hi = self.mesh.bounds()
+            if "x" in f:
+                f["x"] = float(hi[0])
+            if ftype == "extrude":
+                f["offset"] = float(hi[2])
+        self._features().append(f)
+        self.selected_faces = []
+        self.current = ("feature", len(self._features()) - 1)
+        self.remesh(reset_camera=len(self._features()) == 1)
+
+    def add_import_feature(self):
+        path, _ = QFileDialog.getOpenFileName(self, "STEP を取り込む", "", "CAD (*.step *.stp *.STEP *.STP *.igs *.iges *.brep)")
+        if not path:
+            return
+        if not self._ensure_model():
+            return
+        self._features().append(new_feature("import", path=path))
+        self.current = ("feature", len(self._features()) - 1)
+        self.remesh(reset_camera=True)
+
+    def _details_feature(self):
+        i = self.current[1]
+        f = self._features()[i]
+        name, _, params = FEATURES[f["type"]]
+        s = self._section("フィーチャー")
+        self._row(s, "タイプ", name)
+        op = QComboBox()
+        for k, v in OPS.items():
+            op.addItem(v, k)
+        op.setCurrentIndex(max(0, op.findData(f.get("op", "add"))))
+        op.currentIndexChanged.connect(lambda _: self._feature_set(i, "op", op.currentData(), rebuild=True))
+        self._row(s, "操作", op)
+        s2 = self._section("寸法")
+        for key, label, default in params:
+            v = f.get(key, default)
+            if key == "axis":
+                w = QComboBox()
+                w.addItems(AXES)
+                w.setCurrentText(str(v))
+                w.currentTextChanged.connect(lambda t, key=key: self._feature_set(i, key, t))
+            elif key == "plane":
+                w = QComboBox()
+                w.addItems(PLANES)
+                w.setCurrentText(str(v))
+                w.currentTextChanged.connect(lambda t, key=key: self._feature_set(i, key, t))
+            elif key == "points":
+                w = QLineEdit(str(v))
+                w.setToolTip("スケッチ平面上の (u, v) 座標を「;」区切りで。XY 平面なら u=X, v=Y、"
+                             "YZ 平面なら u=Y, v=Z、ZX 平面なら u=Z, v=X")
+                w.editingFinished.connect(lambda w=w, key=key: self._feature_set(i, key, w.text()))
+            elif key == "path":
+                w = QWidget()
+                h = QHBoxLayout(w)
+                h.setContentsMargins(0, 0, 0, 0)
+                h.addWidget(QLabel(os.path.basename(str(v)) or "（未選択）"))
+                b = QPushButton("選択…")
+
+                def pick(_=False):
+                    pth, _f = QFileDialog.getOpenFileName(self, "STEP を選択", "", "CAD (*.step *.stp *.STEP *.STP *.igs *.iges *.brep)")
+                    if pth:
+                        self._feature_set(i, "path", pth, rebuild=True)
+                b.clicked.connect(pick)
+                h.addWidget(b)
+            else:
+                w = dspin(float(v), -1e7, 1e7, 3, 1.0)
+                w.valueChanged.connect(lambda val, key=key: self._feature_set(i, key, val))
+            self._row(s2, label, w)
+        s3 = self._section("操作")
+        sup = QCheckBox("抑制（一時的に無効）")
+        sup.setChecked(bool(f.get("suppressed")))
+        sup.toggled.connect(lambda on: self._feature_set(i, "suppressed", on))
+        self._row(s3, "", sup)
+        b = QPushButton("このフィーチャーを削除")
+        b.clicked.connect(lambda: self._later(self.delete_current))
+        self._row(s3, "", b)
+
+    def _feature_set(self, i, key, value, rebuild=False):
+        feats = self._features()
+        if i >= len(feats):
+            return
+        feats[i][key] = value
+        self.mesh_dirty = True
+        self.result = None
+        # 連続で値を変えても1回だけ作り直す
+        if not hasattr(self, "_regen_timer"):
+            self._regen_timer = QTimer(self)
+            self._regen_timer.setSingleShot(True)
+            self._regen_timer.timeout.connect(lambda: self.remesh())
+        self._regen_timer.start(350)
 
     def _details_material(self):
         m = self.project.material
@@ -1030,6 +1206,11 @@ class MainWindow(QMainWindow):
 
     def delete_current(self):
         k = self.current[0]
+        if k == "feature":
+            del self._features()[self.current[1]]
+            self.current = ("geometry",)
+            self.remesh()
+            return
         if k == "bc":
             del self.project.bcs[self.current[1]]
             self.invalidate()
@@ -1068,7 +1249,15 @@ class MainWindow(QMainWindow):
 
     def remesh(self, reset_camera=False):
         """gmsh はスレッドセーフでなく macOS で落ちるため、メインスレッドで実行"""
-        self._busy(True, "メッシュを生成しています…")
+        g = self.project.geometry
+        if g.get("kind") == "model" and not [f for f in g.get("features", []) if not f.get("suppressed")]:
+            self.mesh = None
+            self.mesh_dirty = False
+            self.result = None
+            self.selected_faces = []
+            self.rebuild_tree()
+            self.refresh_view()
+            return False
         try:
             mesh = build_mesh(self.project.geometry, self.project.mesh_size, self.project.mesh_order,
                               log=lambda m: (self.log(str(m)), QApplication.processEvents()),
@@ -1077,7 +1266,8 @@ class MainWindow(QMainWindow):
             self._busy(False)
             msg = str(e) if isinstance(e, (GeometryError, ValueError, RuntimeError)) else traceback.format_exc()
             self.log("エラー: " + msg)
-            QMessageBox.warning(self, "メッシュ", msg[-1500:])
+            self.rebuild_tree()
+            QMessageBox.warning(self, "形状・メッシュ", msg[-1500:])
             return False
         self._busy(False)
         self.mesh = mesh
@@ -1260,6 +1450,7 @@ class MainWindow(QMainWindow):
 
     def refresh_view(self, *_):
         if self.mesh is None:
+            self._draw_empty()
             return
         pl = self.plotter
         pl.clear()
@@ -1270,6 +1461,26 @@ class MainWindow(QMainWindow):
             self._draw_result()
         else:
             self._draw_model(show_mesh=(k in ("mesh", "sizing") or self.show_mesh_btn.isChecked()))
+        pl.render()
+
+    def _draw_empty(self):
+        """形状がないときの「まっさらな」作業画面（グリッドと原点の座標軸）"""
+        pl = self.plotter
+        pl.clear()
+        pl.add_axes()
+        self._main_actor = None
+        grid = pv.Plane(center=(50, 50, 0), direction=(0, 0, 1), i_size=200, j_size=200,
+                        i_resolution=20, j_resolution=20)
+        pl.add_mesh(grid, style="wireframe", color="#9fb3c8", line_width=0.5, pickable=False)
+        for d, col in [((60, 0, 0), "red"), ((0, 60, 0), "green"), ((0, 0, 60), "blue")]:
+            pl.add_mesh(pv.Arrow(start=(0, 0, 0), direction=d, scale=60, tip_length=0.15, shaft_radius=0.01,
+                                 tip_radius=0.03), color=col, pickable=False)
+        _labels(pl, [(66, 0, 0), (0, 66, 0), (0, 0, 66)], ["X", "Y", "Z"], 14, "black")
+        self._set_overlay("<b>新しいモデル</b><br>リボンの「モデリング」タブから<br>"
+                          "直方体・円柱などを追加して形を作ります。<br>"
+                          "穴は「切り取り」→「穴」。CAD は「STEP 取込」")
+        pl.view_isometric()
+        pl.reset_camera()
         pl.render()
 
     def _draw_model(self, show_mesh=False):
@@ -1453,12 +1664,18 @@ class MainWindow(QMainWindow):
 
     # ======================================================================= ファイル
     def new_project(self):
+        if self.project.bcs or self.project.geometry.get("features") or self.project.geometry.get("kind") != "model":
+            if QMessageBox.question(self, "新規", "現在のモデルを閉じて、新しいモデルを作りますか？\n"
+                                    "（保存していない変更は失われます）") != QMessageBox.Yes:
+                return
         self.project = Project()
         self.project_path = None
         self.selected_faces = []
+        self.result = None
         self.current = ("geometry",)
         self._update_title()
         self.remesh(reset_camera=True)
+        self.ribbon.setCurrentIndex(self.tab_model)
 
     def open_project(self):
         path, _ = QFileDialog.getOpenFileName(self, "プロジェクトを開く", "", "open-mechanical (*.omech)")

@@ -15,7 +15,7 @@ from .solver import BC, solve
 
 @dataclass
 class Project:
-    geometry: dict = field(default_factory=lambda: {"kind": "box", "lx": 100.0, "ly": 20.0, "lz": 10.0})
+    geometry: dict = field(default_factory=lambda: {"kind": "model", "features": []})
     mesh_size: float = 0.0      # 0 = 自動
     mesh_order: int = 2         # 2 = Tet10（推奨）
     material: Material = field(default_factory=lambda: Material(**LIBRARY[DEFAULT].to_dict()))
@@ -27,6 +27,9 @@ class Project:
 
     def geometry_desc(self) -> str:
         g = self.geometry
+        if g.get("kind") == "model":
+            n = len(g.get("features", []))
+            return f"モデル（フィーチャー {n} 個）" if n else "（形状なし）"
         if g.get("kind") == "file":
             return g.get("path", "")
         name, params = PRIMITIVES.get(g.get("kind"), (g.get("kind"), []))
