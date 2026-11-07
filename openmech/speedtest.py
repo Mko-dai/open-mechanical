@@ -40,32 +40,28 @@ def main():
     except ImportError:
         print("pyamg なし")
     print()
-    cases = [("片持ち梁", cantilever, [40, 80, 120]), ("立方体", block, [12, 18, 24, 30])]
-    methods = ["superlu", _direct_backend(), "amg"]
-    methods = list(dict.fromkeys(methods))
+    cases = [("片持ち梁", cantilever, [40, 80]), ("立方体", block, [18, 26])]
     print(f"{'モデル':10s}{'自由度':>10s}  {'ソルバー':10s}{'コア':>4s}{'組立':>8s}{'求解':>8s}{'合計':>8s}  最大変位 [mm]")
     for name, fn, sizes in cases:
         for n in sizes:
             m, bcs = fn(n)
             ref = None
-            for meth in methods:
-                for cores in sorted({1, ncore}):
-                    if meth == "superlu" and 3 * m.n_nodes > 200_000:
-                        continue
-                    if meth == "superlu" and cores > 1:
-                        continue
-                    try:
-                        set_threads(cores)
-                        r = solve(m, mat, bcs, log=lambda *a: None, method=meth)
-                    except Exception as e:
-                        print(f"{name:10s}{3 * m.n_nodes:>10,d}  {meth:10s}{cores:>4d}  失敗: {e}")
-                        continue
-                    d = float(r.disp_mag.max())
-                    ref = d if ref is None else ref
-                    i = r.info
-                    print(f"{name:10s}{i['自由度数']:>10,d}  {meth:10s}{cores:>4d}{i['組立時間 [s]']:>8.2f}"
-                          f"{i['求解時間 [s]']:>8.2f}{i['合計時間 [s]']:>8.2f}  {d:.8g}  (差 {abs(d - ref) / ref:.1e})",
-                          flush=True)
+            runs = [("auto", ncore), ("auto", 1)]
+            if 3 * m.n_nodes <= 80_000:
+                runs.append(("superlu", 1))
+            for meth, cores in runs:
+                try:
+                    set_threads(cores)
+                    r = solve(m, mat, bcs, log=lambda *a: None, method=meth)
+                except Exception as e:
+                    print(f"{name:10s}{3 * m.n_nodes:>10,d}  {meth:10s}{cores:>4d}  失敗: {e}")
+                    continue
+                d = float(r.disp_mag.max())
+                ref = d if ref is None else ref
+                i = r.info
+                print(f"{name:10s}{i['自由度数']:>10,d}  {i['ソルバー']:10s}{cores:>4d}{i['組立時間 [s]']:>8.2f}"
+                      f"{i['求解時間 [s]']:>8.2f}{i['合計時間 [s]']:>8.2f}  {d:.8g}  (差 {abs(d - ref) / ref:.1e})",
+                      flush=True)
     set_threads(0)
 
 
