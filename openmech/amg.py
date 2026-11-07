@@ -13,7 +13,7 @@ import scipy.sparse.linalg as spla
 from .parallel import ParallelMatvec
 
 
-def _lambda_max(mv, n, dinv, iters=10, seed=0):
+def _lambda_max(mv, n, dinv, iters=12, seed=0):
     """D⁻¹A の最大固有値の推定（べき乗法）"""
     rng = np.random.default_rng(seed)
     x = rng.standard_normal(n)
@@ -31,7 +31,7 @@ class _Level:
         self.mv = ParallelMatvec(self.A)
         d = self.A.diagonal()
         self.dinv = 1.0 / np.where(d != 0, d, 1.0)
-        lm = _lambda_max(self.mv, self.A.shape[0], self.dinv) * 1.1
+        lm = _lambda_max(self.mv, self.A.shape[0], self.dinv) * 1.15
         self.a, self.b = lm / 30.0, lm
         self.P = P
         self.R = R
