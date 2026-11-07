@@ -1184,8 +1184,6 @@ class MainWindow(QMainWindow):
         picker.AddPickList(self._main_actor)
         hit = picker.Pick(pos[0], pos[1], 0, self.plotter.renderer)
         cell = picker.GetCellId() if hit else -1
-        if True:  # 動作確認用（後で削除）
-            self.log(f"[debug] click {pos} hit={hit} cell={cell}")
         add = bool(QApplication.keyboardModifiers() & (Qt.ControlModifier | Qt.MetaModifier | Qt.ShiftModifier))
         if self.current[0] == "result" and self.result is not None:
             if cell >= 0:
