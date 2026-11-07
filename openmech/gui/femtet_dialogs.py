@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, 
                                QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QRadioButton, QTabWidget, QVBoxLayout, QWidget)
 
-from ..geometry import AXES, FEATURES, PLANES
+from ..geometry import AXES, FEATURE_CHOICES, FEATURES, PLANES
 from ..materials import LIBRARY, Material
 
 
@@ -51,14 +51,26 @@ class FeatureDialog(QDialog):
         lay = QVBoxLayout(self)
         groups: dict[str, QFormLayout] = {}
         self.widgets = {}
+        special = {"move": {"copy": "操作", "dx": "移動", "dy": "移動", "dz": "移動", "angle": "回転",
+                            "axis": "回転", "x": "回転", "y": "回転", "z": "回転"},
+                   "mirror": {"copy": "操作", "axis": "鏡面", "offset": "鏡面"},
+                   "split": {"axis": "切断面", "offset": "切断面", "keep": "切断面"},
+                   "stretch": {"axis": "断面", "offset": "断面", "length": "断面"}}.get(ftype, {})
         for key, label, default in params:
-            gname = self.GROUPS.get(key, "寸法")
+            if ftype in ("fillet", "chamfer") and key[0] in "xyz" and key[1:] in ("0", "1"):
+                gname = "範囲（この箱に収まる辺だけ）"
+            else:
+                gname = special.get(key) or self.GROUPS.get(key, "寸法")
             if gname not in groups:
                 g = QGroupBox(gname)
                 groups[gname] = QFormLayout(g)
                 lay.addWidget(g)
             v = values.get(key, default)
-            if key == "axis":
+            if key in FEATURE_CHOICES:
+                w = QComboBox()
+                w.addItems(FEATURE_CHOICES[key])
+                w.setCurrentText(str(v))
+            elif key == "axis":
                 w = QComboBox()
                 w.addItems(AXES)
                 w.setCurrentText(str(v))
@@ -78,6 +90,16 @@ class FeatureDialog(QDialog):
                           "XY 平面: u=X, v=Y ／ YZ 平面: u=Y, v=Z ／ ZX 平面: u=Z, v=X")
             hint.setStyleSheet("color:#555")
             lay.addWidget(hint)
+        hints = {"move": "回転してから移動します。「コピー」は元のボディを残して新しいボディを作ります。",
+                 "split": "切断面で 2 つのボディに分けます（片側だけ残すこともできます）。",
+                 "stretch": "指定位置の断面を、指定方向へ長さぶん引き伸ばします（Femtet のストレッチ）。",
+                 "fillet": "条件に合う辺を丸めます。範囲の既定は選択中のボディ全体です。",
+                 "chamfer": "条件に合う辺を面取りします。範囲の既定は選択中のボディ全体です。"}
+        if ftype in hints:
+            h = QLabel(hints[ftype])
+            h.setWordWrap(True)
+            h.setStyleSheet("color:#555")
+            lay.addWidget(h)
         if targets_text:
             t = QLabel(targets_text)
             t.setStyleSheet("color:#555")

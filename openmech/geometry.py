@@ -67,14 +67,37 @@ FEATURES = {
                                    ("u0", "中心 u [mm]", 0.0), ("v0", "中心 v [mm]", 0.0),
                                    ("r", "外半径 [mm]", 20.0), ("ri", "内半径 [mm]（0 = 穴なし）", 0.0),
                                    ("t", "厚さ [mm]", 2.0)]),
+    # ボディの編集（Femtet の 移動・回転・コピー / 切断 / ストレッチ / フィレット / 面取り）
+    "move": ("移動・回転", "移", [("copy", "操作", "移動"),
+                             ("dx", "移動量 X [mm]", 0.0), ("dy", "移動量 Y [mm]", 0.0), ("dz", "移動量 Z [mm]", 0.0),
+                             ("angle", "回転角 [°]", 0.0), ("axis", "回転軸", "Z"),
+                             ("x", "回転中心 X [mm]", 0.0), ("y", "回転中心 Y [mm]", 0.0), ("z", "回転中心 Z [mm]", 0.0)]),
+    "mirror": ("ミラー", "鏡", [("copy", "操作", "コピー"), ("axis", "鏡面の法線", "X"),
+                            ("offset", "鏡面の位置 [mm]", 0.0)]),
+    "split": ("切断", "切", [("axis", "切断面の法線", "X"), ("offset", "切断面の位置 [mm]", 0.0),
+                           ("keep", "残す部分", "両方（2つのボディに分割）")]),
+    "stretch": ("引き伸ばし", "伸", [("axis", "伸ばす方向", "X"), ("offset", "伸ばす断面の位置 [mm]", 0.0),
+                                 ("length", "伸ばす長さ [mm]", 10.0)]),
+    "fillet": ("丸み付け", "丸", [("r", "半径 [mm]", 2.0), ("edges", "対象の辺", "すべての辺"),
+                               ("x0", "範囲 X 最小 [mm]", -1e6), ("x1", "範囲 X 最大 [mm]", 1e6),
+                               ("y0", "範囲 Y 最小 [mm]", -1e6), ("y1", "範囲 Y 最大 [mm]", 1e6),
+                               ("z0", "範囲 Z 最小 [mm]", -1e6), ("z1", "範囲 Z 最大 [mm]", 1e6)]),
+    "chamfer": ("面取り", "角", [("d", "距離 [mm]", 2.0), ("edges", "対象の辺", "すべての辺"),
+                              ("x0", "範囲 X 最小 [mm]", -1e6), ("x1", "範囲 X 最大 [mm]", 1e6),
+                              ("y0", "範囲 Y 最小 [mm]", -1e6), ("y1", "範囲 Y 最大 [mm]", 1e6),
+                              ("z0", "範囲 Z 最小 [mm]", -1e6), ("z1", "範囲 Z 最大 [mm]", 1e6)]),
     "import": ("インポート", "読", [("path", "ファイル", ""),
                                  ("dx", "移動 X [mm]", 0.0), ("dy", "移動 Y [mm]", 0.0), ("dz", "移動 Z [mm]", 0.0)]),
 }
+EDIT_FEATURES = ("move", "mirror", "split", "stretch", "fillet", "chamfer")
+FEATURE_CHOICES = {"copy": ["移動", "コピー"],
+                   "keep": ["両方（2つのボディに分割）", "＋側を残す", "−側を残す"],
+                   "edges": ["すべての辺", "X 方向の辺", "Y 方向の辺", "Z 方向の辺"]}
 OPS = {"new": "新規ボディ", "add": "結合", "cut": "除去（切り取り）", "intersect": "交差"}
 
 
 def new_feature(ftype, op="new", **over):
-    f = {"type": ftype, "op": op}
+    f = {"type": ftype, "op": "edit" if ftype in EDIT_FEATURES else op}
     for k, _, d in FEATURES[ftype][2]:
         f[k] = d
     f.update(over)
@@ -92,7 +115,8 @@ def analysis_2d_mode(spec) -> str | None:
 
 
 def is_shell_model(spec) -> bool:
-    feats = [f for f in spec.get("features", []) if not f.get("suppressed") and f.get("type") != "bool"]
+    feats = [f for f in spec.get("features", []) if not f.get("suppressed")
+             and f.get("type") != "bool" and f.get("type") not in EDIT_FEATURES]
     return spec.get("kind") == "model" and bool(feats) and all(f["type"] in SHELL_FEATURES for f in feats)
 
 
@@ -158,6 +182,14 @@ def _build_shell_features(gmsh, features):
             for k in tools:
                 bodies.pop(k, None)
             continue
+        if t in ("move", "mirror"):
+            tg, k0 = _edit_targets(f, bodies), nkey
+            nkey = _edit_bodies(gmsh, f, bodies, nkey)
+            for j in range(nkey - k0):
+                thick[k0 + j] = thick.get(tg[j], 1.0)
+            continue
+        if t in EDIT_FEATURES:
+            raise GeometryError(f"サーフェス（シェル・2D）では「{FEATURES[t][0]}」にまだ対応していません（移動・回転・ミラーは可）")
         if t not in SHELL_FEATURES:
             raise GeometryError("ソリッドとシェル（サーフェス）を同じモデルで混ぜることには、まだ対応していません")
         tool = _make_surface(gmsh, f)
@@ -384,6 +416,9 @@ def _build_features(gmsh, features):
                 for k in tools:
                     bodies.pop(k, None)
                 continue
+            if t in EDIT_FEATURES:
+                nkey = _edit_bodies(gmsh, f, bodies, nkey)
+                continue
             tool = _make_feature(gmsh, f)
             if not tool:
                 continue
@@ -408,7 +443,8 @@ def _build_features(gmsh, features):
         except GeometryError:
             raise
         except Exception as e:
-            raise GeometryError(f"{label}の{OPS.get(op, op)}に失敗しました: {e}")
+            what = "操作" if t in EDIT_FEATURES else OPS.get(op, op)
+            raise GeometryError(f"{label}の{what}に失敗しました: {e}")
     bodies = {k: [dt for dt in v if dt[0] == 3] for k, v in bodies.items()}
     bodies = {k: v for k, v in bodies.items() if v}
     if not bodies:
@@ -436,18 +472,207 @@ def _build_features(gmsh, features):
         gmsh.model.addPhysicalGroup(3, sorted(set(tags)), tag=k + 1)
 
 
-def feature_body_keys(features) -> dict:
-    """フィーチャー番号 → それが作ったボディ番号（_build_features と同じ規則）"""
-    out, nkey, have = {}, 0, False
+def _edit_targets(f, bodies):
+    return [int(k) for k in (f.get("targets") or sorted(bodies)) if int(k) in bodies]
+
+
+def _creates_bodies(f) -> bool:
+    """編集フィーチャーのうち、新しいボディを作るもの（コピー・2つに切断）"""
+    t = f.get("type")
+    if t in ("move", "mirror"):
+        return f.get("copy", "移動" if t == "move" else "コピー") == "コピー"
+    if t == "split":
+        return str(f.get("keep", "両方")).startswith("両方")
+    return False
+
+
+def _halfspace(occ, bodies_tags, axis, c, positive=True):
+    """座標 axis ≥ c（positive）の半空間を表す大きな箱"""
+    lo = np.full(3, np.inf)
+    hi = np.full(3, -np.inf)
+    for dt in bodies_tags:
+        b = occ.getBoundingBox(*dt)
+        lo, hi = np.minimum(lo, b[:3]), np.maximum(hi, b[3:])
+    L = float(np.max(hi - lo)) + 1.0
+    lo, hi = lo - L, hi + L
+    ax = "XYZ".index(str(axis).upper())
+    if positive:
+        lo[ax] = c
+    else:
+        hi[ax] = c
+    if hi[ax] <= lo[ax]:
+        return None
+    return [(3, occ.addBox(*lo, *(hi - lo)))]
+
+
+def _edge_filter(gmsh, f, vol_tags):
+    """丸み付け・面取りの対象の辺（方向と範囲で絞り込み）"""
+    gmsh.model.occ.synchronize()
+    curves = sorted({abs(c[1]) for c in gmsh.model.getBoundary(vol_tags, combined=False, oriented=False,
+                                                                 recursive=True) if c[0] == 1})
+    kind = str(f.get("edges", "すべての辺"))
+    box = [float(f.get(k, d)) for k, d in (("x0", -1e6), ("y0", -1e6), ("z0", -1e6),
+                                           ("x1", 1e6), ("y1", 1e6), ("z1", 1e6))]
+    out = []
+    for c in curves:
+        b = np.array(gmsh.model.occ.getBoundingBox(1, c))
+        if np.any(b[:3] < np.array(box[:3]) - 1e-9) or np.any(b[3:] > np.array(box[3:]) + 1e-9):
+            continue
+        ext = b[3:] - b[:3]
+        if kind != "すべての辺":
+            ax = "XYZ".index(kind[0])
+            if ext[ax] <= 1e-9 or np.delete(ext, ax).max() > 1e-6 * max(1.0, ext[ax]):
+                continue
+        out.append(c)
+    return out
+
+
+def _edit_bodies(gmsh, f, bodies, nkey):
+    """ボディの編集フィーチャーを実行。新しく作ったボディの分だけ nkey を進めて返す"""
+    occ = gmsh.model.occ
+    t = f["type"]
+    g = lambda k, d=0.0: float(f.get(k, d))  # noqa: E731
+    targets = _edit_targets(f, bodies)
+    if not targets:
+        raise GeometryError("対象のボディがありません")
+    axis = str(f.get("axis", "X")).upper()
+    av = {"X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1)}[axis]
+    if t in ("move", "mirror"):
+        copy = _creates_bodies(f)
+        for k in targets:
+            tags = occ.copy(bodies[k]) if copy else bodies[k]
+            if t == "move":
+                if g("angle"):
+                    occ.rotate(tags, g("x"), g("y"), g("z"), *av, math.radians(g("angle")))
+                if g("dx") or g("dy") or g("dz"):
+                    occ.translate(tags, g("dx"), g("dy"), g("dz"))
+            else:
+                occ.mirror(tags, *av, -g("offset"))
+            if copy:
+                bodies[nkey] = tags
+                nkey += 1
+        return nkey
+    if t == "split":
+        keep = str(f.get("keep", "両方"))
+        for k in targets:
+            plus_box = _halfspace(occ, bodies[k], axis, g("offset"), True)
+            if plus_box is None:
+                continue
+            plus = occ.intersect(occ.copy(bodies[k]), plus_box)[0]
+            minus_box = _halfspace(occ, bodies[k], axis, g("offset"), True)
+            minus = occ.cut(bodies[k], minus_box)[0]
+            plus = [dt for dt in plus if dt[0] == 3]
+            minus = [dt for dt in minus if dt[0] == 3]
+            if keep.startswith("＋"):
+                occ.remove(minus, recursive=True)
+                bodies[k] = plus
+            elif keep.startswith("−"):
+                occ.remove(plus, recursive=True)
+                bodies[k] = minus
+            else:
+                bodies[k] = minus
+                bodies[nkey] = plus
+                nkey += 1
+        return nkey
+    if t == "stretch":
+        L = g("length")
+        if L <= 0:
+            raise GeometryError("伸ばす長さは正の値にしてください")
+        c = g("offset")
+        d = [L * v for v in av]
+        for k in targets:
+            box = _halfspace(occ, bodies[k], axis, c, True)
+            if box is None:
+                continue
+            # 断面（ボディと平面の共通部分）を押し出して間を埋める
+            lo = np.full(3, np.inf)
+            hi = np.full(3, -np.inf)
+            for dt in bodies[k]:
+                b = occ.getBoundingBox(*dt)
+                lo, hi = np.minimum(lo, b[:3]), np.maximum(hi, b[3:])
+            ax = "XYZ".index(axis)
+            o = lo - 1.0
+            o[ax] = c
+            size = hi - lo + 2.0
+            uvec = [0, 0, 0]
+            vvec = [0, 0, 0]
+            others = [i for i in range(3) if i != ax]
+            uvec[others[0]] = size[others[0]]
+            vvec[others[1]] = size[others[1]]
+            p = [occ.addPoint(*o), occ.addPoint(*(o + uvec)), occ.addPoint(*(o + np.add(uvec, vvec))),
+                 occ.addPoint(*(o + vvec))]
+            ln = [occ.addLine(p[i], p[(i + 1) % 4]) for i in range(4)]
+            plane = [(2, occ.addPlaneSurface([occ.addCurveLoop(ln)]))]
+            sec = [dt for dt in occ.intersect(occ.copy(bodies[k]), plane)[0] if dt[0] == 2]
+            if not sec:
+                occ.remove(box, recursive=True)
+                raise GeometryError(f"伸ばす断面（{axis} = {c:g}）がボディ B{k} を横切っていません")
+            mid = [dt for dt in occ.extrude(sec, *d) if dt[0] == 3]
+            plus = [dt for dt in occ.intersect(occ.copy(bodies[k]), box)[0] if dt[0] == 3]
+            box2 = _halfspace(occ, bodies[k], axis, c, True)
+            minus = [dt for dt in occ.cut(bodies[k], box2)[0] if dt[0] == 3]
+            occ.translate(plus, *d)
+            parts = minus + mid + plus
+            bodies[k] = occ.fuse(parts[:1], parts[1:])[0] if len(parts) > 1 else parts
+        return nkey
+    if t in ("fillet", "chamfer"):
+        size = g("r", 2.0) if t == "fillet" else g("d", 2.0)
+        if size <= 0:
+            raise GeometryError("半径・距離は正の値にしてください")
+        for k in targets:
+            vols = [dt[1] for dt in bodies[k] if dt[0] == 3]
+            curves = _edge_filter(gmsh, f, [(3, v) for v in vols])
+            if not curves:
+                raise GeometryError(f"ボディ B{k} に条件に合う辺がありません")
+            if t == "fillet":
+                out = occ.fillet(vols, curves, [size], removeVolume=True)
+            else:
+                surfs = []
+                for cv in curves:
+                    up, _ = gmsh.model.getAdjacencies(1, cv)
+                    surfs.append(int(up[0]))
+                out = occ.chamfer(vols, curves, surfs, [size], removeVolume=True)
+            out = [dt for dt in out if dt[0] == 3]
+            if not out:
+                raise GeometryError(("丸み付け" if t == "fillet" else "面取り")
+                                    + "に失敗しました（半径・距離が大きすぎないか確認してください）")
+            bodies[k] = out
+        return nkey
+    raise GeometryError(f"未知の編集: {t}")
+
+
+def feature_body_keys(features, all_keys=False) -> dict:
+    """フィーチャー番号 → それが作ったボディ番号（_build_features と同じ規則）。
+    all_keys=True なら 番号 → 作ったボディ番号のリスト（コピー・切断は複数）"""
+    out, nkey, live = {}, 0, set()
+    created = {}
     for i, f in enumerate(features):
-        if f.get("suppressed") or f.get("type") == "bool":
+        if f.get("suppressed"):
+            continue
+        t = f.get("type")
+        if t == "bool":
+            tgt = int(f.get("target", -1))
+            tools = [int(k) for k in f.get("tools", []) if int(k) in live and int(k) != tgt]
+            if tgt in live and tools:
+                live -= set(tools)
+            continue
+        if t in EDIT_FEATURES:
+            if _creates_bodies(f):
+                n = len([k for k in (f.get("targets") or sorted(live)) if int(k) in live])
+                if n:
+                    out[i] = nkey
+                    created[i] = list(range(nkey, nkey + n))
+                for _ in range(n):
+                    live.add(nkey)
+                    nkey += 1
             continue
         op = f.get("op", "new")
-        if op == "new" or (op == "add" and not have):
+        if op == "new" or (op == "add" and not live):
             out[i] = nkey
+            created[i] = [nkey]
+            live.add(nkey)
             nkey += 1
-            have = True
-    return out
+    return created if all_keys else out
 
 
 def primitive_to_features(spec):

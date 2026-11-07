@@ -25,11 +25,11 @@ import traceback
 import numpy as np
 from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QFont, QIcon, QKeySequence, QPainter, QPixmap
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFrame,
                                QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
                                QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
                                QPushButton, QSplitter, QTabWidget, QToolButton, QTreeWidget,
-                               QTreeWidgetItem, QVBoxLayout, QWidget)
+                               QListWidget, QListWidgetItem, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 import pyvista as pv
 from pyvistaqt import QtInteractor
@@ -40,9 +40,10 @@ from ..contact import (BEHAVIORS, CONTACT_TYPES, FORMULATIONS, INTERFACE, STATUS
 from ..export import write_csv, write_report, write_vtu
 from ..geometry import (AXES, CAD_EXT, CONTROL_TYPES, FEATURES, MESH_DEFAULTS, OPS, PLANES, PRIMITIVES,
                         GeometryError, build_mesh, mesh_quality,
-                        PLANE_MODES, feature_body_keys, gmsh_available, is_shell_model, new_feature,
+                        EDIT_FEATURES, FEATURE_CHOICES, PLANE_MODES, feature_body_keys, gmsh_available, is_shell_model, new_feature,
                         primitive_to_features)
 from ..materials import LIBRARY, Material
+from ..history import History
 from ..project import Project
 from ..nonlinear import solve_static
 from ..solver import BC, solve
@@ -80,7 +81,8 @@ RESULT_TYPE_JP = {
     "全変形 [mm]": "全変形", "相当応力（ミーゼス） [MPa]": "相当 (von-Mises) 応力",
     "安全率（降伏基準）": "安全率（最大相当応力基準）",
 }
-OP_COLORS = {"new": "#4a78c2", "add": "#2c7fb8", "cut": "#c0392b", "intersect": "#8e44ad", "union": "#2c7fb8"}
+OP_COLORS = {"new": "#4a78c2", "add": "#2c7fb8", "cut": "#c0392b", "intersect": "#8e44ad", "union": "#2c7fb8",
+             "edit": "#e67700"}
 MAT_PALETTE = ["#8fb8de", "#e5b25d", "#a7d3a6", "#d9a0c8", "#9fd6d2", "#e8a08f", "#b9b3e6", "#c9d68a"]
 GEOM_COLOR = "#c9cdd3"
 CONTACT_COLOR, TARGET_COLOR = "#e03131", "#1c7ed6"
@@ -285,6 +287,15 @@ class MainWindow(QMainWindow):
         self._main_actor = None
         self._press = None
         self.probe_text = None
+        # 操作履歴（Femtet と同じく、操作ごとに記録して どの時点にも戻れる）
+        self.history = History()
+        self.history.reset(self.project.to_dict())
+        self._hist_label = None
+        self._restoring = False
+        self._hist_dialog = None
+        self._hist_timer = QTimer(self)
+        self._hist_timer.setSingleShot(True)
+        self._hist_timer.timeout.connect(self._hist_commit)
 
         self._build_ui()
         self._update_title()
@@ -431,6 +442,10 @@ class MainWindow(QMainWindow):
         for ft in ["plate", "sheet", "disk", "cyl_shell"]:
             R.button(g, FEATURES[ft][0].replace("（シェル）", ""), make_icon("#0ca678", FEATURES[ft][1]),
                      lambda _=False, ft=ft: self.create_body(ft))
+        g = R.add_group(t, "ボディ編集")
+        for ft in EDIT_FEATURES:
+            R.button(g, FEATURES[ft][0], make_icon(OP_COLORS["edit"], FEATURES[ft][1]),
+                     lambda _=False, ft=ft: self.edit_body_op(ft))
         g = R.add_group(t, "ブール演算")
         R.button(g, "結合", make_icon(OP_COLORS["union"], "∪"), lambda: self.boolean("union"))
         R.button(g, "除去", make_icon(OP_COLORS["cut"], "−"), lambda: self.boolean("cut"))
@@ -438,6 +453,9 @@ class MainWindow(QMainWindow):
         g = R.add_group(t, "インポート")
         R.button(g, "STEP", make_icon(OP_COLORS["new"], "読"), self.add_import_feature)
         g = R.add_group(t, "編集")
+        R.button(g, "元に戻す", make_icon("#5d6d7e", "↶"), self.undo)
+        R.button(g, "やり直す", make_icon("#5d6d7e", "↷"), self.redo)
+        R.button(g, "操作履歴", make_icon("#5d6d7e", "履"), self.show_history)
         R.button(g, "形状編集", make_icon("#5d6d7e", "編"), self.edit_selected_body)
         R.button(g, "削除", make_icon("#888888", "×"), self.delete_current)
         R.button(g, "再生成", make_icon("#3a8fa8", "⟳"), lambda: self.remesh())
@@ -819,6 +837,19 @@ class MainWindow(QMainWindow):
             a.triggered.connect(fn)
             fm.addAction(a)
         em = mb.addMenu("編集")
+        self.undo_action = QAction("元に戻す", self)
+        self.undo_action.setShortcut(QKeySequence.Undo)
+        self.undo_action.triggered.connect(self.undo)
+        em.addAction(self.undo_action)
+        self.redo_action = QAction("やり直す", self)
+        self.redo_action.setShortcut(QKeySequence.Redo)
+        self.redo_action.triggered.connect(self.redo)
+        em.addAction(self.redo_action)
+        a = QAction("操作履歴…", self)
+        a.setShortcut(QKeySequence("Ctrl+H"))
+        a.triggered.connect(self.show_history)
+        em.addAction(a)
+        em.addSeparator()
         a = QAction("削除", self)
         a.setShortcut(QKeySequence.Delete)
         a.triggered.connect(self.delete_current)
@@ -900,7 +931,140 @@ class MainWindow(QMainWindow):
         return any(b.kind in ("fixed", "displacement", "symmetry", "frictionless") for b in self.project.bcs)
 
     # ======================================================================= ツリー
+    # ======================================================================= 操作履歴
+    def _hist_touch(self):
+        if not self._restoring:
+            self._hist_timer.start(400)
+
+    def _hist_commit(self):
+        if self._restoring:
+            return
+        try:
+            state = self.project.to_dict()
+        except Exception:
+            return
+        if self.history.record(state, self._hist_label):
+            self._hist_refresh()
+        self._hist_label = None
+
+    def _hist_reset(self):
+        self._hist_timer.stop()
+        self.history.reset(self.project.to_dict())
+        self._hist_label = None
+        self._hist_refresh()
+
+    def undo(self):
+        self._hist_commit()
+        if self.history.can_undo():
+            self.restore_history(self.history.pos - 1)
+
+    def redo(self):
+        self._hist_commit()
+        if self.history.can_redo():
+            self.restore_history(self.history.pos + 1)
+
+    def restore_history(self, i):
+        """履歴の i 番目の状態に戻す（その後に操作すると、先の履歴は消えます）"""
+        self._hist_commit()
+        h = self.history
+        if not (0 <= i < len(h.items)) or i == h.pos:
+            return
+        old = self.project.to_dict()
+        new = h.state(i)
+        self._restoring = True
+        self._hist_timer.stop()
+        try:
+            self.project = Project.from_dict(new)
+            h.pos = i
+            self.selected_faces, self.selected_bodies = [], []
+            self.result, self.results, self.solve_error = None, [], ""
+            if not self._node_exists(self.current):
+                self.current = ("geometry",)
+            same_mesh = (old.get("geometry") == new.get("geometry") and old.get("mesh") == new.get("mesh")
+                         and old.get("share_topology") == new.get("share_topology") and old.get("parts") == new.get("parts")
+                         and old.get("body_attrs") == new.get("body_attrs") and old.get("body_assign") == new.get("body_assign"))
+            if same_mesh and self.mesh is not None:
+                self._fill_attr_combos()
+                self.rebuild_tree()
+                self.refresh_view()
+            else:
+                self.mesh_dirty = True
+                self.current = ("geometry",)
+                self.remesh()
+            h.replace_current(self.project.to_dict())   # メッシュ作成時の自動調整はこの時点の状態とする
+            self.log(f"操作履歴: 「{h.items[i]['label']}」（{h.items[i]['time']}）の時点に戻しました")
+        finally:
+            self._restoring = False
+        self._hist_refresh()
+        self.build_details()
+
+    def _node_exists(self, node):
+        k = node[0]
+        if k not in ("bc", "feature", "contact", "sizing", "part", "attr", "mat"):
+            return True
+        try:
+            return {"bc": lambda: node[1] < len(self.project.bcs),
+                    "feature": lambda: node[1] < len(self._features()),
+                    "contact": lambda: node[1] < len(self.project.contacts),
+                    "sizing": lambda: node[1] < len(self.project.local_sizes),
+                    "part": lambda: node[1] < len(self.project.parts),
+                    "attr": lambda: node[1] in self.project.body_attrs,
+                    "mat": lambda: node[1] in self.project.materials}[k]()
+        except Exception:
+            return False
+
+    def show_history(self):
+        """操作履歴ウィンドウ（ダブルクリックでその時点に戻る）"""
+        if self._hist_dialog is None:
+            d = QDialog(self)
+            d.setWindowTitle("操作履歴")
+            d.resize(420, 520)
+            lay = QVBoxLayout(d)
+            info = QLabel("操作ごとに自動で記録しています。行をダブルクリックすると、その時点の状態に戻ります。\n"
+                          "戻った後に別の操作をすると、それより先の履歴は消えます。")
+            info.setWordWrap(True)
+            info.setStyleSheet("color:#555")
+            lay.addWidget(info)
+            lst = QListWidget()
+            lst.itemDoubleClicked.connect(lambda it: self.restore_history(lst.row(it)))
+            lay.addWidget(lst)
+            row = QHBoxLayout()
+            for text, fn in [("◀ 元に戻す", self.undo), ("やり直す ▶", self.redo),
+                             ("選んだ時点に戻す", lambda: self.restore_history(lst.currentRow()))]:
+                b = QPushButton(text)
+                b.clicked.connect(fn)
+                row.addWidget(b)
+            lay.addLayout(row)
+            d.list = lst
+            self._hist_dialog = d
+        self._hist_refresh()
+        self._hist_dialog.show()
+        self._hist_dialog.raise_()
+
+    def _hist_refresh(self):
+        d = self._hist_dialog
+        if hasattr(self, "undo_action"):
+            self.undo_action.setEnabled(self.history.can_undo())
+            self.redo_action.setEnabled(self.history.can_redo())
+        if d is None:
+            return
+        lst = d.list
+        lst.clear()
+        for i, it in enumerate(self.history.items):
+            mark = "▶ " if i == self.history.pos else "　 "
+            w = QListWidgetItem(f"{mark}{i + 1:>3}  {it['time']}  {it['label']}")
+            if i > self.history.pos:
+                w.setForeground(QBrush(QColor("#999999")))
+            if i == self.history.pos:
+                f = w.font()
+                f.setBold(True)
+                w.setFont(f)
+            lst.addItem(w)
+        lst.setCurrentRow(self.history.pos)
+        lst.scrollToItem(lst.currentItem())
+
     def rebuild_tree(self, keep=True, details=True):
+        self._hist_touch()
         cur = self.current if keep else ("geometry",)
         self.tree.blockSignals(True)
         self.tree.clear()
@@ -933,6 +1097,9 @@ class MainWindow(QMainWindow):
                     add(geo, label, ("feature", i), OP_COLORS.get(op, "#888"), "∪" if op == "union" else "−")
                     continue
                 name, ch, _ = FEATURES[f["type"]]
+                if f["type"] in EDIT_FEATURES:
+                    it = add(geo, self._feature_label(f), ("feature", i), OP_COLORS["edit"], ch)
+                    continue
                 if i in keys:
                     k = keys[i]
                     a = self.project.assignment(k)
@@ -1374,6 +1541,71 @@ class MainWindow(QMainWindow):
         self.current = ("feature", len(self._features()) - 1)
         self.remesh(reset_camera=len(self._features()) == 1)
 
+    def _feature_label(self, f):
+        t = f.get("type")
+        if t == "bool":
+            return ("結合" if f.get("op") == "union" else "除去") + f": B{f.get('target')}"
+        name = FEATURES.get(t, (t,))[0]
+        if t not in EDIT_FEATURES:
+            return name
+        tg = ", ".join(f"B{k}" for k in f.get("targets") or []) or "全ボディ"
+        g = lambda k, d=0.0: float(f.get(k, d))  # noqa: E731
+        if t == "move":
+            parts = []
+            if g("dx") or g("dy") or g("dz"):
+                parts.append(f"({g('dx'):g}, {g('dy'):g}, {g('dz'):g})")
+            if g("angle"):
+                parts.append(f"{f.get('axis', 'Z')} 軸 {g('angle'):g}°")
+            d = f"{f.get('copy', '移動')} " + " ".join(parts)
+        elif t == "mirror":
+            d = f"{f.get('copy', 'コピー')} {f.get('axis', 'X')} = {g('offset'):g}"
+        elif t == "split":
+            d = f"{f.get('axis', 'X')} = {g('offset'):g}（{str(f.get('keep', '両方'))[:2]}）"
+        elif t == "stretch":
+            d = f"{f.get('axis', 'X')} = {g('offset'):g} から {g('length'):g} mm"
+        elif t == "fillet":
+            d = f"R{g('r', 2):g} {f.get('edges', 'すべての辺')}"
+        else:
+            d = f"C{g('d', 2):g} {f.get('edges', 'すべての辺')}"
+        return f"{name}: {tg} {d}"
+
+    def edit_body_op(self, ftype):
+        """ボディ編集（移動・回転・コピー / ミラー / 切断 / 引き伸ばし / 丸み付け / 面取り）"""
+        if self.mesh is None or not self._ensure_model() or not self._features():
+            QMessageBox.information(self, FEATURES[ftype][0], "先に形状を作成してください。")
+            return
+        lo, hi = self._selected_bounds()
+        c = 0.5 * (lo + hi)
+        f = new_feature(ftype)
+        if ftype == "move":
+            f.update(x=float(c[0]), y=float(c[1]), z=float(c[2]))
+        elif ftype in ("split", "stretch"):
+            f["axis"] = "XYZ"[int(np.argmax(hi - lo))]
+            f["offset"] = float(c["XYZ".index(f["axis"])])
+        elif ftype == "mirror":
+            f["offset"] = float(hi[0])
+        elif ftype in ("fillet", "chamfer"):
+            pad = 1e-3 * float(np.linalg.norm(hi - lo)) + 1e-6
+            for j, a in enumerate("xyz"):
+                f[a + "0"], f[a + "1"] = float(lo[j] - pad), float(hi[j] + pad)
+            small = float(np.min(hi - lo))
+            f["r" if ftype == "fillet" else "d"] = round(max(small / 10, 0.1), 3)
+        targets = list(self.selected_bodies)
+        txt = ("対象ボディ: " + ", ".join(f"B{b}" for b in targets)) if targets else "対象ボディ: すべて（ボディを選んでから押すと対象を絞れます）"
+        dlg = FeatureDialog(ftype, f, "", self, targets_text=txt)
+        if not dlg.exec():
+            return
+        f.update(dlg.values())
+        if targets:
+            f["targets"] = targets
+        self._hist_label = self._feature_label(f)
+        self._features().append(f)
+        self.current = ("feature", len(self._features()) - 1)
+        if not self.remesh():
+            self._features().pop()
+            self.current = ("geometry",)
+            self.remesh()
+
     def create_hole(self):
         """選択したボディ（未選択なら全ボディ）に円柱の穴をあける"""
         if self.mesh is None or not self._ensure_model():
@@ -1477,16 +1709,27 @@ class MainWindow(QMainWindow):
         eb = QPushButton("形状を編集（ダイアログ）…")
         eb.clicked.connect(lambda: self._later(lambda: self.edit_feature(i)))
         self._row(s, "", eb)
-        op = QComboBox()
-        for k, v in OPS.items():
-            op.addItem(v, k)
-        op.setCurrentIndex(max(0, op.findData(f.get("op", "add"))))
-        op.currentIndexChanged.connect(lambda _: self._feature_set(i, "op", op.currentData(), rebuild=True))
-        self._row(s, "操作", op)
-        s2 = self._section("寸法")
+        if f["type"] in EDIT_FEATURES:
+            self._row(s, "対象ボディ", ", ".join(f"B{k}" for k in f.get("targets") or []) or "すべて")
+            tb = QPushButton("選択中のボディを対象にする")
+            tb.clicked.connect(lambda: self._feature_set(i, "targets", list(self.selected_bodies), rebuild=True))
+            self._row(s, "", tb)
+        else:
+            op = QComboBox()
+            for k, v in OPS.items():
+                op.addItem(v, k)
+            op.setCurrentIndex(max(0, op.findData(f.get("op", "add"))))
+            op.currentIndexChanged.connect(lambda _: self._feature_set(i, "op", op.currentData(), rebuild=True))
+            self._row(s, "操作", op)
+        s2 = self._section("寸法" if f["type"] not in EDIT_FEATURES else "設定")
         for key, label, default in params:
             v = f.get(key, default)
-            if key == "axis":
+            if key in FEATURE_CHOICES:
+                w = QComboBox()
+                w.addItems(FEATURE_CHOICES[key])
+                w.setCurrentText(str(v))
+                w.currentTextChanged.connect(lambda t, key=key: self._feature_set(i, key, t, rebuild=True))
+            elif key == "axis":
                 w = QComboBox()
                 w.addItems(AXES)
                 w.setCurrentText(str(v))
@@ -2394,25 +2637,25 @@ class MainWindow(QMainWindow):
         if k == "feature":
             i = self.current[1]
             feats = self._features()
-            keys = feature_body_keys(feats)
-            gone = keys.get(i)
+            gone = set(feature_body_keys(feats, all_keys=True).get(i, []))
+            self._hist_label = f"削除: {self._feature_label(feats[i])}"
             del feats[i]
-            if gone is not None:
+            if gone:
                 # 後ろのボディ番号を詰める（属性の割り当てと参照を付け替え）
+                fix = lambda x: x - sum(1 for g in gone if g < x)  # noqa: E731
                 ba = {}
                 for kk, v in self.project.body_assign.items():
                     kk = int(kk)
-                    if kk == gone:
+                    if kk in gone:
                         continue
-                    ba[str(kk - 1 if kk > gone else kk)] = v
+                    ba[str(fix(kk))] = v
                 self.project.body_assign = ba
-                fix = lambda x: x - 1 if x > gone else x  # noqa: E731
                 for f in feats:
                     if f.get("type") == "bool":
                         f["target"] = fix(int(f["target"]))
-                        f["tools"] = [fix(int(t)) for t in f.get("tools", []) if int(t) != gone]
+                        f["tools"] = [fix(int(t)) for t in f.get("tools", []) if int(t) not in gone]
                     if f.get("targets"):
-                        f["targets"] = [fix(int(t)) for t in f["targets"] if int(t) != gone]
+                        f["targets"] = [fix(int(t)) for t in f["targets"] if int(t) not in gone]
             self.current = ("geometry",)
             self.selected_bodies = []
             self.remesh()
@@ -3153,6 +3396,7 @@ class MainWindow(QMainWindow):
         self.current = ("geometry",)
         self._update_title()
         self.remesh(reset_camera=True)
+        self._hist_reset()
         self.ribbon.setCurrentIndex(self.tab_model)
 
     def open_project(self):
@@ -3169,6 +3413,7 @@ class MainWindow(QMainWindow):
         self.current = ("analysis",)
         self._update_title()
         self.remesh(reset_camera=True)
+        self._hist_reset()
 
     def save_project(self):
         if not self.project_path:

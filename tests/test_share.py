@@ -64,3 +64,36 @@ def test_auto_fix_gmsh():
     assert tet10_jacobian_ratio(m).min() > 0.0
     assert mesh_quality(m)["要素品質"]["最小"] > 0.0
     print("\n".join(logs))
+
+
+def test_body_edit_keys():
+    """コピー・2分割は新しいボディ番号を作る（_build_features と同じ規則）"""
+    from openmech.geometry import feature_body_keys, new_feature
+    f = [new_feature("box"), new_feature("cylinder"),
+         new_feature("move", copy="コピー", dx=10.0, targets=[0]),
+         new_feature("split", axis="X", offset=5.0),
+         new_feature("box")]
+    k = feature_body_keys(f)
+    assert k == {0: 0, 1: 1, 2: 2, 3: 3, 4: 6}
+
+
+def test_body_edits_gmsh():
+    """移動・コピー・切断・引き伸ばし・丸み付け・面取りが gmsh で動く"""
+    import pytest
+    pytest.importorskip("gmsh")
+    from openmech.geometry import build_mesh, new_feature
+    base = new_feature("box", dx=100.0, dy=20.0, dz=10.0)
+    cases = {
+        "move": ([base, new_feature("move", dx=5.0, angle=90.0, axis="Z")], 1, 100 * 20 * 10),
+        "copy": ([base, new_feature("move", copy="コピー", dz=10.0)], 2, 2 * 100 * 20 * 10),
+        "mirror": ([base, new_feature("mirror", axis="X", offset=0.0)], 2, 2 * 100 * 20 * 10),
+        "split": ([base, new_feature("split", axis="X", offset=40.0)], 2, 100 * 20 * 10),
+        "split_keep": ([base, new_feature("split", axis="X", offset=40.0, keep="＋側を残す")], 1, 60 * 20 * 10),
+        "stretch": ([base, new_feature("stretch", axis="X", offset=50.0, length=30.0)], 1, 130 * 20 * 10),
+        "fillet": ([base, new_feature("fillet", r=2.0, edges="X 方向の辺")], 1, 100 * (20 * 10 - 4 * (4 - np.pi))),
+        "chamfer": ([base, new_feature("chamfer", d=2.0, edges="X 方向の辺")], 1, 100 * (20 * 10 - 4 * 2.0)),
+    }
+    for name, (feats, nb, vol) in cases.items():
+        m = build_mesh({"kind": "model", "features": feats}, size=4.0, order=1, log=lambda *a: None)
+        assert len(m.body_ids()) == nb, name
+        assert abs(m.volume() / vol - 1) < 0.01, (name, m.volume(), vol)
