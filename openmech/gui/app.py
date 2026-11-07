@@ -943,7 +943,14 @@ class MainWindow(QMainWindow):
             state = self.project.to_dict()
         except Exception:
             return
-        if self.history.record(state, self._hist_label):
+        h = self.history
+        if h.pos > 0 and self._hist_label is None:
+            prev = h.state(h.pos)
+            diff = [k for k in set(prev) | set(state) if prev.get(k) != state.get(k)]
+            if diff == ["contacts"] and all(c.get("auto") for c in state.get("contacts", [])):
+                h.replace_current(state)        # 形状変更に伴う接触の自動作成は、直前の操作に含める
+                return
+        if h.record(state, self._hist_label):
             self._hist_refresh()
         self._hist_label = None
 
