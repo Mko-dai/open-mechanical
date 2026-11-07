@@ -1179,6 +1179,8 @@ class MainWindow(QMainWindow):
         picker.AddPickList(self._main_actor)
         hit = picker.Pick(pos[0], pos[1], 0, self.plotter.renderer)
         cell = picker.GetCellId() if hit else -1
+        if os.environ.get("OPENMECH_DEBUG"):
+            self.log(f"[debug] click {pos} hit={hit} cell={cell}")
         add = bool(QApplication.keyboardModifiers() & (Qt.ControlModifier | Qt.MetaModifier | Qt.ShiftModifier))
         if self.current[0] == "result" and self.result is not None:
             if cell >= 0:
@@ -1575,6 +1577,19 @@ def _install_excepthook(crash_file):
     sys.excepthook = hook
 
 
+def _light_palette(app):
+    """Ansys と同じ明るい配色に固定（macOS のダークモードでも）"""
+    from PySide6.QtGui import QPalette
+    p = QPalette()
+    c = {QPalette.Window: "#f0f0f0", QPalette.WindowText: "#1a1a1a", QPalette.Base: "#ffffff",
+         QPalette.AlternateBase: "#f5f7fa", QPalette.Text: "#1a1a1a", QPalette.Button: "#f3f3f3",
+         QPalette.ButtonText: "#1a1a1a", QPalette.Highlight: "#3d7bd9", QPalette.HighlightedText: "#ffffff",
+         QPalette.ToolTipBase: "#ffffe1", QPalette.ToolTipText: "#1a1a1a", QPalette.PlaceholderText: "#888888"}
+    for role, col in c.items():
+        p.setColor(role, QColor(col))
+    app.setPalette(p)
+
+
 def main():
     os.environ.setdefault("QT_MAC_WANTS_LAYER", "1")
     _crash = _setup_crash_log()
@@ -1586,6 +1601,7 @@ def main():
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("open-mechanical")
     app.setStyle("Fusion")
+    _light_palette(app)
     w = MainWindow()
     w.show()
     return app.exec()
