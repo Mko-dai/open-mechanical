@@ -98,7 +98,13 @@ class ParallelMatvec:
             cuts = np.searchsorted(nnz, targets)
             cuts[0], cuts[-1] = 0, n
             cuts = np.unique(cuts)
-            self.blocks = [(a, b, A[a:b]) for a, b in zip(cuts[:-1], cuts[1:])]
+            # 行ブロックはデータを複製せず元の配列を参照する（メモリ節約）
+            self.blocks = []
+            for a, b in zip(cuts[:-1], cuts[1:]):
+                s0, s1 = A.indptr[a], A.indptr[b]
+                B = sp.csr_matrix((A.data[s0:s1], A.indices[s0:s1], A.indptr[a:b + 1] - s0),
+                                  shape=(b - a, A.shape[1]), copy=False)
+                self.blocks.append((a, b, B))
         else:
             self.blocks = None
 

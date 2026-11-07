@@ -118,7 +118,10 @@ def _element_K(X, De, dN, wts):
 
 def assemble_stiffness(mesh: Mesh, D: np.ndarray, chunk: int = 20000,
                        progress=None, elem_mat=None) -> sp.csr_matrix:
-    """全体剛性マトリクス。要素をブロックに分けて並列（使用コア数）で計算する。"""
+    """全体剛性マトリクス。要素をブロックに分け、ブロックごとに並列（使用コア数）で組み立てて足し合わせる。
+
+    ブロックごとに疎行列にしてから足すので、大きなモデルでもメモリを使いすぎない。
+    """
     from .parallel import chunks, pmap
     nn = mesh.elems.shape[1]
     ndof = 3 * mesh.n_nodes
@@ -127,10 +130,9 @@ def assemble_stiffness(mesh: Mesh, D: np.ndarray, chunk: int = 20000,
     ne = mesh.n_elems
     nloc = 3 * nn
     blocks = chunks(ne, min_size=1000)
-    # ブロックが大きすぎるとメモリを使うので分割
     blocks = [(a + i, min(b, a + i + chunk)) for a, b in blocks for i in range(0, b - a, chunk)]
-    data = np.empty(ne * nloc * nloc)
     done = [0]
+    loc = np.arange(3)
 
     def work(ab):
         a, b = ab
@@ -138,16 +140,22 @@ def assemble_stiffness(mesh: Mesh, D: np.ndarray, chunk: int = 20000,
         De = _D_of(D, elem_mat, slice(a, b))
         if De.ndim == 2:
             De = np.broadcast_to(De, (b - a, 6, 6))
-        data[a * nloc * nloc:b * nloc * nloc] = _element_K(mesh.nodes[el], De, dN, wts).ravel()
+        Ke = _element_K(mesh.nodes[el], De, dN, wts)
+        dofs = (3 * el[:, :, None] + loc).reshape(b - a, nloc).astype(np.int32)
+        rows = np.repeat(dofs, nloc, axis=1).ravel()
+        cols = np.tile(dofs, (1, nloc)).ravel()
+        Kb = sp.coo_matrix((Ke.ravel(), (rows, cols)), shape=(ndof, ndof)).tocsr()
         done[0] += b - a
         if progress:
             progress(min(1.0, done[0] / ne))
+        return Kb
 
-    pmap(work, blocks)
-    dofs = (3 * mesh.elems[:, :, None] + np.arange(3)).reshape(ne, nloc).astype(np.int32)
-    rows = np.repeat(dofs, nloc, axis=1).ravel()
-    cols = np.tile(dofs, (1, nloc)).ravel()
-    K = sp.coo_matrix((data, (rows, cols)), shape=(ndof, ndof)).tocsr()
+    parts = pmap(work, blocks)
+    # 2つずつ足し合わせる（並列）
+    while len(parts) > 1:
+        pairs = [parts[i:i + 2] for i in range(0, len(parts), 2)]
+        parts = pmap(lambda pr: pr[0] + pr[1] if len(pr) == 2 else pr[0], pairs)
+    K = parts[0]
     K.sum_duplicates()
     return K
 
