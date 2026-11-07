@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "title": "片持ち梁（先端荷重 1000N）",
+  "geometry": {
+    "kind": "box",
+    "lx": 200.0,
+    "ly": 20.0,
+    "lz": 20.0
+  },
+  "mesh": {
+    "size": 5.0,
+    "order": 2
+  },
+  "material": {
+    "name": "SS400",
+    "E": 206000,
+    "nu": 0.3,
+    "density": 7850,
+    "yield_strength": 245,
+    "tensile_strength": 400
+  },
+  "bcs": [
+    {
+      "kind": "fixed",
+      "faces": [
+        0
+      ],
+      "values": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "name": "根元固定"
+    },
+    {
+      "kind": "force",
+      "faces": [
+        1
+      ],
+      "values": [
+        0,
+        0,
+        -1000.0
+      ],
+      "name": "先端荷重"
+    },
+    {
+      "kind": "gravity",
+      "faces": [],
+      "values": [
+        0,
+        0,
+        -9806.65
+      ],
+      "name": "自重"
+    }
+  ]
+}
