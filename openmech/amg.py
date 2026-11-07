@@ -89,5 +89,5 @@ class ChebyshevAMG:
 def build(A, B=None, max_coarse=3000, degree=3):
     import pyamg
     ml = pyamg.smoothed_aggregation_solver(sp.csr_matrix(A), B=B, symmetry="hermitian", strength="symmetric",
-                                           max_coarse=max_coarse)
+                                           max_coarse=max_coarse, improve_candidates=None)
     return ChebyshevAMG(ml, degree)

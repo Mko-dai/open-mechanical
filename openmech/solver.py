@@ -555,11 +555,7 @@ def _direct_backend():
         return "cholmod"
     except ImportError:
         pass
-    try:
-        import cholespy  # noqa: F401
-        return "cholespy"
-    except ImportError:
-        pass
+    # cholespy（CHOLMOD の簡易版）は Apple Silicon で SuperLU より遅かったため自動選択しない
     return "superlu"
 
 
@@ -572,7 +568,7 @@ def _amg_available():
 
 
 # 自動選択のしきい値（自由度）: これより大きいと反復法（AMG-CG）。Mac での実測で決定
-AUTO_ITERATIVE_DOF = {"pardiso": 400_000, "cholmod": 400_000, "cholespy": 150_000, "superlu": 15_000}
+AUTO_ITERATIVE_DOF = {"pardiso": 400_000, "cholmod": 400_000, "cholespy": 15_000, "superlu": 15_000}
 
 
 def choose_method(n: int, method: str = "auto") -> str:
@@ -600,12 +596,12 @@ def _linear_solve(A: sp.csc_matrix, b: np.ndarray, log=print, coords=None,
     m = choose_method(n, method)
     if m == "amg":
         try:
-            import pyamg
-            log("ソルバー: 反復法（AMG 前処理付き共役勾配法）")
+            import pyamg  # noqa: F401
+            from .amg import build as build_amg
+            log("ソルバー: 反復法（AMG 前処理付き共役勾配法・並列チェビシェフ平滑化）")
             B = _rigid_modes(coords, n) if coords is not None else None
-            ml = pyamg.smoothed_aggregation_solver(A.tocsr(), B=B, symmetry="hermitian",
-                                                   strength="symmetric", max_coarse=1000)
-            xsol, info, it = _pcg(A.tocsr(), b, ml.aspreconditioner(cycle="V"), tol=1e-10)
+            M = build_amg(A, B)
+            xsol, info, it = _pcg(A.tocsr(), b, M, tol=1e-10)
             if info == 0 and _rel_res(A, xsol, b) < 1e-8:
                 log(f"  反復回数 {it}")
                 return xsol
