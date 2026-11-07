@@ -468,6 +468,7 @@ class MainWindow(QMainWindow):
         self.sel_face_btn.clicked.connect(lambda: (self.sel_face_btn.setChecked(True), self.sel_body_btn.setChecked(False)))
         self.sel_body_btn.clicked.connect(self.select_body)
         Ribbon.button(h, "選択解除", make_icon("#888888", "×"), lambda: self.set_selection([]), big=False)
+        self.face_list_btn = Ribbon.button(h, "面の一覧", make_icon("#888888", "≡"), self.face_list_menu, big=False)
         sep = QFrame()
         sep.setFrameShape(QFrame.VLine)
         h.addWidget(sep)
@@ -1201,6 +1202,24 @@ class MainWindow(QMainWindow):
         else:
             sel = [f]
         self.set_selection(sel)
+
+    def face_list_menu(self):
+        """面を一覧から選ぶ（クリックしにくい面や、隠れた面を選ぶとき用）"""
+        if self.mesh is None:
+            return
+        m = QMenu(self)
+        for f in self.mesh.face_info():
+            c, n = f["centroid"], f["normal"]
+            txt = (f"面{f['id'] + 1}  {'平面' if f['flat'] else '曲面'}  面積 {f['area']:.4g} mm²  "
+                   f"中心 ({c[0]:.3g}, {c[1]:.3g}, {c[2]:.3g})"
+                   + (f"  法線 ({n[0]:.2f}, {n[1]:.2f}, {n[2]:.2f})" if f["flat"] else ""))
+            a = QAction(txt, m)
+            a.setCheckable(True)
+            a.setChecked(f["id"] in self.selected_faces)
+            a.toggled.connect(lambda on, fid=f["id"]: self.set_selection(
+                (set(self.selected_faces) | {fid}) if on else (set(self.selected_faces) - {fid})))
+            m.addAction(a)
+        m.exec(self.face_list_btn.mapToGlobal(self.face_list_btn.rect().bottomLeft()))
 
     def select_body(self):
         if self.mesh is None:
