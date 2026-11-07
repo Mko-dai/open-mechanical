@@ -75,6 +75,23 @@ class Mesh2D(ShellMesh):
         return a * self.thickness
 
 
+_NODE_XI = np.array([[0, 0], [1, 0], [0, 1], [.5, 0], [.5, .5], [0, .5]], float)
+
+
+def _extrapolate_avg(mesh, sig_gp, gp):
+    """sig_gp: (積分点, E, k) → 節点値 (N, k)"""
+    P = np.column_stack([np.ones(len(gp)), gp])
+    Q = np.column_stack([np.ones(6), _NODE_XI])
+    Ex = Q @ np.linalg.pinv(P)                          # (6, 積分点)
+    ne = np.einsum("ag,gek->eak", Ex, sig_gp)           # (E,6,k)
+    A = np.abs(mesh.element_volumes())
+    idx = mesh.elems.ravel()
+    wt = np.repeat(A, 6)
+    den = np.maximum(np.bincount(idx, wt, mesh.n_nodes), 1e-300)
+    return np.column_stack([np.bincount(idx, ne[:, :, j].ravel() * wt, mesh.n_nodes)
+                            for j in range(ne.shape[2])]) / den[:, None]
+
+
 def _D4(m, mode):
     """[εx, εy, εz(θ), γxy] に対する剛性 (4,4)"""
     D = material_D(m)
@@ -354,10 +371,9 @@ def solve_2d(mesh: Mesh2D, material, bcs: list[BC], mode="plane_stress", elem_ma
         fint, _ = pl.internal(u)
         if fth is not None:
             fint = fint + fth
-    sig = pl.trial[4].mean(0)                    # (E,4) 要素平均
-    # 6 節点に外挿せず要素平均を節点平均（表示用）
-    A = np.abs(mesh.element_volumes())
-    S4 = _nodal_avg(mesh, sig, A)
+    # 積分点の応力を要素内で 1 次式に当てはめて 6 節点へ外挿し、節点で面積平均（Ansys の節点平均と同じ考え方）
+    gp = _GP6 if mode == "axisymmetric" else _GP
+    S4 = _extrapolate_avg(mesh, pl.trial[4], gp)
     stress = np.zeros((mesh.n_nodes, 6))
     stress[:, 0], stress[:, 1], stress[:, 2], stress[:, 3] = S4[:, 0], S4[:, 1], S4[:, 2], S4[:, 3]
     if mode == "plane_stress":
@@ -378,7 +394,7 @@ def solve_2d(mesh: Mesh2D, material, bcs: list[BC], mode="plane_stress", elem_ma
     r = Result(mesh, mats[0], U, stress, np.zeros_like(stress), reactions, info, mats, elem_mat)
     r.extra = {}
     if plastic:
-        r.extra["相当塑性ひずみ"] = _nodal_avg(mesh, pl.pb.max(0)[:, None], A)[:, 0]
+        r.extra["相当塑性ひずみ"] = _nodal_avg(mesh, pl.pb.max(0)[:, None], np.abs(mesh.element_volumes()))[:, 0]
     if mode == "axisymmetric":
         r.extra["円周応力 σθ [MPa]"] = stress[:, 2]
     return r
