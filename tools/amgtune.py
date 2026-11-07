@@ -1,4 +1,5 @@
 """AMG 設定の比較（開発用）"""
+import os, sys; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import time, numpy as np, scipy.sparse as sp, pyamg
 from openmech.speedtest import cantilever, block
 from openmech.solver import assemble_stiffness, elasticity_matrix, build_load_and_constraints, _rigid_modes, _pcg

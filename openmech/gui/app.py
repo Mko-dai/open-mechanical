@@ -427,6 +427,13 @@ class MainWindow(QMainWindow):
         R.button(g, "形状編集", make_icon("#5d6d7e", "編"), self.edit_selected_body)
         R.button(g, "削除", make_icon("#888888", "×"), self.delete_current)
         R.button(g, "再生成", make_icon("#3a8fa8", "⟳"), lambda: self.remesh())
+        g = R.add_group(t, "節点共有")
+        R.button(g, "パート作成\n（節点共有）", make_icon("#2f9e44", "共"), self.make_part)
+        m_sh = QMenu(self)
+        menu_action(m_sh, "節点共有しない（接触でつなぐ）", lambda: self.set_share("none"))
+        menu_action(m_sh, "接しているボディすべてで節点共有", lambda: self.set_share("all"))
+        menu_action(m_sh, "パートごとに節点共有", lambda: self.set_share("parts"))
+        R.button(g, "共有方法", make_icon("#2f9e44", "⇔"), menu=m_sh)
         g = R.add_group(t, "属性")
         R.button(g, "ボディ属性\n材料定数", make_icon("#b07b2c", "材"), lambda: self.set_attr_mode(0))
         R.button(g, "境界条件", make_icon(BC_COLORS["fixed"], "境"), lambda: self.set_attr_mode(1))
@@ -905,6 +912,12 @@ class MainWindow(QMainWindow):
         else:
             add(geo, self.project.geometry_desc() if gk != "file"
                 else os.path.basename(self.project.geometry.get("path", "")), ("geometry",), "#7f9cc9", "体")
+        if self.project.share_topology == "all":
+            add(geo, "節点共有: 接しているボディすべて", ("share",), "#2f9e44", "共")
+        elif self.project.share_topology == "parts":
+            for i, pt in enumerate(self.project.parts):
+                add(geo, f"{pt.get('name', f'パート{i + 1}')}: " + ", ".join(f"B{b}" for b in pt.get("bodies", []))
+                    + "（節点共有）", ("part", i), "#2f9e44", "共")
         at = add(model, "ボディ属性", ("attrs",), "#7a8a99", "属")
         for name in self.project.body_attrs:
             n = sum(1 for b in live if self.project.assignment(b).get("attr") == name)
@@ -1074,6 +1087,10 @@ class MainWindow(QMainWindow):
             name = "ボディ属性" if k == "attrs" else "材料定数"
         elif k == "contact":
             name = self.project.contacts[self.current[1]].name
+        elif k == "part":
+            name = self.project.parts[self.current[1]].get("name", "パート")
+        elif k == "share":
+            name = "節点共有"
         elif k in ("connections", "contacts"):
             name = "接続" if k == "connections" else "接触"
         elif k == "bc":
@@ -1118,6 +1135,76 @@ class MainWindow(QMainWindow):
         self._row(s, "タイプ", "直交座標")
         self._row(s, "原点", "(0, 0, 0) mm")
 
+    def _share_section(self):
+        s = self._section("節点共有（トポロジ共有）")
+        self._row(s, "共有方法", self._combo(
+            [("しない（ボディ間は接触でつなぐ）", "none"), ("接しているボディすべて", "all"), ("パートごと", "parts")],
+            self.project.share_topology, lambda v: self._later(lambda: self.set_share(v))))
+        if self.project.share_topology == "parts":
+            self._row(s, "パート数", len(self.project.parts))
+            b = QPushButton("選択中のボディでパートを作成")
+            b.clicked.connect(lambda: self._later(self.make_part))
+            self._row(s, "", b)
+        self._row(s, "", "節点共有したボディ同士は、界面の節点を共有して一体で解かれます（接触は作られません）")
+
+    def _details_share(self):
+        self._share_section()
+
+    def _details_part(self):
+        i = self.current[1]
+        pt = self.project.parts[i]
+        s = self._section("パート")
+        name = QLineEdit(pt.get("name", f"パート{i + 1}"))
+
+        def setname():
+            pt["name"] = name.text().strip() or pt.get("name")
+            self._later(self.rebuild_tree)
+        name.editingFinished.connect(setname)
+        self._row(s, "名前", name)
+        self._row(s, "ボディ", ", ".join(f"B{b}" for b in pt.get("bodies", [])))
+        self._row(s, "節点共有", "はい（Ansys のトポロジ共有と同じ）")
+        b = QPushButton("選択中のボディに置き換え")
+        b.clicked.connect(lambda: self._later(lambda: self._part_set(i, list(self.selected_bodies))))
+        self._row(s, "", b)
+        d = QPushButton("パートを解除")
+        d.clicked.connect(lambda: self._later(self.delete_current))
+        self._row(s, "", d)
+
+    def _part_set(self, i, bodies):
+        if len(bodies) < 2:
+            QMessageBox.information(self, "パート", "ボディ選択モードで2つ以上のボディを選んでください。")
+            return
+        self.project.parts[i]["bodies"] = sorted(int(b) for b in bodies)
+        self.remesh()
+
+    def set_share(self, mode):
+        if self.project.share_topology == mode:
+            return
+        self.project.share_topology = mode
+        self.log({"none": "節点共有をやめ、ボディ同士を接触でつなぎます",
+                  "all": "接しているボディすべてで節点を共有します",
+                  "parts": "パートごとに節点を共有します"}[mode])
+        self.invalidate(mesh=True)
+        self.remesh()
+
+    def make_part(self):
+        """選択中のボディを1つのパートにまとめて節点共有（Ansys の「新規パートを作成」）"""
+        bodies = sorted(set(int(b) for b in self.selected_bodies))
+        if len(bodies) < 2:
+            self.set_select_mode("body")
+            QMessageBox.information(self, "パート作成",
+                                    "グラフィックスで2つ以上のボディを Ctrl(⌘)+クリックで選んでから押してください。")
+            return
+        # 既存パートから外してから追加
+        for pt in self.project.parts:
+            pt["bodies"] = [b for b in pt.get("bodies", []) if b not in bodies]
+        self.project.parts = [pt for pt in self.project.parts if len(pt.get("bodies", [])) > 1]
+        self.project.parts.append({"name": f"パート{len(self.project.parts) + 1}", "bodies": bodies})
+        self.project.share_topology = "parts"
+        self.log(f"パートを作成しました（{', '.join(f'B{b}' for b in bodies)} で節点共有）")
+        self.invalidate(mesh=True)
+        self.remesh()
+
     def _details_geometry(self):
         g = self.project.geometry
         s = self._section("定義")
@@ -1148,6 +1235,8 @@ class MainWindow(QMainWindow):
             b = QPushButton("CAD ファイルを読み込む（STEP / STL）…")
             b.clicked.connect(self.import_file)
             self._row(s, "", b)
+        if self.mesh is not None and len(self.mesh.body_ids()) > 1 or self.project.share_topology != "none":
+            self._share_section()
         if self.mesh is not None:
             s2 = self._section("プロパティ")
             lo, hi = self.mesh.bounds()
@@ -1769,7 +1858,16 @@ class MainWindow(QMainWindow):
             self._row(s, label, sp)
         # ソルバー制御
         s = self._section("ソルバー制御")
-        self._row(s, "ソルバータイプ", self._combo([("プログラム制御", "auto"), ("直接法", "scipy"), ("反復法", "amg")],
+        from ..parallel import available_cores
+        nc = QDoubleSpinBox()
+        nc.setDecimals(0)
+        nc.setRange(0, available_cores())
+        nc.setSpecialValueText(f"すべて（{available_cores()} コア）")
+        nc.setValue(st.n_cores)
+        nc.setKeyboardTracking(False)
+        nc.valueChanged.connect(lambda v: self._set_setting("n_cores", int(v)))
+        self._row(s, "使用コア数", nc)
+        self._row(s, "ソルバータイプ", self._combo([("プログラム制御", "auto"), ("直接法", "direct"), ("反復法", "amg")],
                                              st.solver_type, lambda v: self._set_setting("solver_type", v)))
         self._row(s, "弱いバネ", self._combo([("オフ", False), ("オン", True)], st.weak_springs,
                                          lambda v: self._set_setting("weak_springs", v)))
@@ -2016,6 +2114,12 @@ class MainWindow(QMainWindow):
             self.selected_bodies = []
             self.remesh()
             return
+        if k == "part":
+            del self.project.parts[self.current[1]]
+            self.invalidate(mesh=True)
+            self.current = ("geometry",)
+            self.remesh()
+            return
         if k == "contact":
             del self.project.contacts[self.current[1]]
             self.invalidate()
@@ -2093,7 +2197,8 @@ class MainWindow(QMainWindow):
         try:
             mesh = build_mesh(self.project.geometry, self.project.mesh_size, self.project.mesh_order,
                               log=lambda m: (self.log(str(m)), QApplication.processEvents()),
-                              local_sizes=self.project.local_sizes + self.project.body_local_sizes(self.mesh))
+                              local_sizes=self.project.local_sizes + self.project.body_local_sizes(self.mesh),
+                              share=self.project.share_map())
         except Exception as e:
             self._busy(False)
             msg = str(e) if isinstance(e, (GeometryError, ValueError, RuntimeError)) else traceback.format_exc()
@@ -2175,7 +2280,7 @@ class MainWindow(QMainWindow):
                                  elem_materials=em)
         else:
             self.worker = Worker(solve, self.mesh, p.material, list(p.bcs), method=p.settings.solver_type,
-                                 elem_materials=em)
+                                 elem_materials=em, n_cores=p.settings.n_cores)
         self.worker.log.connect(lambda m: (self.solver_log.append(m), self.log(m)))
         self.worker.done.connect(self._on_solved)
         self.worker.failed.connect(self._on_solve_failed)
@@ -2432,7 +2537,8 @@ class MainWindow(QMainWindow):
                 overlay = ["<b>接続</b>", f"接触領域 {len(self.project.contacts)}",
                            f"<span style='color:{CONTACT_COLOR}'>■</span> 接触　"
                            f"<span style='color:{TARGET_COLOR}'>■</span> ターゲット"]
-        elif k in ("geometry", "feature", "attrs", "attr", "mats", "mat", "model", "project", "coords") \
+        elif k in ("geometry", "feature", "attrs", "attr", "mats", "mat", "model", "project", "coords", "part",
+                   "share") \
                 and mesh.elem_body is not None:
             # ボディごとに材料の色で塗り分け（未定義は灰色）
             tb = mesh.tri_body()[src]
@@ -2445,6 +2551,8 @@ class MainWindow(QMainWindow):
                     col = "#3a8fa8"
                 if k == "mat" and a.get("mat") != self.current[1]:
                     col = "#e0e0e0"
+                if k == "part":
+                    col = "#2f9e44" if b in self.project.parts[self.current[1]].get("bodies", []) else "#e0e0e0"
                 rgb[tb == b] = _hex(col)
                 a_txt = f"{a.get('attr') or '未定義'} / {a.get('mat') or '未定義'}"
                 sw = col if a.get("mat") in self.project.materials else "#999999"
