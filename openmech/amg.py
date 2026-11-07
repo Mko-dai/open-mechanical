@@ -96,5 +96,6 @@ def build(A, B=None, max_coarse=3000, degree=3, comps=None):
     else:
         A_setup = A
     ml = pyamg.smoothed_aggregation_solver(A_setup, B=B, symmetry="hermitian", strength="symmetric",
-                                           max_coarse=max_coarse, improve_candidates=None)
+                                           max_coarse=max_coarse, improve_candidates=None,
+                                           smooth=None)   # 平滑化なし集約: 準備が速く、総時間も最短（実測）
     return ChebyshevAMG(ml, degree)
