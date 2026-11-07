@@ -86,8 +86,15 @@ class ChebyshevAMG:
         return self._vcycle(0, np.asarray(r, float))
 
 
-def build(A, B=None, max_coarse=3000, degree=3):
+def build(A, B=None, max_coarse=3000, degree=3, comps=None):
+    """comps: 自由度ごとの成分番号（0,1,2）。節点ごとに3成分そろっていればブロック（BSR）で集約する"""
     import pyamg
-    ml = pyamg.smoothed_aggregation_solver(sp.csr_matrix(A), B=B, symmetry="hermitian", strength="symmetric",
+    A = sp.csr_matrix(A)
+    n = A.shape[0]
+    if comps is not None and n % 3 == 0 and np.array_equal(comps, np.tile([0, 1, 2], n // 3)):
+        A_setup = A.tobsr(blocksize=(3, 3))
+    else:
+        A_setup = A
+    ml = pyamg.smoothed_aggregation_solver(A_setup, B=B, symmetry="hermitian", strength="symmetric",
                                            max_coarse=max_coarse, improve_candidates=None)
     return ChebyshevAMG(ml, degree)

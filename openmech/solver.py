@@ -600,7 +600,7 @@ def _linear_solve(A: sp.csc_matrix, b: np.ndarray, log=print, coords=None,
             from .amg import build as build_amg
             log("ソルバー: 反復法（AMG 前処理付き共役勾配法・並列チェビシェフ平滑化）")
             B = _rigid_modes(coords, n) if coords is not None else None
-            M = build_amg(A, B)
+            M = build_amg(A, B, comps=coords[:, 3].astype(int) if coords is not None else None)
             xsol, info, it = _pcg(A.tocsr(), b, M, tol=1e-10)
             if info == 0 and _rel_res(A, xsol, b) < 1e-8:
                 log(f"  反復回数 {it}")
