@@ -18,15 +18,15 @@ def system(m, bcs):
     coords = np.column_stack([m.nodes[ids // 3], ids % 3])
     return A, b, coords
 
+from openmech.amg import ChebyshevAMG
 cfgs = {
- "A csr":             dict(bsr=False, kw=dict(strength="symmetric")),
- "G csr splu":        dict(bsr=False, kw=dict(strength="symmetric", coarse_solver="splu")),
- "H csr splu mc200":  dict(bsr=False, kw=dict(strength="symmetric", coarse_solver="splu", max_coarse=200)),
- "I bsr splu mc200":  dict(bsr=True, kw=dict(strength="symmetric", coarse_solver="splu", max_coarse=200)),
- "J csr chol mc200":  dict(bsr=False, kw=dict(strength="symmetric", coarse_solver="cholesky", max_coarse=200)),
- "K evol splu mc200": dict(bsr=True, kw=dict(strength="evolution", coarse_solver="splu", max_coarse=200)),
+ "A pyamg標準":        dict(bsr=False, kw=dict(strength="symmetric")),
+ "L cheb3 mc3000":     dict(bsr=False, cheb=3, kw=dict(strength="symmetric", max_coarse=3000)),
+ "M cheb2 mc3000":     dict(bsr=False, cheb=2, kw=dict(strength="symmetric", max_coarse=3000)),
+ "N cheb4 mc3000":     dict(bsr=False, cheb=4, kw=dict(strength="symmetric", max_coarse=3000)),
+ "O cheb3 mc1000":     dict(bsr=False, cheb=3, kw=dict(strength="symmetric", max_coarse=1000)),
 }
-for name, fn, n in [("片持ち梁", cantilever, 40), ("立方体", block, 18)]:
+for name, fn, n in [("片持ち梁", cantilever, 40), ("立方体", block, 18), ("立方体", block, 26)]:
     m, bcs = fn(n)
     A, b, coords = system(m, bcs)
     print(f"--- {name} dof {A.shape[0]:,}", flush=True)
@@ -37,15 +37,17 @@ for name, fn, n in [("片持ち梁", cantilever, 40), ("立方体", block, 18)]:
             AA = A.tobsr(blocksize=(3, 3)) if c["bsr"] else A
             kw = dict(max_coarse=1000); kw.update(c["kw"])
             ml = pyamg.smoothed_aggregation_solver(AA, B=B, symmetry="hermitian", **kw)
+            M = ChebyshevAMG(ml, c["cheb"]) if c.get("cheb") else ml.aspreconditioner(cycle="V")
             ts = time.time() - t
             t = time.time()
-            x, info, it = _pcg(A, b, ml.aspreconditioner(cycle="V"), tol=1e-10)
+            x, info, it = _pcg(A, b, M, tol=1e-10)
             tc = time.time() - t
-            M = ml.aspreconditioner(cycle="V"); r = np.random.rand(A.shape[0])
+            r = np.random.rand(A.shape[0])
             t = time.time(); M(r); tv = time.time() - t
             t = time.time(); A @ r; tm = time.time() - t
             sizes = "/".join(str(l.A.shape[0]) for l in ml.levels)
             print(f"{cn:22s} Vcycle {tv:.3f} matvec {tm:.3f} sizes {sizes}")
-            print(f"{cn:22s} setup {ts:6.2f}  solve {tc:6.2f}  it {it:4d}  levels {len(ml.levels)} cx {ml.operator_complexity():.2f}", flush=True)
+            res = np.linalg.norm(A @ x - b) / np.linalg.norm(b)
+            print(f"{cn:22s} res {res:.1e} setup {ts:6.2f}  solve {tc:6.2f}  it {it:4d}  levels {len(ml.levels)} cx {ml.operator_complexity():.2f}", flush=True)
         except Exception as e:
             print(cn, "失敗", e, flush=True)
