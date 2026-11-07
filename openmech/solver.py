@@ -116,7 +116,7 @@ def _element_K(X, De, dN, wts):
     return Ke
 
 
-def assemble_stiffness(mesh: Mesh, D: np.ndarray, chunk: int = 20000,
+def assemble_stiffness(mesh: Mesh, D: np.ndarray, chunk: int = 4000,
                        progress=None, elem_mat=None) -> sp.csr_matrix:
     """全体剛性マトリクス。要素をブロックに分け、ブロックごとに並列（使用コア数）で組み立てて足し合わせる。
 
