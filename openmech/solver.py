@@ -568,7 +568,8 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
     Kfr = K[free]                       # 行の取り出し（CSR のまま。コピーは 1 回だけ）
     rhs = F[free] - Kfr[:, cdofs] @ cvals
     Kff = Kfr[:, free]
-    del Kfr
+    Kc = K[cdofs]                       # 反力用（拘束自由度の行だけ残す）
+    del Kfr, K                          # 全体行列は手放す（大規模モデルのメモリ節約）
     prog(0.45, f"連立方程式を解いています（自由度 {Kff.shape[0]:,}）…")
     t1 = time.time()
     dof_ids = np.nonzero(free)[0]
@@ -586,7 +587,8 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
     t_sol = time.time() - t1
     prog(0.85, "応力を計算中…")
     stress, strain = nodal_stress(mesh, u, D, elem_mat=elem_mat, eps_th_m=eps_th_m)
-    R = K @ u - F
+    R = np.zeros(ndof)                  # 拘束していない自由度は釣り合い（≈0）
+    R[cdofs] = Kc @ u - F[cdofs]
     reactions = {}
     for i, bc in enumerate(bcs):
         if bc.kind in ("fixed", "displacement", "symmetry", "frictionless"):
