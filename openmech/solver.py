@@ -175,14 +175,19 @@ class BC:
     faces: list[int] = field(default_factory=list)
     values: list = field(default_factory=lambda: [0.0, 0.0, 0.0])
     name: str = ""
+    nodes: list[int] = field(default_factory=list)   # 面の代わりに節点を直接指定（線・点の拘束用）
 
     def to_dict(self):
-        return {"kind": self.kind, "faces": list(map(int, self.faces)),
-                "values": list(self.values), "name": self.name}
+        d = {"kind": self.kind, "faces": list(map(int, self.faces)),
+             "values": list(self.values), "name": self.name}
+        if self.nodes:
+            d["nodes"] = list(map(int, self.nodes))
+        return d
 
     @staticmethod
     def from_dict(d):
-        return BC(d["kind"], d.get("faces", []), d.get("values", [0, 0, 0]), d.get("name", ""))
+        return BC(d["kind"], d.get("faces", []), d.get("values", [0, 0, 0]), d.get("name", ""),
+                  d.get("nodes", []))
 
     def label(self) -> str:
         jp = {"fixed": "固定支持", "displacement": "強制変位", "force": "力",
@@ -203,7 +208,7 @@ def build_load_and_constraints(mesh: Mesh, material: Material, bcs: list[BC]):
     fixed = {}  # dof -> value
     for bc in bcs:
         if bc.kind in ("fixed", "displacement"):
-            nodes = mesh.face_nodes(bc.faces)
+            nodes = mesh.face_nodes(bc.faces) if bc.faces else np.asarray(bc.nodes, dtype=np.int64)
             vals = [0.0, 0.0, 0.0] if bc.kind == "fixed" else bc.values
             for c in range(3):
                 if vals[c] is None:
@@ -397,7 +402,7 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
     reactions = {}
     for i, bc in enumerate(bcs):
         if bc.kind in ("fixed", "displacement"):
-            nodes = mesh.face_nodes(bc.faces)
+            nodes = mesh.face_nodes(bc.faces) if bc.faces else np.asarray(bc.nodes, dtype=np.int64)
             reactions[i] = R.reshape(-1, 3)[nodes].sum(0)
     prog(1.0, "完了")
     info = {"自由度数": int(free.sum()), "節点数": mesh.n_nodes, "要素数": mesh.n_elems,
