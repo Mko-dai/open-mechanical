@@ -23,4 +23,9 @@ for n in [int(a) for a in (sys.argv[1:] or ["30", "40", "50"])]:
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**30   # macOS は bytes
     i = r.info
     print(f"   組立 {i['組立時間 [s]']} s / 求解 {i['求解時間 [s]']} s / 合計 {i['合計時間 [s]']} s / 最大メモリ {rss:.1f} GB / 最大変位 {r.disp_mag.max():.6g}", flush=True)
+    try:
+        sw = subprocess.check_output(["sysctl", "-n", "vm.swapusage"]).decode().strip()
+        print(f"   スワップ: {sw}", flush=True)
+    except Exception:
+        pass
     del m, r

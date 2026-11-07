@@ -71,6 +71,7 @@ class ChebyshevAMG:
             A = A0 if (i == 0 and A0 is not None) else lv[i].A    # 最上位は元の CSR をそのまま使う（コピーしない）
             self.levels.append(_Level(A, sp.csr_matrix(lv[i].P), sp.csr_matrix(lv[i].R), degree))
         Ac = sp.csc_matrix(lv[-1].A)
+        self.coarse_n = Ac.shape[0]
         self.coarse = spla.splu(Ac)
         self.shape = lv[0].A.shape
 

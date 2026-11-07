@@ -710,10 +710,14 @@ def _linear_solve(A: sp.csc_matrix, b: np.ndarray, log=print, coords=None,
             from .amg import build as build_amg
             log("ソルバー: 反復法（AMG 前処理付き共役勾配法・並列チェビシェフ平滑化）")
             B = _rigid_modes(coords, n) if coords is not None else None
+            t0 = time.time()
             M = build_amg(A, B, comps=coords[:, 3].astype(int) if coords is not None else None)
+            t1 = time.time()
             xsol, info, it = _pcg(A.tocsr(), b, M, tol=1e-10)
+            t2 = time.time()
             if info == 0 and _rel_res(A, xsol, b) < 1e-8:
-                log(f"  反復回数 {it}")
+                log(f"  反復回数 {it}（AMG 準備 {t1 - t0:.1f} s / 反復 {t2 - t1:.1f} s / 階層 "
+                    + " → ".join(f"{L.A.shape[0]:,}" for L in M.levels) + f" → {M.coarse_n:,}）")
                 return xsol
             log("反復法が収束しなかったため直接法に切り替えます")
         except ImportError:
