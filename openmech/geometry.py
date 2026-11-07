@@ -675,6 +675,8 @@ MESH_DEFAULTS = {
     "curvature_min_size": 0.0,    # 曲率の最小サイズ [mm]（0 = 自動）
     "smoothing": "medium",        # スムージング low / medium / high
     "optimize": True,             # 要素形状の最適化
+    "auto_fix": True,             # 品質の悪い要素を自動修正
+    "min_quality": 0.05,          # 自動修正の目標: 要素品質の下限（Ansys の要素品質と同じ定義）
 }
 
 CONTROL_TYPES = {"sizing": "サイズ指定", "refinement": "リファインメント", "sweep": "手法：スイープ",
@@ -898,6 +900,70 @@ def mesh_quality(mesh) -> dict:
     return {"要素品質": st(q), "歪度": st(skew), "アスペクト比": st(ar), "_quality": q}
 
 
+def tet10_jacobian_ratio(mesh) -> np.ndarray:
+    """2次四面体の曲がり具合: 角と積分点でのヤコビアン ÷ 直線要素のヤコビアン の最小値（要素ごと）。
+    0 以下は要素が裏返っている（解析できない）、1 は直線の要素と同じ。"""
+    from .solver import shape_dN_dxi
+    if mesh.elems.shape[1] != 10:
+        return np.ones(mesh.n_elems)
+    X = mesh.nodes[mesh.elems]
+    lin = shape_dN_dxi(None, 4)
+    J0 = np.linalg.det(np.einsum("eai,ak->eik", X[:, :4], lin))
+    a, b = 0.5854101966249685, 0.1381966011250105
+    pts = [np.array(v) for v in ([1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1],
+                                 [a, b, b, b], [b, a, b, b], [b, b, a, b], [b, b, b, a], [.25] * 4)]
+    r = np.full(mesh.n_elems, np.inf)
+    for L in pts:
+        J = np.linalg.det(np.einsum("eai,ak->eik", X, shape_dN_dxi(L, 10)))
+        r = np.minimum(r, J / np.where(np.abs(J0) > 1e-300, J0, 1e-300))
+    return r
+
+
+def straighten_bad_tet10(mesh, limit=0.2, log=print, rounds=4) -> int:
+    """曲がりすぎた 2 次要素（ヤコビアン比 < limit）の中間節点を辺の中点に戻す。直した要素数を返す"""
+    from .solver import _EDGES10
+    if mesh.elems.shape[1] != 10:
+        return 0
+    fixed = 0
+    for _ in range(rounds):
+        bad = np.nonzero(tet10_jacobian_ratio(mesh) < limit)[0]
+        if len(bad) == 0:
+            break
+        el = mesh.elems[bad]
+        for k, (i, j) in enumerate(_EDGES10):
+            mesh.nodes[el[:, 4 + k]] = 0.5 * (mesh.nodes[el[:, i]] + mesh.nodes[el[:, j]])
+        fixed += len(bad)
+    return fixed
+
+
+def _gmsh_quality_fix(gmsh, qmin, log):
+    """gmsh の要素品質（γ）を見て、悪ければ最適化を重ねがけ。返り値 (修正前の不良数, 修正後の不良数)"""
+    def count_bad():
+        n, worst = 0, 1.0
+        for _, tag in gmsh.model.getEntities(3):
+            ets, etags, _ = gmsh.model.mesh.getElements(3, tag)
+            for t, tg in zip(ets, etags):
+                if int(t) != 4 or len(tg) == 0:
+                    continue
+                q = np.asarray(gmsh.model.mesh.getElementQualities(tg, "gamma"))
+                n += int((q < qmin).sum())
+                worst = min(worst, float(q.min()))
+        return n, worst
+    n0, w0 = count_bad()
+    if n0 == 0:
+        return 0, 0, w0, w0
+    n1, w1 = n0, w0
+    for method in ("", "Netgen", "Relocate3D", ""):
+        try:
+            gmsh.model.mesh.optimize(method, force=True, niter=2, threshold=max(qmin * 2, 0.3))
+        except Exception:
+            continue
+        n1, w1 = count_bad()
+        if n1 == 0:
+            break
+    return n0, n1, w0, w1
+
+
 def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 12,
                log=print, local_sizes: list | None = None, share: dict | None = None,
                settings: dict | None = None) -> Mesh:
@@ -984,14 +1050,27 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
             mesh = _extract_shell_mesh(gmsh, thick)
             log(f"シェルメッシュ完了: 節点 {mesh.n_nodes:,} / 要素 {mesh.n_elems:,} / 面 {mesh.n_surf} / 辺 {len(mesh.edges)}")
             return mesh
+        fix_msgs = []
         if sweeps:
             mesh = _sweep_mesh(gmsh, sweeps[-1], order, h, log)
         else:
             gmsh.model.mesh.generate(3)
+            if ms.get("auto_fix", True):
+                n0, n1, w0, w1 = _gmsh_quality_fix(gmsh, float(ms.get("min_quality", 0.05)), log)
+                if n0:
+                    fix_msgs.append(f"品質 {ms.get('min_quality', 0.05):g} 未満の要素 {n0:,} 個 → 最適化で {n1:,} 個"
+                                    f"（最小品質 {w0:.3f} → {w1:.3f}）")
             if order == 2:
                 gmsh.option.setNumber("Mesh.SecondOrderLinear", 0)  # 曲面に沿わせる
                 gmsh.model.mesh.setOrder(2)
             mesh = _extract_mesh(gmsh, share)
+        if order == 2 and ms.get("auto_fix", True):
+            nfix = straighten_bad_tet10(mesh, log=log)
+            if nfix:
+                fix_msgs.append(f"曲がりすぎた 2 次要素 {nfix:,} 個の中間節点を直線化")
+        if fix_msgs:
+            log("メッシュ自動修正: " + " / ".join(fix_msgs))
+        mesh.fix_log = fix_msgs
         if np.any(mesh.element_volumes() <= 0):
             raise GeometryError("不正な要素ができました。要素サイズを小さくして再試行してください。")
         log(f"メッシュ完了: 節点 {mesh.n_nodes:,} / 要素 {mesh.n_elems:,} / 面 {mesh.n_faces}")

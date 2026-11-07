@@ -1865,6 +1865,13 @@ class MainWindow(QMainWindow):
                                             self._ms("smoothing"), lambda v: self._ms_set("smoothing", v)))
         self._row(s, "形状の最適化", self._combo([("はい", True), ("いいえ", False)], self._ms("optimize"),
                                              lambda v: self._ms_set("optimize", v)))
+        self._row(s, "品質の自動修正", self._combo([("はい", True), ("いいえ", False)], self._ms("auto_fix"),
+                                              lambda v: self._ms_set("auto_fix", v)))
+        if self._ms("auto_fix"):
+            mq = dspin(float(self._ms("min_quality")), 0.0, 0.9, 3, 0.01)
+            mq.valueChanged.connect(lambda v: self._ms_set("min_quality", v))
+            self._row(s, "目標の要素品質（下限）", mq)
+            self._row(s, "", "下限より悪い要素を最適化で直し、裏返りそうな 2 次要素は中間節点を直線に戻します")
         b = QPushButton("メッシュを生成")
         b.clicked.connect(lambda: self.remesh())
         self._row(self._section("操作"), "", b)
@@ -1885,6 +1892,8 @@ class MainWindow(QMainWindow):
                 for key in ("要素品質", "歪度", "アスペクト比"):
                     v = q[1][key]
                     self._row(s2, f"{key}（最小/平均/最大）", f"{v['最小']:.3f} / {v['平均']:.3f} / {v['最大']:.3f}")
+            for msg in getattr(self.mesh, "fix_log", []) or []:
+                self._row(s2, "自動修正", msg)
             self._row(s2, "状態", "最新" if not self.mesh_dirty else "再生成が必要（⚡）")
 
     def _mesh_set(self, what, v):
