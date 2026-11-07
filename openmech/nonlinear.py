@@ -188,7 +188,7 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
     t_start = time.time()
     settings = settings or AnalysisSettings()
     contacts = [c for c in (contacts or []) if not c.suppressed]
-    if not any(b.kind in ("fixed", "displacement") for b in bcs):
+    if not any(b.kind in ("fixed", "displacement", "symmetry", "frictionless") for b in bcs):
         raise ValueError("拘束（固定支持 または 変位）がありません。少なくとも1つ設定してください。")
 
     # 材料
@@ -225,7 +225,7 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
             F += th_factor(t) * F_th
         for bc, (Fi, fx) in zip(bcs, per_bc):
             f = _step_factor(bc, t, ends)
-            if bc.kind in ("fixed",):
+            if bc.kind in ("fixed", "symmetry", "frictionless"):
                 for d in fx:
                     fixed[d] = 0.0
             elif bc.kind == "displacement":
@@ -444,7 +444,7 @@ def _make_result(mesh, mats, elem_mat, D, u, bcs, per_bc, F, pairs, contacts, LD
         Rv = Rv + Kc @ u - fc
     reactions = {}
     for i, (bc, (_, fx)) in enumerate(zip(bcs, per_bc)):
-        if bc.kind in ("fixed", "displacement"):
+        if bc.kind in ("fixed", "displacement", "symmetry", "frictionless"):
             d = np.fromiter(fx.keys(), dtype=np.int64)
             r = np.zeros(3)
             for c in range(3):

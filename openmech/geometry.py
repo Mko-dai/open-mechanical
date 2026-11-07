@@ -63,6 +63,10 @@ FEATURES = {
     "cyl_shell": ("円筒面（シェル）", "筒", [("x", "底面中心 X [mm]", 0.0), ("y", "底面中心 Y [mm]", 0.0),
                                       ("z", "底面中心 Z [mm]", 0.0), ("axis", "軸方向", "Z"),
                                       ("r", "半径 [mm]", 50.0), ("h", "長さ [mm]", 100.0), ("t", "厚さ [mm]", 2.0)]),
+    "disk": ("円板（シェル・2D）", "盤", [("plane", "平面", "XY"), ("offset", "平面の位置 [mm]", 0.0),
+                                   ("u0", "中心 u [mm]", 0.0), ("v0", "中心 v [mm]", 0.0),
+                                   ("r", "外半径 [mm]", 20.0), ("ri", "内半径 [mm]（0 = 穴なし）", 0.0),
+                                   ("t", "厚さ [mm]", 2.0)]),
     "import": ("インポート", "読", [("path", "ファイル", ""),
                                  ("dx", "移動 X [mm]", 0.0), ("dy", "移動 Y [mm]", 0.0), ("dz", "移動 Z [mm]", 0.0)]),
 }
@@ -77,7 +81,14 @@ def new_feature(ftype, op="new", **over):
     return f
 
 
-SHELL_FEATURES = ("plate", "sheet", "cyl_shell")
+SHELL_FEATURES = ("plate", "sheet", "cyl_shell", "disk")
+PLANE_MODES = {"plane_stress": "平面応力", "plane_strain": "平面ひずみ", "axisymmetric": "軸対称"}
+
+
+def analysis_2d_mode(spec) -> str | None:
+    """2D 解析のモード（Ansys のジオメトリ「2D の挙動」）。3D なら None"""
+    m = spec.get("analysis_2d")
+    return m if m in PLANE_MODES else None
 
 
 def is_shell_model(spec) -> bool:
@@ -94,8 +105,20 @@ def _make_surface(gmsh, f):
     occ = gmsh.model.occ
     t = f["type"]
     g = lambda k: float(f.get(k, 0.0))  # noqa: E731
-    if g("t") <= 0:
+    if g("t") <= 0 and f.get("op", "new") == "new":
         raise GeometryError("シェルの厚さは正の値にしてください")
+    if t == "disk":
+        plane = f.get("plane", "XY")
+        to3 = _plane_map(plane, g("offset"))
+        normal = {"XY": (0, 0, 1), "YZ": (1, 0, 0), "ZX": (0, 1, 0)}[plane]
+        if g("r") <= 0 or g("ri") >= g("r") or g("ri") < 0:
+            raise GeometryError("円板の半径は 0 ≤ 内半径 < 外半径 にしてください")
+        cx = to3(g("u0"), g("v0"))
+        outer = occ.addCurveLoop([occ.addCircle(*cx, g("r"), zAxis=normal)])
+        loops = [outer]
+        if g("ri") > 0:
+            loops.append(occ.addCurveLoop([occ.addCircle(*cx, g("ri"), zAxis=normal)]))
+        return [(2, occ.addPlaneSurface(loops))]
     if t == "plate":
         to3 = _plane_map(f.get("plane", "XY"), g("offset"))
         u0, v0, du, dv = g("u0"), g("v0"), g("du"), g("dv")
@@ -115,30 +138,57 @@ def _make_surface(gmsh, f):
 
 
 def _build_shell_features(gmsh, features):
-    """サーフェス（シェル）のボディを作る。接する辺・交わる線は節点を共有（フラグメント）"""
+    """サーフェス（シェル・2D）のボディを作る。ソリッドと同じく op（new/add/cut）と
+    ブール演算（結合・除去）が使える。接する辺・交わる線は節点を共有（フラグメント）"""
     occ = gmsh.model.occ
-    keys = feature_body_keys(features)
-    objs, owner, thick = [], [], {}
+    bodies: dict[int, list] = {}
+    thick = {}
+    nkey, last = 0, None
     for i, f in enumerate(features):
-        if f.get("suppressed") or f.get("type") == "bool" or i not in keys:
+        if f.get("suppressed"):
             continue
-        if f["type"] not in SHELL_FEATURES:
+        t, op = f["type"], f.get("op", "new")
+        if t == "bool":
+            tgt = int(f.get("target", -1))
+            tools = [int(k) for k in f.get("tools", []) if int(k) in bodies and int(k) != tgt]
+            if tgt not in bodies or not tools:
+                continue
+            tt = [dt for k in tools for dt in bodies[k]]
+            bodies[tgt] = (occ.fuse if op == "union" else occ.cut)(bodies[tgt], tt)[0]
+            for k in tools:
+                bodies.pop(k, None)
+            continue
+        if t not in SHELL_FEATURES:
             raise GeometryError("ソリッドとシェル（サーフェス）を同じモデルで混ぜることには、まだ対応していません")
-        for dt in _make_surface(gmsh, f):
-            objs.append(dt)
-            owner.append(keys[i])
-        thick[keys[i]] = float(f.get("t", 1.0))
-    if not objs:
+        tool = _make_surface(gmsh, f)
+        if op == "new" or not bodies:
+            bodies[nkey] = tool
+            thick[nkey] = float(f.get("t", 1.0))
+            last = nkey
+            nkey += 1
+        elif op == "add":
+            tgt = int(f.get("target", last if last is not None else -1))
+            tgt = tgt if tgt in bodies else max(bodies)
+            bodies[tgt] = occ.fuse(bodies[tgt], tool)[0]
+        elif op == "cut":
+            for k in [int(k) for k in (f.get("targets") or list(bodies)) if int(k) in bodies]:
+                bodies[k] = occ.cut(bodies[k], tool, removeTool=False)[0]
+            occ.remove(tool, recursive=True)
+    bodies = {k: [dt for dt in v if dt[0] == 2] for k, v in bodies.items()}
+    bodies = {k: v for k, v in bodies.items() if v}
+    if not bodies:
         raise GeometryError("サーフェスがありません")
+    keys = sorted(bodies)
+    objs = [(dt, k) for k in keys for dt in bodies[k]]
     groups = {}
     if len(objs) > 1:
-        _, omap = occ.fragment(objs[:1], objs[1:])
+        _, omap = occ.fragment([objs[0][0]], [o[0] for o in objs[1:]])
         for idx, children in enumerate(omap):
             for dt in children:
-                if dt[0] == 2:
-                    groups.setdefault(owner[idx], set()).add(dt[1])
+                if dt[0] == 2 and not any(dt[1] in g for g in groups.values()):
+                    groups.setdefault(objs[idx][1], set()).add(dt[1])
     else:
-        groups[owner[0]] = {objs[0][1]}
+        groups[objs[0][1]] = {objs[0][0][1]}
     occ.synchronize()
     for k, tags in groups.items():
         gmsh.model.addPhysicalGroup(2, sorted(tags), tag=k + 1)
@@ -179,6 +229,49 @@ def _extract_shell_mesh(gmsh, thick):
     remap[used] = np.arange(len(used))
     return ShellMesh(coords[used], remap[tris], np.concatenate(th), np.concatenate(sid),
                      [remap[e] for e in edges], elem_body=np.concatenate(body), n_surf=len(surfs))
+
+
+def _extract_2d_mesh(gmsh, thick, mode):
+    """XY 平面の 6 節点三角形メッシュ → Mesh2D（辺は 3 節点の線要素）"""
+    from .plane import Mesh2D
+    tags, coords, _ = gmsh.model.mesh.getNodes()
+    coords = coords.reshape(-1, 3)
+    if np.abs(coords[:, 2]).max() > 1e-6 * max(1.0, np.abs(coords).max()):
+        raise GeometryError("2D 解析では、面を XY 平面（Z = 0）に作成してください")
+    tag2idx = np.full(int(tags.max()) + 1, -1, dtype=np.int64)
+    tag2idx[tags.astype(np.int64)] = np.arange(len(tags))
+    surfs = sorted(gmsh.model.getEntities(2), key=lambda e: e[1])
+    tris, sid, body, th = [], [], [], []
+    for i, (_, st) in enumerate(surfs):
+        phys = gmsh.model.getPhysicalGroupsForEntity(2, st)
+        b = int(phys[0]) - 1 if len(phys) else 0
+        ets, _, ens = gmsh.model.mesh.getElements(2, st)
+        for t, en in zip(ets, ens):
+            if int(t) != 9:          # 9 = 6 節点三角形
+                continue
+            tri = tag2idx[en.astype(np.int64)].reshape(-1, 6)
+            tris.append(tri)
+            sid.append(np.full(len(tri), i))
+            body.append(np.full(len(tri), b))
+            th.append(np.full(len(tri), thick.get(b, 1.0) if mode == "plane_stress" else 1.0))
+    if not tris:
+        raise GeometryError("面を三角形でメッシュできませんでした")
+    tris = np.vstack(tris)
+    p = coords[tris[:, :3], :2]
+    neg = ((p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1])
+           - (p[:, 2, 0] - p[:, 0, 0]) * (p[:, 1, 1] - p[:, 0, 1])) < 0
+    tris[neg] = tris[neg][:, [0, 2, 1, 5, 4, 3]]          # 反時計回りにそろえる
+    edges = []
+    for _, ct in sorted(gmsh.model.getEntities(1), key=lambda e: e[1]):
+        ets, _, ens = gmsh.model.mesh.getElements(1, ct)
+        seg = [tag2idx[en.astype(np.int64)].reshape(-1, 3) for t, en in zip(ets, ens) if int(t) == 8]
+        if seg:
+            edges.append(np.vstack(seg))
+    used = np.unique(np.concatenate([tris.ravel()] + [e.ravel() for e in edges]))
+    remap = np.full(len(coords), -1, dtype=np.int64)
+    remap[used] = np.arange(len(used))
+    return Mesh2D(coords[used], remap[tris], np.concatenate(sid), [remap[e] for e in edges],
+                  np.concatenate(th), elem_body=np.concatenate(body), n_surf=len(surfs), mode=mode)
 
 
 def _axis_vec(axis, h):
@@ -876,6 +969,16 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
                                       ms.get("growth_rate", 1.5))
             if mins:
                 gmsh.option.setNumber("Mesh.MeshSizeMin", min([hmin] + [v * 0.5 for v in mins]))
+        mode2d = analysis_2d_mode(spec)
+        if mode2d is not None:
+            if not shell:
+                raise GeometryError("2D 解析では、形状を XY 平面上のサーフェス（平板・多角形の面・円板）で作成してください")
+            gmsh.model.mesh.generate(2)
+            gmsh.option.setNumber("Mesh.SecondOrderLinear", 0)
+            gmsh.model.mesh.setOrder(2)
+            mesh = _extract_2d_mesh(gmsh, thick, mode2d)
+            log(f"2D メッシュ完了（{PLANE_MODES[mode2d]}）: 節点 {mesh.n_nodes:,} / 要素 {mesh.n_elems:,} / 辺 {len(mesh.edges3)}")
+            return mesh
         if shell:
             gmsh.model.mesh.generate(2)
             mesh = _extract_shell_mesh(gmsh, thick)

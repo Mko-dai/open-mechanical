@@ -291,34 +291,31 @@ def _shell_dofs(el):
     return (6 * el[:, :, None] + np.arange(6)).reshape(len(el), -1)
 
 
-def solve_shell(mesh: ShellMesh, material, bcs: list[BC], elem_materials=None, log=print, progress=None,
-                method="auto", n_cores=None) -> Result:
-    """シェルの線形静解析"""
-    from .parallel import set_threads
-    if n_cores is not None:
-        set_threads(n_cores)
-    t0 = time.time()
-    if not any(b.kind in ("fixed", "displacement") for b in bcs):
-        raise ValueError("拘束（固定支持 または 変位）がありません。辺または面に設定してください。")
-    if elem_materials is not None:
-        mats, elem_mat = elem_materials
-        elem_mat = np.asarray(elem_mat, np.int64)
-    else:
-        mats, elem_mat = [material], np.zeros(mesh.n_elems, np.int64)
-    Dps = np.stack([plane_stress_D(material_D(m)) for m in mats])
-    Dp = Dps[elem_mat]
-    X = mesh.nodes[mesh.elems]
-    t = mesh.thickness
-    Ke, R, xy, A = shell_element_K(X, t, Dp)
+def _allman_stab(xy, A, t, Dp, alpha_s=0.05):
+    """Allman 膜のゼロエネルギーモード抑制ばね（弾性, 9×9）"""
+    _, b, c = _allman_B(xy, A, (1 / 3, 1 / 3, 1 / 3))
+    E = len(xy)
+    g = np.zeros((E, 9))
+    for i in range(3):
+        g[:, 3 * i] = -0.5 * c[:, i]
+        g[:, 3 * i + 1] = 0.5 * b[:, i]
+        g[:, 3 * i + 2] = -1.0 / 3.0
+    ks = alpha_s * Dp[:, 2, 2] * t * A
+    return ks[:, None, None] * np.einsum("ei,ej->eij", g, g)
+
+
+def _transform(R):
+    T = np.zeros((len(R), 18, 18))
+    for k in range(6):
+        T[:, 3 * k:3 * k + 3, 3 * k:3 * k + 3] = R
+    return T
+
+
+def shell_constraints(mesh: ShellMesh, bcs, mats, elem_mat, A, normals):
+    """シェルの拘束 {自由度: 値} と外力ベクトル"""
     nd = 6 * mesh.n_nodes
-    dofs = _shell_dofs(mesh.elems)
-    rows = np.repeat(dofs, 18, axis=1).ravel()
-    cols = np.tile(dofs, (1, 18)).ravel()
-    K = sp.coo_matrix((Ke.ravel(), (rows, cols)), shape=(nd, nd)).tocsr()
-    # 使われていない回転自由度などを止める
     F = np.zeros(nd)
     fixed = {}
-    normals = R[:, 2]
     for bc in bcs:
         nodes = mesh.face_nodes(bc.faces) if bc.faces else np.asarray(bc.nodes, np.int64)
         if bc.kind == "fixed":
@@ -331,6 +328,23 @@ def solve_shell(mesh: ShellMesh, material, bcs: list[BC], elem_materials=None, l
                     continue
                 for d in 6 * nodes + c:
                     fixed[int(d)] = float(bc.values[c])
+            # 面内の変位を与えた辺は、ドリリング回転（法線まわり）も止める（辺がまっすぐ動くように）
+            if bc.faces:
+                el = np.isin(mesh.elems, nodes).any(axis=1)
+                n = normals[el].mean(0) if el.any() else np.zeros(3)
+                if np.linalg.norm(n) > 0 and np.max(np.abs(n)) / np.linalg.norm(n) > 0.999:
+                    ax = int(np.argmax(np.abs(n)))
+                    if any(bc.values[c] is not None for c in range(3) if c != ax):
+                        for d in 6 * nodes + 3 + ax:
+                            fixed.setdefault(int(d), 0.0)
+        elif bc.kind in ("symmetry", "frictionless"):
+            for f in bc.faces:
+                ax = _shell_sym_axis(mesh, int(f), normals)
+                fn = mesh.face_nodes([f])
+                comps = [ax] if bc.kind == "frictionless" else [ax, 3 + (ax + 1) % 3, 3 + (ax + 2) % 3]
+                for c in comps:   # 対称: 面に垂直な変位と、面内の軸まわりの回転を止める
+                    for d in 6 * fn + c:
+                        fixed[int(d)] = 0.0
         elif bc.kind == "force":
             f = np.asarray(bc.values, float)
             w = _load_weights(mesh, bc.faces)
@@ -347,66 +361,213 @@ def solve_shell(mesh: ShellMesh, material, bcs: list[BC], elem_materials=None, l
         elif bc.kind == "gravity":
             acc = np.asarray(bc.values, float)
             rho = np.array([m.density_t_mm3 for m in mats])[elem_mat]
-            mass = rho * t * A
+            mass = rho * mesh.thickness * A
             for c in range(3):
                 np.add.at(F, 6 * mesh.elems.ravel() + c, np.repeat(mass / 3 * acc[c], 3))
         elif bc.kind in ("moment", "thermal"):
             raise ValueError("シェルではモーメント・熱条件にまだ対応していません")
-    cd = np.array(sorted(fixed), np.int64)
-    cv = np.array([fixed[int(d)] for d in cd])
-    free = np.ones(nd, bool)
-    free[cd] = False
-    # どの要素にもつながらない自由度（孤立節点）を除く
+    return F, fixed
+
+
+def _shell_sym_axis(mesh, fid, normals):
+    """シェルの辺（または面）の対称面の法線軸"""
+    if mesh.is_edge(fid):
+        seg = mesh.edges[fid - mesh.n_surf]
+        d = mesh.nodes[seg[:, 1]] - mesh.nodes[seg[:, 0]]
+        d = d.sum(0)
+        d /= np.linalg.norm(d)
+        # 辺に接する要素の法線
+        nodes = set(seg.ravel().tolist())
+        el = [i for i, e in enumerate(mesh.elems) if len(nodes.intersection(e.tolist())) >= 2]
+        ns = normals[el].mean(0)
+        n = np.cross(d, ns)
+    else:
+        n = normals[mesh.face_ids == fid].mean(0)
+    n /= max(np.linalg.norm(n), 1e-300)
+    if np.max(np.abs(n)) < 0.999:
+        raise ValueError("シェルの対称領域・摩擦なし支持は、座標軸に垂直な平面上の辺（または面）に設定してください")
+    return int(np.argmax(np.abs(n)))
+
+
+NL_LAYERS = 5   # 板厚方向の積分点（Ansys の SHELL181 の塑性と同じ 5 点, シンプソン則）
+_LZ = np.linspace(-0.5, 0.5, NL_LAYERS)
+_LW = np.array([1, 4, 2, 4, 1], float) / 12.0      # シンプソン則（合計 1）
+_GPL = ([2 / 3, 1 / 6, 1 / 6], [1 / 6, 2 / 3, 1 / 6], [1 / 6, 1 / 6, 2 / 3])
+_GPX = [(1 / 6, 1 / 6), (2 / 3, 1 / 6), (1 / 6, 2 / 3)]   # 同じ点の (ξ, η)（DKT 用。L1 = 1−ξ−η）
+
+
+class ShellPlastic:
+    """塑性材料を含むシェルの内力・接線（板厚方向 5 層、面内 3 点、平面応力のリターンマッピング）"""
+
+    def __init__(self, mesh, mats, elem_mat, Dp):
+        from .plasticity import PlasticModel
+        self.mesh, self.mats, self.elem_mat, self.Dp = mesh, mats, elem_mat, Dp
+        X = mesh.nodes[mesh.elems]
+        self.R, self.xy, self.A = _frames(X)
+        self.T = _transform(self.R)
+        self.t = mesh.thickness
+        E = mesh.n_elems
+        # 膜の B は体積座標 (L1,L2,L3)、DKT は (ξ,η)=(L2,L3)
+        self.Bm = [_allman_B(self.xy, self.A, Lp)[0] for Lp in _GPL]
+        self.Bb = [_dkt_B(self.xy, Lp[1], Lp[2]) for Lp in _GPL]
+        self.Ks = _allman_stab(self.xy, self.A, self.t, Dp)
+        self.models = {i: PlasticModel(m) for i, m in enumerate(mats) if getattr(m, "plastic", False)}
+        sh = (3, NL_LAYERS, E)
+        self.ep = np.zeros(sh + (6,))
+        self.al = np.zeros(sh + (6,))
+        self.pb = np.zeros(sh)
+        self.ez = np.zeros(sh)
+        self.trial = None
+        self.dofs = _shell_dofs(mesh.elems)
+        self.rows = np.repeat(self.dofs, 18, axis=1).ravel()
+        self.cols = np.tile(self.dofs, (1, 18)).ravel()
+
+    def internal(self, u):
+        from .newton import plane_stress_return
+        E = self.mesh.n_elems
+        ul = np.einsum("eij,ej->ei", self.T, u[self.dofs])
+        um, ub = ul[:, _MEMR], ul[:, _BEN]
+        fl = np.zeros((E, 18))
+        Kl = np.zeros((E, 18, 18))
+        Kl[:, _MEMR[:, None], _MEMR[None, :]] += self.Ks
+        fl[:, _MEMR] += np.einsum("eij,ej->ei", self.Ks, um)
+        st = [self.ep.copy(), self.al.copy(), self.pb.copy(), self.ez.copy()]
+        sig_out = np.zeros((3, NL_LAYERS, E, 3))
+        idx_m = np.ix_(range(E), _MEMR, _MEMR)
+        for g in range(3):
+            Bm, Bb = self.Bm[g], self.Bb[g]
+            em = np.einsum("eij,ej->ei", Bm, um)
+            kap = np.einsum("eij,ej->ei", Bb, ub)
+            for l, (z, wl) in enumerate(zip(_LZ, _LW)):
+                zz = z * self.t
+                eps = em + zz[:, None] * kap
+                C = self.Dp.copy()
+                sig = np.einsum("eij,ej->ei", C, eps)
+                for mi, model in self.models.items():
+                    sel = np.nonzero(self.elem_mat == mi)[0]
+                    if len(sel) == 0:
+                        continue
+                    sg, Cs, e1, a1, p1, z1 = plane_stress_return(model, eps[sel], self.ep[g, l, sel],
+                                                                 self.al[g, l, sel], self.pb[g, l, sel],
+                                                                 self.ez[g, l, sel])
+                    sig[sel], C[sel] = sg, Cs
+                    st[0][g, l, sel], st[1][g, l, sel], st[2][g, l, sel], st[3][g, l, sel] = e1, a1, p1, z1
+                sig_out[g, l] = sig
+                w = (self.A / 3) * self.t * wl            # 面積 × 層の厚さ
+                fl[:, _MEMR] += np.einsum("e,eki,ek->ei", w, Bm, sig)
+                fl[:, _BEN] += np.einsum("e,eki,ek->ei", w * zz, Bb, sig)
+                Kl[:, _MEMR[:, None], _MEMR[None, :]] += np.einsum("e,eki,ekl,elj->eij", w, Bm, C, Bm)
+                Kmb = np.einsum("e,eki,ekl,elj->eij", w * zz, Bm, C, Bb)
+                Kl[:, _MEMR[:, None], _BEN[None, :]] += Kmb
+                Kl[:, _BEN[:, None], _MEMR[None, :]] += Kmb.transpose(0, 2, 1)
+                Kl[:, _BEN[:, None], _BEN[None, :]] += np.einsum("e,eki,ekl,elj->eij", w * zz * zz, Bb, C, Bb)
+        del idx_m
+        self.trial = st + [sig_out]
+        fe = np.einsum("eki,ek->ei", self.T, fl)
+        Ke = np.einsum("eki,ekl,elj->eij", self.T, Kl, self.T)
+        nd = 6 * self.mesh.n_nodes
+        f = np.zeros(nd)
+        np.add.at(f, self.dofs.ravel(), fe.ravel())
+        K = sp.coo_matrix((Ke.ravel(), (self.rows, self.cols)), shape=(nd, nd)).tocsr()
+        return f, K
+
+    def commit(self):
+        self.ep, self.al, self.pb, self.ez = [x.copy() for x in self.trial[:4]]
+
+
+def _layer_to_global(R, s):
+    S = np.zeros((len(s), 3, 3))
+    S[:, 0, 0], S[:, 1, 1] = s[:, 0], s[:, 1]
+    S[:, 0, 1] = S[:, 1, 0] = s[:, 2]
+    G = np.einsum("eki,ekl,elj->eij", R, S, R)
+    return np.stack([G[:, 0, 0], G[:, 1, 1], G[:, 2, 2], G[:, 0, 1], G[:, 1, 2], G[:, 0, 2]], 1)
+
+
+def solve_shell(mesh: ShellMesh, material, bcs: list[BC], elem_materials=None, log=print, progress=None,
+                method="auto", n_cores=None, settings=None) -> Result:
+    """シェルの静解析（線形、または塑性材料があれば弾塑性）"""
+    from .parallel import set_threads
+    if n_cores is not None:
+        set_threads(n_cores)
+    t0 = time.time()
+    if not any(b.kind in ("fixed", "displacement", "symmetry", "frictionless") for b in bcs):
+        raise ValueError("拘束（固定支持 または 変位）がありません。辺または面に設定してください。")
+    if elem_materials is not None:
+        mats, elem_mat = elem_materials
+        elem_mat = np.asarray(elem_mat, np.int64)
+    else:
+        mats, elem_mat = [material], np.zeros(mesh.n_elems, np.int64)
+    Dps = np.stack([plane_stress_D(material_D(m)) for m in mats])
+    Dp = Dps[elem_mat]
+    X = mesh.nodes[mesh.elems]
+    t = mesh.thickness
+    R, xy, A = _frames(X)
+    normals = R[:, 2]
+    nd = 6 * mesh.n_nodes
+    dofs = _shell_dofs(mesh.elems)
+    F, fixed = shell_constraints(mesh, bcs, mats, elem_mat, A, normals)
     used = np.zeros(nd, bool)
     used[dofs.ravel()] = True
-    free &= used
-    u = np.zeros(nd)
-    u[cd] = cv
-    Kff = K[free][:, free].tocsc()
-    rhs = F[free] - K[free][:, cd] @ cv
-    log(f"シェル: 節点 {mesh.n_nodes:,}、要素 {mesh.n_elems:,}、自由度 {int(free.sum()):,}")
-    uf = _linear_solve(Kff, rhs, log, method="direct" if method == "auto" else method)
-    if not np.all(np.isfinite(uf)) or _rel_res(Kff, uf, rhs) > 1e-4:
-        raise RuntimeError("解が求まりませんでした。拘束が不足していないか確認してください（シェルは辺に支持を設定します）。")
-    u[free] = uf
-    # 応力（上面・下面、要素の重心で評価 → 節点平均）
-    ue = u[dofs]
-    T = np.zeros((len(R), 18, 18))
-    for k in range(6):
-        T[:, 3 * k:3 * k + 3, 3 * k:3 * k + 3] = R
-    ul = np.einsum("eij,ej->ei", T, ue)
-    em = np.einsum("eij,ej->ei", _allman_B(xy, A, (1 / 3, 1 / 3, 1 / 3))[0], ul[:, _MEMR])
-    kap = np.einsum("eij,ej->ei", _dkt_B(xy, 1 / 3, 1 / 3), ul[:, _BEN])
-    out = {}
-    for name, z in (("上面", 0.5), ("下面", -0.5)):
-        eps = em + (z * t)[:, None] * kap
-        s = np.einsum("eij,ej->ei", Dp, eps)            # 局所 σx, σy, τxy
-        S = np.zeros((len(s), 3, 3))
-        S[:, 0, 0], S[:, 1, 1] = s[:, 0], s[:, 1]
-        S[:, 0, 1] = S[:, 1, 0] = s[:, 2]
-        G = np.einsum("eki,ekl,elj->eij", R, S, R)       # 全体座標
-        sv = np.stack([G[:, 0, 0], G[:, 1, 1], G[:, 2, 2], G[:, 0, 1], G[:, 1, 2], G[:, 0, 2]], 1)
-        out[name] = _nodal_avg(mesh, sv, A)
+    plastic = any(getattr(m, "plastic", False) for m in mats)
+    log(f"シェル: 節点 {mesh.n_nodes:,}、要素 {mesh.n_elems:,}" + ("（弾塑性）" if plastic else ""))
+    extra = {}
+    if plastic:
+        from .newton import solve_incremental
+        from .nonlinear import AnalysisSettings
+        ps = ShellPlastic(mesh, mats, elem_mat, Dp)
+        u = solve_incremental(ps.internal, ps.commit, F, fixed, nd, settings or AnalysisSettings(), log,
+                              free_mask=used)
+        K = ps.internal(u)[1]
+        sig = ps.trial[4]           # (3 点, 5 層, E, 3)
+        out = {"上面": _layer_to_global(R, sig[:, -1].mean(0)), "下面": _layer_to_global(R, sig[:, 0].mean(0))}
+        out = {k: _nodal_avg(mesh, v, A) for k, v in out.items()}
+        peq = ps.pb.max(axis=(0, 1))
+        extra["相当塑性ひずみ"] = _nodal_avg(mesh, peq[:, None], A)[:, 0]
+        R_all = ps.internal(u)[0] - F
+    else:
+        Ke, R, xy, A = shell_element_K(X, t, Dp)
+        rows = np.repeat(dofs, 18, axis=1).ravel()
+        cols = np.tile(dofs, (1, 18)).ravel()
+        K = sp.coo_matrix((Ke.ravel(), (rows, cols)), shape=(nd, nd)).tocsr()
+        cd = np.array(sorted(fixed), np.int64)
+        cv = np.array([fixed[int(d)] for d in cd])
+        free = np.ones(nd, bool)
+        free[cd] = False
+        free &= used
+        u = np.zeros(nd)
+        u[cd] = cv
+        Kff = K[free][:, free].tocsc()
+        rhs = F[free] - K[free][:, cd] @ cv
+        uf = _linear_solve(Kff, rhs, log, method="direct" if method == "auto" else method)
+        if not np.all(np.isfinite(uf)) or _rel_res(Kff, uf, rhs) > 1e-4:
+            raise RuntimeError("解が求まりませんでした。拘束が不足していないか確認してください（シェルは辺に支持を設定します）。")
+        u[free] = uf
+        ul = np.einsum("eij,ej->ei", _transform(R), u[dofs])
+        em = np.einsum("eij,ej->ei", _allman_B(xy, A, (1 / 3, 1 / 3, 1 / 3))[0], ul[:, _MEMR])
+        kap = np.einsum("eij,ej->ei", _dkt_B(xy, 1 / 3, 1 / 3), ul[:, _BEN])
+        out = {}
+        for name, z in (("上面", 0.5), ("下面", -0.5)):
+            s = np.einsum("eij,ej->ei", Dp, em + (z * t)[:, None] * kap)
+            out[name] = _nodal_avg(mesh, _layer_to_global(R, s), A)
+        R_all = K @ u - F
     vm = {k: _mises(v) for k, v in out.items()}
     top_bigger = vm["上面"] >= vm["下面"]
     stress = np.where(top_bigger[:, None], out["上面"], out["下面"])
     U = u.reshape(-1, 6)
-    R_all = K @ u - F
     reactions = {}
     for i, bc in enumerate(bcs):
-        if bc.kind in ("fixed", "displacement"):
+        if bc.kind in ("fixed", "displacement", "symmetry", "frictionless"):
             nodes = mesh.face_nodes(bc.faces) if bc.faces else np.asarray(bc.nodes, np.int64)
             reactions[i] = R_all.reshape(-1, 6)[nodes, :3].sum(0)
-    info = {"自由度数": int(free.sum()), "節点数": mesh.n_nodes, "要素数": mesh.n_elems,
-            "要素タイプ": "シェル（3節点 DKT＋CST, SHELL181 相当）", "ソルバー": "直接法",
-            "合計時間 [s]": round(time.time() - t0, 2)}
+    info = {"自由度数": int(used.sum() - len(fixed)), "節点数": mesh.n_nodes, "要素数": mesh.n_elems,
+            "要素タイプ": "シェル（3節点 DKT＋Allman 膜, SHELL181 相当）" + ("・弾塑性 5 層" if plastic else ""),
+            "ソルバー": "直接法", "合計時間 [s]": round(time.time() - t0, 2)}
     r = Result(mesh, mats[0], U[:, :3].copy(), stress, np.zeros_like(stress), reactions, info, mats, elem_mat)
     r.extra = {"相当応力（上面） [MPa]": vm["上面"], "相当応力（下面） [MPa]": vm["下面"],
-               "回転 θx [rad]": U[:, 3], "回転 θy [rad]": U[:, 4], "回転 θz [rad]": U[:, 5]}
-    for k, lab in enumerate(("σx", "σy", "σz", "τxy", "τyz", "τzx")):
-        if k in (0, 1, 3):
-            r.extra[f"応力 {lab}（上面） [MPa]"] = out["上面"][:, k]
-            r.extra[f"応力 {lab}（下面） [MPa]"] = out["下面"][:, k]
+               "回転 θx [rad]": U[:, 3], "回転 θy [rad]": U[:, 4], "回転 θz [rad]": U[:, 5], **extra}
+    for k, lab in ((0, "σx"), (1, "σy"), (3, "τxy")):
+        r.extra[f"応力 {lab}（上面） [MPa]"] = out["上面"][:, k]
+        r.extra[f"応力 {lab}（下面） [MPa]"] = out["下面"][:, k]
     r.rotations = U[:, 3:].copy()
     return r
 
@@ -434,10 +595,11 @@ def _load_weights(mesh: ShellMesh, faces):
 
 
 def _nodal_avg(mesh, ev, A):
+    k = mesh.elems.shape[1]
     idx = mesh.elems.ravel()
-    wt = np.repeat(A, 3)
+    wt = np.repeat(A, k)
     den = np.maximum(np.bincount(idx, wt, mesh.n_nodes), 1e-300)
-    return np.column_stack([np.bincount(idx, (np.repeat(ev[:, k], 3) * wt), mesh.n_nodes) for k in range(ev.shape[1])]) / den[:, None]
+    return np.column_stack([np.bincount(idx, (np.repeat(ev[:, j], k) * wt), mesh.n_nodes) for j in range(ev.shape[1])]) / den[:, None]
 
 
 def _mises(s):

@@ -268,7 +268,7 @@ class BC:
                   d.get("nodes", []), d.get("step_factors", []), d.get("bodies", []))
 
     def label(self) -> str:
-        jp = {"fixed": "固定支持", "displacement": "強制変位", "force": "力",
+        jp = {"symmetry": "対称領域", "frictionless": "摩擦なし支持", "fixed": "固定支持", "displacement": "強制変位", "force": "力",
               "pressure": "圧力", "moment": "モーメント", "gravity": "重力加速度", "thermal": "熱条件"}
         name = self.name or jp.get(self.kind, self.kind)
         unit = {"force": "N", "pressure": "MPa", "moment": "N·mm",
@@ -280,11 +280,31 @@ class BC:
         return f"{name}{f}{v}"
 
 
+def symmetry_axis(mesh: Mesh, faces) -> int:
+    """対称面（座標軸に垂直な平面）の法線の軸 0/1/2。面ごとに求め、すべて同じ軸であること"""
+    info = {f["id"]: f for f in mesh.face_info()}
+    axes = set()
+    for f in faces:
+        n = np.asarray(info[int(f)]["normal"], float)
+        if not info[int(f)].get("flat", False) or np.max(np.abs(n)) < 0.999:
+            raise ValueError("対称領域・摩擦なし支持は、座標軸に垂直な平らな面に設定してください"
+                             f"（面{int(f) + 1} は法線 ({n[0]:.2f}, {n[1]:.2f}, {n[2]:.2f})）")
+        axes.add(int(np.argmax(np.abs(n))))
+    return axes
+
+
 def build_load_and_constraints(mesh: Mesh, material: Material, bcs: list[BC], rho_e=None):
     ndof = 3 * mesh.n_nodes
     F = np.zeros(ndof)
     fixed = {}  # dof -> value
     for bc in bcs:
+        if bc.kind in ("symmetry", "frictionless"):
+            # 対称領域 / 摩擦なし支持: 面に垂直な方向の変位 = 0（面に沿っては自由）
+            for f in bc.faces:
+                ax = symmetry_axis(mesh, [f]).pop()
+                for d in 3 * mesh.face_nodes(f) + ax:
+                    fixed[int(d)] = 0.0
+            continue
         if bc.kind in ("fixed", "displacement"):
             nodes = mesh.face_nodes(bc.faces) if bc.faces else np.asarray(bc.nodes, dtype=np.int64)
             vals = [0.0, 0.0, 0.0] if bc.kind == "fixed" else bc.values
@@ -484,7 +504,7 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
         if progress:
             progress(x, msg)
 
-    if not any(b.kind in ("fixed", "displacement") for b in bcs):
+    if not any(b.kind in ("fixed", "displacement", "symmetry", "frictionless") for b in bcs):
         raise ValueError("拘束（固定支持 または 強制変位）がありません。少なくとも1つ設定してください。")
     mats, elem_mat, rho_e = None, None, None
     if elem_materials is not None:
@@ -536,7 +556,7 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
     R = K @ u - F
     reactions = {}
     for i, bc in enumerate(bcs):
-        if bc.kind in ("fixed", "displacement"):
+        if bc.kind in ("fixed", "displacement", "symmetry", "frictionless"):
             nodes = mesh.face_nodes(bc.faces) if bc.faces else np.asarray(bc.nodes, dtype=np.int64)
             reactions[i] = R.reshape(-1, 3)[nodes].sum(0)
     prog(1.0, "完了")

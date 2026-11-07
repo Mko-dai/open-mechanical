@@ -146,3 +146,17 @@ def test_two_materials_in_series():
     assert np.median(sf[far]) == pytest.approx(10.0, rel=1e-2)
     near_steel = m.nodes[:, 0] < 0.2 * L   # 鋼側: 降伏250 → 25 だが上限15
     assert np.median(sf[near_steel]) == pytest.approx(15.0)
+
+
+def test_symmetry_half_model():
+    """片持ち梁の半分モデル（対称領域）が全体モデルと同じ"""
+    import numpy as np
+    from openmech.materials import Material
+    from openmech.mesh import structured_box
+    from openmech.solver import BC, solve
+    mat = Material("鋼", 200000, 0.3, 7850)
+    full = structured_box(100, 20, 10, 20, 4, 2).to_quadratic()
+    rf = solve(full, mat, [BC("fixed", [0]), BC("force", [1], [0, 0, -100.0])], log=lambda *a: None)
+    half = structured_box(100, 10, 10, 20, 2, 2).to_quadratic()
+    rh = solve(half, mat, [BC("fixed", [0]), BC("symmetry", [3]), BC("force", [1], [0, 0, -50.0])], log=lambda *a: None)
+    assert abs(rh.u[:, 2].min() / rf.u[:, 2].min() - 1) < 0.005   # 四面体の分割向きが鏡像でない分だけ差

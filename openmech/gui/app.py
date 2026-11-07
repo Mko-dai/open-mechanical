@@ -40,7 +40,8 @@ from ..contact import (BEHAVIORS, CONTACT_TYPES, FORMULATIONS, INTERFACE, STATUS
 from ..export import write_csv, write_report, write_vtu
 from ..geometry import (AXES, CAD_EXT, CONTROL_TYPES, FEATURES, MESH_DEFAULTS, OPS, PLANES, PRIMITIVES,
                         GeometryError, build_mesh, mesh_quality,
-                        feature_body_keys, gmsh_available, new_feature, primitive_to_features)
+                        PLANE_MODES, feature_body_keys, gmsh_available, is_shell_model, new_feature,
+                        primitive_to_features)
 from ..materials import LIBRARY, Material
 from ..project import Project
 from ..nonlinear import solve_static
@@ -51,9 +52,11 @@ from .viewer import FIELD_EN, feature_edges, surface_polydata
 # ---------------------------------------------------------------------------- 定義
 
 BC_JP = {"fixed": "固定支持", "displacement": "変位", "force": "力", "pressure": "圧力",
-         "moment": "モーメント", "gravity": "標準地球重力", "thermal": "熱条件"}
+         "moment": "モーメント", "gravity": "標準地球重力", "thermal": "熱条件",
+         "symmetry": "対称領域", "frictionless": "摩擦なし支持"}
 BC_COLORS = {"fixed": "#5a4fcf", "displacement": "#e8b100", "force": "#e03131",
-             "pressure": "#d6336c", "moment": "#ae3ec9", "gravity": "#f08c00", "thermal": "#c92a2a"}
+             "pressure": "#d6336c", "moment": "#ae3ec9", "gravity": "#f08c00", "thermal": "#c92a2a",
+             "symmetry": "#1c7ed6", "frictionless": "#7048e8"}
 BC_UNIT = {"displacement": "mm", "force": "N", "pressure": "MPa", "moment": "N·mm", "gravity": "mm/s²",
            "thermal": "°C"}
 
@@ -411,7 +414,7 @@ class MainWindow(QMainWindow):
             menu_action(mm, lab, lambda key=key: self.add_control(key))
         R.button(g, "メッシュ制御", make_icon("#3a8fa8", "細"), menu=mm)
         g = R.add_group(t, "挿入")
-        R.button(g, "支持", make_icon(BC_COLORS["fixed"], "支"), menu=self._bc_menu(["fixed", "displacement"]))
+        R.button(g, "支持", make_icon(BC_COLORS["fixed"], "支"), menu=self._bc_menu(["fixed", "displacement", "frictionless", "symmetry"]))
         R.button(g, "荷重", make_icon(BC_COLORS["force"], "荷"),
                  menu=self._bc_menu(["force", "pressure", "moment", "gravity", "thermal"]))
         g = R.add_group(t, "出力")
@@ -425,7 +428,7 @@ class MainWindow(QMainWindow):
             R.button(g, FEATURES[ft][0], make_icon(OP_COLORS["new"], FEATURES[ft][1]),
                      lambda _=False, ft=ft: self.create_body(ft))
         g = R.add_group(t, "サーフェス（シェル）")
-        for ft in ["plate", "sheet", "cyl_shell"]:
+        for ft in ["plate", "sheet", "disk", "cyl_shell"]:
             R.button(g, FEATURES[ft][0].replace("（シェル）", ""), make_icon("#0ca678", FEATURES[ft][1]),
                      lambda _=False, ft=ft: self.create_body(ft))
         g = R.add_group(t, "ブール演算")
@@ -465,8 +468,8 @@ class MainWindow(QMainWindow):
         g = R.add_group(t, "静的構造")
         R.button(g, "荷重", make_icon(BC_COLORS["force"], "荷"),
                  menu=self._bc_menu(["force", "pressure", "moment", "gravity", "thermal"]))
-        R.button(g, "支持", make_icon(BC_COLORS["fixed"], "支"), menu=self._bc_menu(["fixed", "displacement"]))
-        for k in ["fixed", "displacement", "force", "pressure", "moment", "gravity", "thermal"]:
+        R.button(g, "支持", make_icon(BC_COLORS["fixed"], "支"), menu=self._bc_menu(["fixed", "displacement", "frictionless", "symmetry"]))
+        for k in ["fixed", "displacement", "frictionless", "symmetry", "force", "pressure", "moment", "gravity", "thermal"]:
             R.button(g, BC_JP[k], make_icon(BC_COLORS[k], BC_JP[k][0]), lambda _=False, k=k: self.add_bc(k))
         g = R.add_group(t, "解析")
         R.button(g, "解析", make_icon("#2e9d3a", "⚡"), self.run_solve)
@@ -627,12 +630,16 @@ class MainWindow(QMainWindow):
         self.bc_attr_w.setVisible(idx == 1)
         self.set_select_mode("body" if idx == 0 else "face")
 
+    def _surface_mesh(self):
+        """シェルまたは 2D のメッシュ（辺を選べる）"""
+        return bool(getattr(self.mesh, "is_shell", False) or getattr(self.mesh, "is_2d", False))
+
     def set_select_mode(self, mode):
         self.sel_body_btn.setChecked(mode == "body")
         self.sel_face_btn.setChecked(mode == "face")
         self.sel_edge_btn.setChecked(mode == "edge")
-        if mode == "edge" and not getattr(self.mesh, "is_shell", False):
-            self.log("辺の選択はシェル（サーフェス）のモデルで使えます")
+        if mode == "edge" and not self._surface_mesh():
+            self.log("辺の選択はシェル（サーフェス）・2D のモデルで使えます")
         if mode == "body":
             self.selected_faces = []
             self.attr_hint.setText("ボディをクリックして選び、名前を入力して［設定］")
@@ -890,7 +897,7 @@ class MainWindow(QMainWindow):
         return STATUS_NONE
 
     def _has_support(self):
-        return any(b.kind in ("fixed", "displacement") for b in self.project.bcs)
+        return any(b.kind in ("fixed", "displacement", "symmetry", "frictionless") for b in self.project.bcs)
 
     # ======================================================================= ツリー
     def rebuild_tree(self, keep=True, details=True):
@@ -1235,6 +1242,16 @@ class MainWindow(QMainWindow):
         self.invalidate(mesh=True)
         self.remesh()
 
+    def _set_analysis_2d(self, mode):
+        g = self.project.geometry
+        if mode in PLANE_MODES:
+            g["analysis_2d"] = mode
+        else:
+            g.pop("analysis_2d", None)
+        self.invalidate(mesh=True)
+        self.remesh()
+        self.build_details()
+
     def _details_geometry(self):
         g = self.project.geometry
         s = self._section("定義")
@@ -1247,6 +1264,18 @@ class MainWindow(QMainWindow):
         kind.currentIndexChanged.connect(lambda _: self._later(lambda d=kind.currentData(): self._geometry_kind_changed(d)))
         self._row(s, "形状", kind)
         if g.get("kind") == "model":
+            mode = QComboBox()
+            mode.addItem("3D", "3d")
+            for key, label in PLANE_MODES.items():
+                mode.addItem("2D: " + label, key)
+            mode.setCurrentIndex(max(0, mode.findData(g.get("analysis_2d") or "3d")))
+            mode.currentIndexChanged.connect(
+                lambda _: self._later(lambda d=mode.currentData(): self._set_analysis_2d(d)))
+            self._row(s, "解析タイプ（2D の挙動）", mode)
+            if g.get("analysis_2d") in PLANE_MODES:
+                self._row(s, "", "XY 平面（Z = 0）上に「平板・多角形の面・円板」で断面を作ります。"
+                          + ("X = 半径方向、Y = 対称軸です。" if g.get("analysis_2d") == "axisymmetric"
+                             else "平面応力では面の厚さが板厚になります。"))
             n = len(g.get("features", []))
             self._row(s, "フィーチャー数", n)
             self._row(s, "", "リボンの［モデル］タブの「作成」で形状を作ります" if n == 0
@@ -1352,6 +1381,20 @@ class MainWindow(QMainWindow):
             return
         lo, hi = self._selected_bounds()
         c, sz = 0.5 * (lo + hi), hi - lo
+        if is_shell_model(self.project.geometry) and sz[2] < 1e-6 * max(1.0, float(sz.max())):
+            # 平らなサーフェス（2D・シェル）の穴 = 円板で切り取る
+            f = new_feature("disk", "cut", u0=float(c[0]), v0=float(c[1]), offset=float(lo[2]),
+                            r=float(max(min(sz[0], sz[1]) / 6, 0.5)))
+            dlg = FeatureDialog("disk", f, "（穴）", self)
+            if not dlg.exec():
+                return
+            f.update(dlg.values())
+            if self.selected_bodies:
+                f["targets"] = list(self.selected_bodies)
+            self._features().append(f)
+            self.current = ("feature", len(self._features()) - 1)
+            self.remesh()
+            return
         f = new_feature("cylinder", "cut", x=float(c[0]), y=float(c[1]), z=float(lo[2] - 1), axis="Z",
                         h=float(sz[2] + 2), r=float(max(min(sz[0], sz[1]) / 6, 0.5)))
         targets = list(self.selected_bodies)
@@ -1829,7 +1872,9 @@ class MainWindow(QMainWindow):
             s2 = self._section("統計")
             self._row(s2, "節点数", f"{self.mesh.n_nodes:,}")
             self._row(s2, "要素数", f"{self.mesh.n_elems:,}")
-            if getattr(self.mesh, "is_shell", False):
+            if getattr(self.mesh, "is_2d", False):
+                self._row(s2, "要素", "2次三角形（6節点, PLANE183 相当）")
+            elif getattr(self.mesh, "is_shell", False):
                 self._row(s2, "要素", "シェル（3節点, SHELL181 相当）")
             else:
                 self._row(s2, "要素", "2次四面体（Tet10, SOLID187 相当）" if self.mesh.order == 2 else "1次四面体（Tet4）")
@@ -2167,6 +2212,12 @@ class MainWindow(QMainWindow):
         unit = BC_UNIT.get(bc.kind, "")
         if bc.kind == "fixed":
             self._row(s2, "拘束", "X, Y, Z 方向すべて固定" + ("（シェルは回転も固定）" if getattr(self.mesh, "is_shell", False) else ""))
+        elif bc.kind == "symmetry":
+            self._row(s2, "拘束", "面（2D は辺）の法線方向の変位を 0（シェルは面内軸まわりの回転も 0）")
+            self._row(s2, "", "対称面は座標軸に垂直な平面にしてください（Ansys の「対称領域」と同じ。結果は対称モデル側の値）")
+        elif bc.kind == "frictionless":
+            self._row(s2, "拘束", "面（2D は辺）の法線方向の変位を 0、接線方向は自由")
+            self._row(s2, "", "現在は座標軸に垂直な平らな面に対応しています")
         elif bc.kind == "thermal":
             sp = dspin(float(bc.values[0] or 0), -273, 1e5, 3, 10.0, "°C")
             sp.valueChanged.connect(lambda v: self._bc_value(i, 0, v))
@@ -2314,7 +2365,7 @@ class MainWindow(QMainWindow):
         faces = [] if kind in ("gravity", "thermal") else list(self.selected_faces)
         vals = {"fixed": [0.0, 0.0, 0.0], "displacement": [0.0, None, None], "force": [0.0, 0.0, -1000.0],
                 "pressure": [1.0], "moment": [0.0, 0.0, 1000.0], "gravity": [0.0, 0.0, -9806.65],
-                "thermal": [100.0]}[kind]
+                "thermal": [100.0], "symmetry": [], "frictionless": []}[kind]
         bc = BC(kind, faces, vals, "")
         if kind == "thermal":
             bc.bodies = list(self.selected_bodies)
@@ -2460,7 +2511,7 @@ class MainWindow(QMainWindow):
             p.assign(mesh.body_ids().tolist(), mat=p.material.name)
         self.selected_bodies = [b for b in self.selected_bodies if b in set(mesh.body_ids().tolist())]
         self._fill_attr_combos()
-        if len(mesh.body_ids()) > 1 and not getattr(mesh, "is_shell", False):
+        if len(mesh.body_ids()) > 1 and not getattr(mesh, "is_shell", False) and not getattr(mesh, "is_2d", False):
             # Ansys と同じく、ボディ同士の接触を自動で作成（手動の接触は残す）
             self.auto_contacts(quiet=True)
         else:
@@ -2511,23 +2562,28 @@ class MainWindow(QMainWindow):
         self.solver_log = []
         self._fail_history = None
         p = self.project
-        if not getattr(self.mesh, "is_shell", False) and p.needs_nonlinear_solver(self.mesh) and not p.contacts \
+        if not self._surface_mesh() and p.needs_nonlinear_solver(self.mesh) and not p.contacts \
                 and len(self.mesh.body_ids()) > 1:
             self.auto_contacts(quiet=True)
         bad_c = [c.name for c in p.contacts if not c.suppressed and not (c.contact_faces and c.target_faces)]
         if bad_c:
             QMessageBox.warning(self, "接触", "面が割り当てられていない接触領域があります: " + ", ".join(bad_c))
             return
-        if getattr(self.mesh, "is_shell", False):
+        if self._surface_mesh():
             try:
                 p.check_shell_supported()
             except ValueError as e:
-                QMessageBox.warning(self, "シェル", str(e))
+                QMessageBox.warning(self, "シェル・2D", str(e))
                 return
-            from ..shell import solve_shell
             self._busy(True, "解析を実行しています…")
-            self.worker = Worker(solve_shell, self.mesh, p.material, list(p.bcs), elem_materials=em,
-                                 n_cores=p.settings.n_cores)
+            if getattr(self.mesh, "is_2d", False):
+                from ..plane import solve_2d
+                self.worker = Worker(solve_2d, self.mesh, p.material, list(p.bcs), mode=self.mesh.mode,
+                                     elem_materials=em, settings=p.settings, n_cores=p.settings.n_cores)
+            else:
+                from ..shell import solve_shell
+                self.worker = Worker(solve_shell, self.mesh, p.material, list(p.bcs), elem_materials=em,
+                                     n_cores=p.settings.n_cores, settings=p.settings)
         elif p.needs_nonlinear_solver(self.mesh):
             self._busy(True, "解析を実行しています…")
             self.worker = Worker(solve_static, self.mesh, p.material, list(p.bcs), list(p.contacts), p.settings,
@@ -2612,7 +2668,7 @@ class MainWindow(QMainWindow):
                 self.set_body_selection([])
             return
         tri = self._tri_src[cell]
-        if self.sel_edge_btn.isChecked() and getattr(self.mesh, "is_shell", False):
+        if self.sel_edge_btn.isChecked() and self._surface_mesh():
             lo, hi = self.mesh.bounds()
             e = self.mesh.nearest_edge(np.array(picker.GetPickPosition()), tol=0.05 * float(np.linalg.norm(hi - lo)))
             if e < 0:
@@ -2918,7 +2974,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _bc_value_text(bc):
-        if bc.kind == "fixed":
+        if bc.kind in ("fixed", "symmetry", "frictionless"):
             return ""
         if bc.kind == "pressure":
             return f": {bc.values[0]:g} MPa"

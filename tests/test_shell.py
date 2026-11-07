@@ -50,3 +50,36 @@ def test_uniform_tension():
            BC("force", [2], [4000.0, 0, 0])]
     r = solve_shell(m, MAT, bcs, log=lambda *a: None)
     assert abs(r.u[m.nodes[:, 0] == 100, 0].mean() / 0.05 - 1) < 0.02
+
+
+def test_shell_plastic_tension_and_elastic_equivalence():
+    from openmech.materials import Material
+    pl = Material("p", 200000, 0.3, 7850, 250, plasticity="bilinear_iso", tangent_modulus=2000)
+    m = structured_plate(100, 20, 20, 4, 2.0)
+    em = ([pl.state()], np.zeros(m.n_elems, int))
+    small = [BC("fixed", [1]), BC("force", [2], [0, 0, -1.0])]
+    a = solve_shell(m, MAT, small, log=lambda *x: None)
+    b = solve_shell(m, pl, small, elem_materials=em, log=lambda *x: None)
+    assert np.abs(a.u - b.u).max() < 1e-8 * np.abs(a.u).max()
+    bcs = [BC("displacement", [1], [0.0, None, 0.0]), BC("displacement", [], [None, 0.0, None], nodes=[0]),
+           BC("displacement", [2], [0.5, None, None])]
+    r = solve_shell(m, pl, bcs, elem_materials=em, log=lambda *x: None)
+    H = 200000 * 2000 / 198000
+    ep = (0.005 - 250 / 200000) / (1 + H / 200000)
+    assert abs(r.stress[:, 0].mean() / (250 + H * ep) - 1) < 0.002
+    assert abs(r.fields()["相当塑性ひずみ"].mean() / ep - 1) < 0.01
+
+
+def test_shell_symmetry_half_model():
+    """単純支持板の 1/4 モデル（対称領域2辺）が全体モデルと同じ"""
+    a, t, q = 100.0, 2.0, 0.01
+    full = structured_plate(a, a, 16, 16, t)
+    rf = solve_shell(full, MAT, [BC("displacement", [1, 2, 3, 4], [None, None, 0.0]),
+                                 BC("displacement", [], [0.0, 0.0, None], nodes=[0]),
+                                 BC("displacement", [], [None, 0.0, None], nodes=[16 * 17]),
+                                 BC("pressure", [0], [q])], log=lambda *x: None)
+    quarter = structured_plate(a / 2, a / 2, 8, 8, t)
+    rq = solve_shell(quarter, MAT, [BC("displacement", [1, 3], [None, None, 0.0]),
+                                    BC("symmetry", [2]), BC("symmetry", [4]), BC("pressure", [0], [q])],
+                     log=lambda *x: None)
+    assert abs(rq.u[:, 2].min() / rf.u[:, 2].min() - 1) < 1e-6
