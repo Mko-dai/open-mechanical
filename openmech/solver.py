@@ -149,48 +149,79 @@ def _element_K(X, De, dN, wts):
     return Ke
 
 
+def stiffness_pattern(elems: np.ndarray, n_nodes: int):
+    """節点どうしの隣接（疎行列のパターン）。返り値 (indptr, indices)（各行の列は昇順）"""
+    ne, nn = elems.shape
+    C = sp.csr_matrix((np.ones(ne * nn, np.float32), elems.ravel().astype(np.int64),
+                       np.arange(0, ne * nn + 1, nn)), shape=(ne, n_nodes))
+    G = (C.T @ C).tocsr()                       # 要素を共有する節点の組
+    G.sort_indices()
+    return G.indptr.astype(np.int64), G.indices.astype(np.int64)
+
+
 def assemble_stiffness(mesh: Mesh, D: np.ndarray, chunk: int = 4000,
                        progress=None, elem_mat=None) -> sp.csr_matrix:
-    """全体剛性マトリクス。要素をブロックに分け、ブロックごとに並列（使用コア数）で組み立てて足し合わせる。
+    """全体剛性マトリクス（CSR）。
 
-    ブロックごとに疎行列にしてから足すので、大きなモデルでもメモリを使いすぎない。
+    先に節点の隣接から行列のパターン（非ゼロの位置）を作り、要素剛性をその位置に直接足し込む。
+    要素剛性の計算は使用コア数で並列。途中で大きな COO 行列を作らないので、
+    100 万節点級でもメモリは最終的な行列 + α で済む。
     """
-    from .parallel import chunks, pmap
+    from . import parallel as _par
+    from .parallel import pmap
     nn = mesh.elems.shape[1]
-    ndof = 3 * mesh.n_nodes
+    N = mesh.n_nodes
+    ndof = 3 * N
     pts, wts = _quadrature(nn)
     dN = [shape_dN_dxi(L, nn) for L in pts]
     ne = mesh.n_elems
-    nloc = 3 * nn
-    blocks = chunks(ne, min_size=1000)
-    blocks = [(a + i, min(b, a + i + chunk)) for a, b in blocks for i in range(0, b - a, chunk)]
-    done = [0]
-    loc = np.arange(3)
+    ip, ix = stiffness_pattern(mesh.elems, N)
+    nnzb = len(ix)
+    rowlen = np.diff(ip)
+    keys = np.repeat(np.arange(N, dtype=np.int64), rowlen) * N + ix      # 昇順
+    # 自由度の CSR: 行 3r+i の並びは「列の節点 k 順 × 成分 j」
+    indptr = np.zeros(ndof + 1, np.int64)
+    indptr[1:] = np.cumsum(np.repeat(3 * rowlen, 3))
+    big = 9 * nnzb >= 2**31 - 1
+    itype = np.int64 if big else np.int32
+    indices = np.empty(9 * nnzb, itype)
+    data = np.zeros(9 * nnzb)
+    prow = np.repeat(np.arange(N, dtype=np.int64), rowlen)
+    base = 6 * ip[prow] + 3 * np.arange(nnzb, dtype=np.int64)          # = 9 ip[r] + 3 (p - ip[r])
+    lr3 = 3 * rowlen[prow]
+    for i in range(3):
+        for j in range(3):
+            indices[base + i * lr3 + j] = 3 * ix + j
+    del prow, base, lr3
+    blocks = [(a, min(ne, a + chunk)) for a in range(0, ne, chunk)]
+    wave = max(1, int(_par._N))
 
     def work(ab):
         a, b = ab
-        el = mesh.elems[a:b]
+        el = mesh.elems[a:b].astype(np.int64)
         De = _D_of(D, elem_mat, slice(a, b))
         if De.ndim == 2:
             De = np.broadcast_to(De, (b - a, 6, 6))
-        Ke = _element_K(mesh.nodes[el], De, dN, wts)
-        dofs = (3 * el[:, :, None] + loc).reshape(b - a, nloc).astype(np.int32)
-        rows = np.repeat(dofs, nloc, axis=1).ravel()
-        cols = np.tile(dofs, (1, nloc)).ravel()
-        Kb = sp.coo_matrix((Ke.ravel(), (rows, cols)), shape=(ndof, ndof)).tocsr()
-        done[0] += b - a
-        if progress:
-            progress(min(1.0, done[0] / ne))
-        return Kb
+        Ke = _element_K(mesh.nodes[el], De, dN, wts).reshape(b - a, nn, 3, nn, 3)
+        r = el[:, :, None]                                         # (B,nn,1)
+        c = el[:, None, :]                                         # (B,1,nn)
+        p = np.searchsorted(keys, (r * N + c).ravel()).reshape(b - a, nn, nn)
+        pr = ip[r]                                                 # (B,nn,1)
+        b0 = 6 * pr + 3 * p                                        # (B,nn,nn)
+        l3 = 3 * (ip[r + 1] - pr)
+        # 位置 (B, a, i, b, j) = b0[a,b] + i*l3[a] + j
+        pos = (b0[:, :, None, :, None] + np.arange(3)[None, None, :, None, None] * l3[:, :, :, None, None]
+               + np.arange(3)[None, None, None, None, :])
+        return pos.ravel(), Ke.ravel()
 
-    parts = pmap(work, blocks)
-    # 2つずつ足し合わせる（並列）
-    while len(parts) > 1:
-        pairs = [parts[i:i + 2] for i in range(0, len(parts), 2)]
-        parts = pmap(lambda pr: pr[0] + pr[1] if len(pr) == 2 else pr[0], pairs)
-    K = parts[0]
-    K.sum_duplicates()
-    return K
+    done = 0
+    for w in range(0, len(blocks), wave):
+        for pos, val in pmap(work, blocks[w:w + wave]):
+            np.add.at(data, pos, val)
+            done += len(val) // (9 * nn * nn)
+        if progress:
+            progress(min(1.0, done / ne))
+    return sp.csr_matrix((data, indices, indptr.astype(itype)), shape=(ndof, ndof))
 
 
 def body_force_vector(mesh: Mesh, b: np.ndarray) -> np.ndarray:
@@ -534,8 +565,10 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
     free[cdofs] = False
     u = np.zeros(ndof)
     u[cdofs] = cvals
-    Kff = K[free][:, free].tocsc()
-    rhs = F[free] - K[free][:, cdofs] @ cvals
+    Kfr = K[free]                       # 行の取り出し（CSR のまま。コピーは 1 回だけ）
+    rhs = F[free] - Kfr[:, cdofs] @ cvals
+    Kff = Kfr[:, free]
+    del Kfr
     prog(0.45, f"連立方程式を解いています（自由度 {Kff.shape[0]:,}）…")
     t1 = time.time()
     dof_ids = np.nonzero(free)[0]

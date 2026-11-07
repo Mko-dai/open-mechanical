@@ -64,11 +64,12 @@ class _Level:
 class ChebyshevAMG:
     """M(r) ≈ A⁻¹ r（V サイクル1回）"""
 
-    def __init__(self, ml, degree=3):
+    def __init__(self, ml, degree=3, A0=None):
         lv = ml.levels
         self.levels = []
         for i in range(len(lv) - 1):
-            self.levels.append(_Level(lv[i].A, sp.csr_matrix(lv[i].P), sp.csr_matrix(lv[i].R), degree))
+            A = A0 if (i == 0 and A0 is not None) else lv[i].A    # 最上位は元の CSR をそのまま使う（コピーしない）
+            self.levels.append(_Level(A, sp.csr_matrix(lv[i].P), sp.csr_matrix(lv[i].R), degree))
         Ac = sp.csc_matrix(lv[-1].A)
         self.coarse = spla.splu(Ac)
         self.shape = lv[0].A.shape
@@ -98,4 +99,5 @@ def build(A, B=None, max_coarse=3000, degree=3, comps=None):
     ml = pyamg.smoothed_aggregation_solver(A_setup, B=B, symmetry="hermitian", strength="symmetric",
                                            max_coarse=max_coarse, improve_candidates=None,
                                            smooth=None)   # 平滑化なし集約: 準備が速く、総時間も最短（実測）
-    return ChebyshevAMG(ml, degree)
+    del A_setup
+    return ChebyshevAMG(ml, degree, A0=A)
