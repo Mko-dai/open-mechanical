@@ -18,10 +18,12 @@ class Project:
     geometry: dict = field(default_factory=lambda: {"kind": "box", "lx": 100.0, "ly": 20.0, "lz": 10.0})
     mesh_size: float = 0.0      # 0 = 自動
     mesh_order: int = 2         # 2 = Tet10（推奨）
-    material: Material = field(default_factory=lambda: LIBRARY[DEFAULT])
+    material: Material = field(default_factory=lambda: Material(**LIBRARY[DEFAULT].to_dict()))
     bcs: list[BC] = field(default_factory=list)
     title: str = "構造解析"
     local_sizes: list = field(default_factory=list)  # [{"faces": [...], "size": mm}]
+    results: list = field(default_factory=lambda: ["全変形 [mm]", "相当応力（ミーゼス） [MPa]"])
+    solver: str = "auto"
 
     def geometry_desc(self) -> str:
         g = self.geometry
@@ -35,7 +37,8 @@ class Project:
                 "mesh": {"size": self.mesh_size, "order": self.mesh_order,
                          "local_sizes": self.local_sizes},
                 "material": self.material.to_dict(),
-                "bcs": [b.to_dict() for b in self.bcs]}
+                "bcs": [b.to_dict() for b in self.bcs],
+                "results": list(self.results), "solver": self.solver}
 
     @staticmethod
     def from_dict(d) -> "Project":
@@ -44,7 +47,9 @@ class Project:
                        material=Material.from_dict(d["material"]),
                        bcs=[BC.from_dict(b) for b in d.get("bcs", [])],
                        title=d.get("title", "構造解析"),
-                       local_sizes=d.get("mesh", {}).get("local_sizes", []))
+                       local_sizes=d.get("mesh", {}).get("local_sizes", []),
+                       results=d.get("results", ["全変形 [mm]", "相当応力（ミーゼス） [MPa]"]),
+                       solver=d.get("solver", "auto"))
 
     def save(self, path):
         with open(path, "w", encoding="utf-8") as f:
