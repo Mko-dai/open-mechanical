@@ -739,7 +739,7 @@ class MainWindow(QMainWindow):
                     c = 0.5 * (lo + hi)
                     v = np.asarray(bc.values, float)
                     if np.linalg.norm(v) > 0:
-                        pl.add_mesh(pv.Arrow(c, v / np.linalg.norm(v), scale=0.25 * L),
+                        pl.add_mesh(pv.Arrow(start=c, direction=v / np.linalg.norm(v), scale=0.25 * L),
                                     color=BC_COLORS["gravity"])
                 continue
             A = sum(info[f]["area"] for f in faces)
@@ -750,17 +750,17 @@ class MainWindow(QMainWindow):
                 v = np.asarray(bc.values, float)
                 if np.linalg.norm(v) > 0:
                     d = v / np.linalg.norm(v)
-                    pl.add_mesh(pv.Arrow(c - d * 0.2 * L, d, scale=0.2 * L), color=BC_COLORS["force"])
+                    pl.add_mesh(pv.Arrow(start=c - d * 0.2 * L, direction=d, scale=0.2 * L), color=BC_COLORS["force"])
             elif bc.kind == "pressure":
                 s = 1 if (bc.values[0] or 0) >= 0 else -1
-                pl.add_mesh(pv.Arrow(c + s * n * 0.15 * L, -s * n, scale=0.15 * L),
+                pl.add_mesh(pv.Arrow(start=c + s * n * 0.15 * L, direction=-s * n, scale=0.15 * L),
                             color=BC_COLORS["pressure"])
             elif bc.kind == "moment":
                 v = np.asarray(bc.values, float)
                 if np.linalg.norm(v) > 0:
                     d = v / np.linalg.norm(v)
-                    pl.add_mesh(pv.Arrow(c, d, scale=0.15 * L, tip_length=0.4), color=BC_COLORS["moment"])
-                    pl.add_mesh(pv.Arrow(c + d * 0.05 * L, d, scale=0.17 * L, tip_length=0.35),
+                    pl.add_mesh(pv.Arrow(start=c, direction=d, scale=0.15 * L, tip_length=0.4), color=BC_COLORS["moment"])
+                    pl.add_mesh(pv.Arrow(start=c + d * 0.05 * L, direction=d, scale=0.17 * L, tip_length=0.35),
                                 color=BC_COLORS["moment"])
 
     def _draw_results(self):
