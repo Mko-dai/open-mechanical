@@ -2586,6 +2586,7 @@ class MainWindow(QMainWindow):
             vmax = vmin + 1e-30
         n_colors = self.bands.currentData() or 9
         cmap = "jet_r" if "Safety" in en else "jet"
+        real = (vmin, vmax)
         if key == "接触:接触状態":
             n_colors, vmin, vmax = 4, -0.5, 3.5
         show_el = self.edges_combo.currentIndex() == 2
@@ -2626,7 +2627,8 @@ class MainWindow(QMainWindow):
             + (f"単位: {unit}<br>" if unit else "")
             + f"時間: {getattr(r, 'time', 1.0):g} s<br>{datetime.datetime.now():%Y/%m/%d %H:%M}<br>"
             f"変形倍率: {'変形なし' if scale == 0 else f'{scale:g} 倍'}<br><br>"
-            f"<span style='color:#c00'>最大 {vmax:.5g}</span><br><span style='color:#00c'>最小 {vmin:.5g}</span>")
+            f"<span style='color:#c00'>最大 {real[1]:.5g}</span><br><span style='color:#00c'>最小 {real[0]:.5g}</span>"
+            + ("<br><br>0: 遠い　1: 近い<br>2: すべり　3: 固着" if key == "接触:接触状態" else ""))
 
     def _probe(self, pos, tri):
         r = self.result
