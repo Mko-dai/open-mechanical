@@ -53,6 +53,16 @@ FEATURES = {
     "extrude": ("押し出し", "押", [("plane", "スケッチ平面", "XY"), ("offset", "平面の位置 [mm]", 0.0),
                                ("points", "頂点 (u,v; u,v; …) [mm]", "0,0; 80,0; 80,10; 10,10; 10,60; 0,60"),
                                ("h", "押し出し長さ [mm]", 30.0)]),
+    # サーフェス（シェル要素で解く薄肉の面。Ansys のサーフェスボディ＋厚さ）
+    "plate": ("平板（シェル）", "板", [("plane", "平面", "XY"), ("offset", "平面の位置 [mm]", 0.0),
+                                  ("u0", "原点 u [mm]", 0.0), ("v0", "原点 v [mm]", 0.0),
+                                  ("du", "幅 u [mm]", 100.0), ("dv", "幅 v [mm]", 50.0), ("t", "厚さ [mm]", 2.0)]),
+    "sheet": ("多角形の面（シェル）", "面", [("plane", "平面", "XY"), ("offset", "平面の位置 [mm]", 0.0),
+                                      ("points", "頂点 (u,v; u,v; …) [mm]", "0,0; 100,0; 100,40; 0,60"),
+                                      ("t", "厚さ [mm]", 2.0)]),
+    "cyl_shell": ("円筒面（シェル）", "筒", [("x", "底面中心 X [mm]", 0.0), ("y", "底面中心 Y [mm]", 0.0),
+                                      ("z", "底面中心 Z [mm]", 0.0), ("axis", "軸方向", "Z"),
+                                      ("r", "半径 [mm]", 50.0), ("h", "長さ [mm]", 100.0), ("t", "厚さ [mm]", 2.0)]),
     "import": ("インポート", "読", [("path", "ファイル", ""),
                                  ("dx", "移動 X [mm]", 0.0), ("dy", "移動 Y [mm]", 0.0), ("dz", "移動 Z [mm]", 0.0)]),
 }
@@ -65,6 +75,110 @@ def new_feature(ftype, op="new", **over):
         f[k] = d
     f.update(over)
     return f
+
+
+SHELL_FEATURES = ("plate", "sheet", "cyl_shell")
+
+
+def is_shell_model(spec) -> bool:
+    feats = [f for f in spec.get("features", []) if not f.get("suppressed") and f.get("type") != "bool"]
+    return spec.get("kind") == "model" and bool(feats) and all(f["type"] in SHELL_FEATURES for f in feats)
+
+
+def _plane_map(plane, off):
+    return {"XY": lambda u, v: (u, v, off), "YZ": lambda u, v: (off, u, v),
+            "ZX": lambda u, v: (v, off, u)}[plane]
+
+
+def _make_surface(gmsh, f):
+    occ = gmsh.model.occ
+    t = f["type"]
+    g = lambda k: float(f.get(k, 0.0))  # noqa: E731
+    if g("t") <= 0:
+        raise GeometryError("シェルの厚さは正の値にしてください")
+    if t == "plate":
+        to3 = _plane_map(f.get("plane", "XY"), g("offset"))
+        u0, v0, du, dv = g("u0"), g("v0"), g("du"), g("dv")
+        pts = [(u0, v0), (u0 + du, v0), (u0 + du, v0 + dv), (u0, v0 + dv)]
+    elif t == "sheet":
+        to3 = _plane_map(f.get("plane", "XY"), g("offset"))
+        pts = parse_points(f.get("points", ""))
+    elif t == "cyl_shell":
+        c = occ.addCircle(g("x"), g("y"), g("z"), g("r"), zAxis=_axis_vec(f.get("axis", "Z"), 1.0))
+        out = occ.extrude([(1, c)], *_axis_vec(f.get("axis", "Z"), g("h")))
+        return [e for e in out if e[0] == 2]
+    else:
+        raise GeometryError(f"未知のサーフェス: {t}")
+    ptags = [occ.addPoint(*to3(u, v)) for u, v in pts]
+    lines = [occ.addLine(ptags[i], ptags[(i + 1) % len(ptags)]) for i in range(len(ptags))]
+    return [(2, occ.addPlaneSurface([occ.addCurveLoop(lines)]))]
+
+
+def _build_shell_features(gmsh, features):
+    """サーフェス（シェル）のボディを作る。接する辺・交わる線は節点を共有（フラグメント）"""
+    occ = gmsh.model.occ
+    keys = feature_body_keys(features)
+    objs, owner, thick = [], [], {}
+    for i, f in enumerate(features):
+        if f.get("suppressed") or f.get("type") == "bool" or i not in keys:
+            continue
+        if f["type"] not in SHELL_FEATURES:
+            raise GeometryError("ソリッドとシェル（サーフェス）を同じモデルで混ぜることには、まだ対応していません")
+        for dt in _make_surface(gmsh, f):
+            objs.append(dt)
+            owner.append(keys[i])
+        thick[keys[i]] = float(f.get("t", 1.0))
+    if not objs:
+        raise GeometryError("サーフェスがありません")
+    groups = {}
+    if len(objs) > 1:
+        _, omap = occ.fragment(objs[:1], objs[1:])
+        for idx, children in enumerate(omap):
+            for dt in children:
+                if dt[0] == 2:
+                    groups.setdefault(owner[idx], set()).add(dt[1])
+    else:
+        groups[owner[0]] = {objs[0][1]}
+    occ.synchronize()
+    for k, tags in groups.items():
+        gmsh.model.addPhysicalGroup(2, sorted(tags), tag=k + 1)
+    return thick
+
+
+def _extract_shell_mesh(gmsh, thick):
+    from .shell import ShellMesh
+    tags, coords, _ = gmsh.model.mesh.getNodes()
+    coords = coords.reshape(-1, 3)
+    tag2idx = np.full(int(tags.max()) + 1, -1, dtype=np.int64)
+    tag2idx[tags.astype(np.int64)] = np.arange(len(tags))
+    surfs = sorted(gmsh.model.getEntities(2), key=lambda e: e[1])
+    tris, sid, body, th = [], [], [], []
+    for i, (_, st) in enumerate(surfs):
+        phys = gmsh.model.getPhysicalGroupsForEntity(2, st)
+        b = int(phys[0]) - 1 if len(phys) else 0
+        ets, _, ens = gmsh.model.mesh.getElements(2, st)
+        for t, en in zip(ets, ens):
+            if int(t) != 2:
+                continue
+            tri = tag2idx[en.astype(np.int64)].reshape(-1, 3)
+            tris.append(tri)
+            sid.append(np.full(len(tri), i))
+            body.append(np.full(len(tri), b))
+            th.append(np.full(len(tri), thick.get(b, 1.0)))
+    if not tris:
+        raise GeometryError("面を三角形でメッシュできませんでした")
+    tris = np.vstack(tris)
+    edges = []
+    for _, ct in sorted(gmsh.model.getEntities(1), key=lambda e: e[1]):
+        ets, _, ens = gmsh.model.mesh.getElements(1, ct)
+        seg = [tag2idx[en.astype(np.int64)].reshape(-1, 2) for t, en in zip(ets, ens) if int(t) == 1]
+        if seg:
+            edges.append(np.vstack(seg))
+    used = np.unique(np.concatenate([tris.ravel()] + [e.ravel() for e in edges]))
+    remap = np.full(len(coords), -1, dtype=np.int64)
+    remap[used] = np.arange(len(used))
+    return ShellMesh(coords[used], remap[tris], np.concatenate(th), np.concatenate(sid),
+                     [remap[e] for e in edges], elem_body=np.concatenate(body), n_surf=len(surfs))
 
 
 def _axis_vec(axis, h):
@@ -89,6 +203,8 @@ def parse_points(text):
 def _make_feature(gmsh, f):
     occ = gmsh.model.occ
     t = f["type"]
+    if t in SHELL_FEATURES:
+        raise GeometryError("ソリッドとシェル（サーフェス）を同じモデルで混ぜることには、まだ対応していません")
     g = lambda k: float(f.get(k, 0.0))  # noqa: E731
     if t == "box":
         if min(g("dx"), g("dy"), g("dz")) <= 0:
@@ -458,18 +574,86 @@ def _extract_mesh(gmsh, share: dict | None = None) -> Mesh:
     return mesh
 
 
-def _apply_local_sizes(gmsh, h, local_sizes):
-    """面ごとのメッシュサイズ（Ansys の「面サイズ指定」相当）。
+MESH_DEFAULTS = {
+    "resolution": 2,              # 解像度 0（粗い）〜 7（細かい）。要素サイズ未指定のとき使う
+    "growth_rate": 1.5,           # 成長率（局所サイズから周りへ大きくなる割合）
+    "capture_curvature": True,    # 曲率を捕捉
+    "curvature_normal_angle": 30.0,   # 曲率法線角度 [度]（1要素が張る最大角度）
+    "curvature_min_size": 0.0,    # 曲率の最小サイズ [mm]（0 = 自動）
+    "smoothing": "medium",        # スムージング low / medium / high
+    "optimize": True,             # 要素形状の最適化
+}
 
-    local_sizes: [{"faces": [面番号...], "size": mm}, ...]  面番号は本ソフトの面番号（0始まり）
-    指定面から離れるにつれて全体サイズ h へなめらかに大きくなります。
+CONTROL_TYPES = {"sizing": "サイズ指定", "refinement": "リファインメント", "sweep": "手法：スイープ",
+                 "sphere": "影響球サイズ"}
+
+
+def resolved_size(diag, size, ms):
+    """全体の要素サイズ（Ansys の「要素サイズ」既定 → 解像度から決める）"""
+    if size and size > 0:
+        return float(size)
+    r = int(ms.get("resolution", 2))
+    return diag / (17.0 + 4.0 * r)
+
+
+def _apply_local_sizes(gmsh, h, local_sizes, growth=1.5):
+    """局所メッシュ制御（Ansys の サイズ指定 / 影響球 / リファインメント 相当）。
+
+    local_sizes の各項目:
+      {"type":"sizing", "scope":"faces", "faces":[面番号], "size":mm, "behavior":"soft"|"hard"}
+      {"type":"sizing", "scope":"bodies", "bodies":[ボディ番号], "size":mm}
+      {"type":"sphere", "center":[x,y,z], "radius":r, "size":mm}
+      {"type":"refinement", "faces":[面番号], "level":1〜3}   周りの要素を 1/2^level に細分
+    （type 省略 = 面サイズ指定）。指定部分から離れると成長率で全体サイズへ大きくなります。
     """
     surfs = [t for _, t in sorted(gmsh.model.getEntities(2), key=lambda e: e[1])]
-    fields = []
+    vols = {}
+    for _, vtag in gmsh.model.getEntities(3):
+        phys = gmsh.model.getPhysicalGroupsForEntity(3, vtag)
+        vols.setdefault(int(phys[0]) - 1 if len(phys) else 0, []).append(vtag)
+    g = max(float(growth), 1.01)
+    fields, mins = [], []
     for ls in local_sizes:
-        # ボディ境界の裏側の面（番号 >= サーフェス数）は表側と同じサーフェスなので省略
+        t = ls.get("type", "sizing")
+        if ls.get("suppressed"):
+            continue
+        if t == "sphere":
+            r, hs = float(ls.get("radius", 0)), float(ls.get("size", 0))
+            c = ls.get("center", [0, 0, 0])
+            if r <= 0 or hs <= 0:
+                continue
+            fb = gmsh.model.mesh.field.add("Ball")
+            for k, v in zip(("XCenter", "YCenter", "ZCenter"), c):
+                gmsh.model.mesh.field.setNumber(fb, k, float(v))
+            gmsh.model.mesh.field.setNumber(fb, "Radius", r)
+            gmsh.model.mesh.field.setNumber(fb, "Thickness", max(h - hs, 0.0) / (g - 1))
+            gmsh.model.mesh.field.setNumber(fb, "VIn", hs)
+            gmsh.model.mesh.field.setNumber(fb, "VOut", h)
+            fields.append(fb)
+            mins.append(hs)
+            continue
+        if t == "sizing" and ls.get("scope") == "bodies":
+            hs = float(ls.get("size", 0))
+            tags = sorted({v for b in ls.get("bodies", []) for v in vols.get(int(b), [])})
+            if not tags or hs <= 0:
+                continue
+            fc = gmsh.model.mesh.field.add("Constant")
+            gmsh.model.mesh.field.setNumbers(fc, "VolumesList", tags)
+            gmsh.model.mesh.field.setNumber(fc, "VIn", hs)
+            gmsh.model.mesh.field.setNumber(fc, "VOut", 1e22)
+            try:
+                gmsh.model.mesh.field.setNumber(fc, "IncludeBoundary", 1)
+            except Exception:
+                pass
+            fields.append(fc)
+            mins.append(hs)
+            continue
+        # 面: サイズ指定・リファインメント（ボディ境界の裏側の面は表側と同じサーフェスなので省略）
         tags = sorted({surfs[f] for f in ls.get("faces", []) if 0 <= f < len(surfs)})
-        hs = float(ls.get("size", 0))
+        if t == "refinement":
+            hs = h / 2 ** max(1, min(3, int(ls.get("level", 1))))
+        else:
+            hs = float(ls.get("size", 0))
         if not tags or hs <= 0:
             continue
         fd = gmsh.model.mesh.field.add("Distance")
@@ -479,18 +663,151 @@ def _apply_local_sizes(gmsh, h, local_sizes):
         gmsh.model.mesh.field.setNumber(ft, "InField", fd)
         gmsh.model.mesh.field.setNumber(ft, "SizeMin", hs)
         gmsh.model.mesh.field.setNumber(ft, "SizeMax", h)
-        gmsh.model.mesh.field.setNumber(ft, "DistMin", 0.0)
-        gmsh.model.mesh.field.setNumber(ft, "DistMax", max(h - hs, 0.0) * 4.0)  # 成長率 約1.25
+        hard = ls.get("behavior") == "hard"
+        # ハード: 面上は指定サイズちょうど・すぐ全体サイズへ。ソフト: 成長率でなめらかに
+        gmsh.model.mesh.field.setNumber(ft, "DistMin", hs * 0.5 if hard else 0.0)
+        gmsh.model.mesh.field.setNumber(ft, "DistMax", max(h - hs, 0.0) / (g - 1))
         fields.append(ft)
+        mins.append(hs)
     if fields:
         fm = gmsh.model.mesh.field.add("Min")
         gmsh.model.mesh.field.setNumbers(fm, "FieldsList", fields)
         gmsh.model.mesh.field.setAsBackgroundMesh(fm)
         gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+    return mins
+
+
+def _sweep_mesh(gmsh, ls, order, h, log):
+    """スイープメッシュ（Ansys の 手法: スイープ）。
+
+    断面（ソース面）の2次元メッシュを、掃引方向に Sweep Num Divs 層だけ押し出してプリズムにし、
+    各プリズムを3つの四面体に分割する（隣り合う面で分割の向きがそろう規則で）。
+    2次要素の中間節点は CAD の面に投影するので、円柱などの曲面も正しく表されます。
+    """
+    vols = gmsh.model.getEntities(3)
+    if len(vols) != 1:
+        raise GeometryError("スイープは、ボディが1つのモデルで使えます（複数ボディのスイープは今後対応予定）")
+    vtag = vols[0][1]
+    surfs = [t for _, t in sorted(gmsh.model.getEntities(2), key=lambda e: e[1])]
+    # ソース面: 平らな面のうち、法線方向に同じ形の向かい合う面（ターゲット）を持つもの
+    info = []
+    for st in surfs:
+        lo = gmsh.model.getBoundingBox(2, st)
+        mass = gmsh.model.occ.getMass(2, st)
+        typ = gmsh.model.getType(2, st)
+        info.append((st, typ, mass, np.array(lo[:3]), np.array(lo[3:])))
+    blo, bhi = np.array(gmsh.model.getBoundingBox(3, vtag)[:3]), np.array(gmsh.model.getBoundingBox(3, vtag)[3:])
+    V = gmsh.model.occ.getMass(3, vtag)
+    want = ls.get("axis", "auto")
+    cands = []
+    for ax in range(3):
+        if want in "XYZ" and want != "auto" and "XYZ".index(want) != ax:
+            continue
+        L = bhi[ax] - blo[ax]
+        lo_f = [x for x in info if x[1] == "Plane" and abs(x[3][ax] - blo[ax]) < 1e-6 * max(1, L) and abs(x[4][ax] - blo[ax]) < 1e-6 * max(1, L)]
+        hi_f = [x for x in info if x[1] == "Plane" and abs(x[3][ax] - bhi[ax]) < 1e-6 * max(1, L) and abs(x[4][ax] - bhi[ax]) < 1e-6 * max(1, L)]
+        if len(lo_f) == 1 and len(hi_f) == 1 and abs(lo_f[0][2] * L - V) < 1e-4 * V and abs(lo_f[0][2] - hi_f[0][2]) < 1e-6 * lo_f[0][2]:
+            cands.append((L, ax, lo_f[0][0]))
+    if not cands:
+        raise GeometryError("このボディはスイープできません（座標軸方向に同じ断面が続く形状が必要です）")
+    L, ax, src = min(cands) if want == "auto" else cands[0]    # 自動: 薄い方向（Ansys の Automatic Thin と同じ考え）
+    n = int(ls.get("divs", 0)) or max(1, int(round(L / h)))
+    log(f"スイープ: {'XYZ'[ax]} 方向に {n} 分割（長さ {L:.4g} mm）")
+    gmsh.model.mesh.generate(2)
+    ets, _, ens = gmsh.model.mesh.getElements(2, src)
+    tri = None
+    for t, en in zip(ets, ens):
+        if int(t) == 2:
+            tri = en.astype(np.int64).reshape(-1, 3)
+    if tri is None:
+        raise GeometryError("ソース面を三角形でメッシュできませんでした")
+    used = np.unique(tri)
+    ntag, ncoord, _ = gmsh.model.mesh.getNodes()
+    cmap = dict(zip(ntag.astype(np.int64).tolist(), ncoord.reshape(-1, 3)))
+    P = np.array([cmap[int(t)] for t in used])
+    tri = np.searchsorted(used, tri)
+    P[:, ax] = blo[ax]
+    nb = len(P)
+    layers = [P + np.eye(3)[ax] * (L * k / n) for k in range(n + 1)]
+    nodes = np.vstack(layers)
+    tets = []
+    for k in range(n):
+        o0, o1 = k * nb, (k + 1) * nb
+        t = np.sort(tri, axis=1)                  # v0 < v1 < v2（分割の向きをそろえる規則）
+        a, b, c = t[:, 0], t[:, 1], t[:, 2]
+        tets += [np.column_stack([a + o0, b + o0, c + o0, c + o1]),
+                 np.column_stack([a + o0, b + o0, b + o1, c + o1]),
+                 np.column_stack([a + o0, a + o1, b + o1, c + o1])]
+    el = np.vstack(tets)
+    X = nodes[el]
+    vol = np.einsum("ij,ij->i", np.cross(X[:, 1] - X[:, 0], X[:, 2] - X[:, 0]), X[:, 3] - X[:, 0])
+    flip = vol < 0
+    el[flip] = el[flip][:, [0, 2, 1, 3]]
+    m = Mesh(nodes, el)
+    if order == 2:
+        m = m.to_quadratic()
+        # 曲面上の中間節点を CAD の面へ投影
+        bt = m.boundary_tris_full
+        mids = np.unique(bt[:, 3:])
+        curved = [st for st, typ, *_ in info if typ != "Plane"]
+        if curved and len(mids):
+            Xm = m.nodes[mids]
+            best = np.full(len(mids), np.inf)
+            proj = Xm.copy()
+            for st in curved:
+                cp = np.array(gmsh.model.getClosestPoint(2, st, Xm.ravel().tolist())[0]).reshape(-1, 3)
+                d = np.linalg.norm(cp - Xm, axis=1)
+                better = d < best
+                best[better], proj[better] = d[better], cp[better]
+            ok = best < 0.05 * h
+            m.nodes[mids[ok]] = proj[ok]
+    phys = gmsh.model.getPhysicalGroupsForEntity(3, vtag)
+    m.elem_body = np.full(m.n_elems, int(phys[0]) - 1 if len(phys) else 0, dtype=np.int64)
+    m.node_origin = np.arange(m.n_nodes)
+    # 面番号 = CAD のサーフェス番号（四面体メッシュと同じ番号になるので境界条件がそのまま使える）
+    cen = m.nodes[m.boundary_tris].mean(axis=1)
+    best = np.full(len(cen), np.inf)
+    fid = np.zeros(len(cen), dtype=np.int64)
+    for i, st in enumerate(surfs):
+        cp = np.array(gmsh.model.getClosestPoint(2, st, cen.ravel().tolist())[0]).reshape(-1, 3)
+        d = np.linalg.norm(cp - cen, axis=1)
+        better = d < best
+        best[better], fid[better] = d[better], i
+    m.set_face_ids(fid)
+    return m
+
+
+def mesh_quality(mesh) -> dict:
+    """メッシュの品質（Ansys の メッシュメトリック 相当、頂点4点で評価）
+
+    要素品質: 正四面体 = 1（Ansys と同じ定義: C·V / √(Σ辺²)³）
+    歪度: 体積基準（正四面体 = 0、つぶれた要素 = 1）
+    アスペクト比: 最長辺 / 最短の高さ × √(2/3)（正四面体 = 1）
+    """
+    X = mesh.nodes[mesh.elems[:, :4]]
+    e = [X[:, j] - X[:, i] for i, j in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))]
+    l2 = np.stack([np.einsum("ij,ij->i", v, v) for v in e], 1)
+    V = np.abs(np.einsum("ij,ij->i", np.cross(e[0], e[1]), e[2])) / 6
+    q = 124.70765802 * V / np.sqrt(l2.sum(1)) ** 3
+    q = np.clip(q, 0, 1)
+    # 外接球半径から理想体積
+    a, b, c = e[0], e[1], e[2]
+    num = np.linalg.norm(np.einsum("i,ij->ij", (a * a).sum(1), np.cross(b, c)) + np.einsum("i,ij->ij", (b * b).sum(1), np.cross(c, a))
+                         + np.einsum("i,ij->ij", (c * c).sum(1), np.cross(a, b)), axis=1)
+    R = num / np.maximum(12 * V, 1e-300)
+    Vopt = 8 * np.sqrt(3) / 27 * R ** 3
+    skew = np.clip((Vopt - V) / np.maximum(Vopt, 1e-300), 0, 1)
+    faces = [(1, 2, 3), (0, 2, 3), (0, 1, 3), (0, 1, 2)]
+    areas = np.stack([0.5 * np.linalg.norm(np.cross(X[:, f[1]] - X[:, f[0]], X[:, f[2]] - X[:, f[0]]), axis=1) for f in faces], 1)
+    hmin = 3 * V / np.maximum(areas.max(1), 1e-300)
+    ar = np.sqrt(l2.max(1)) / np.maximum(hmin, 1e-300) * np.sqrt(2.0 / 3.0)
+    st = lambda v: {"最小": float(v.min()), "最大": float(v.max()), "平均": float(v.mean())}  # noqa: E731
+    return {"要素品質": st(q), "歪度": st(skew), "アスペクト比": st(ar), "_quality": q}
 
 
 def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 12,
-               log=print, local_sizes: list | None = None, share: dict | None = None) -> Mesh:
+               log=print, local_sizes: list | None = None, share: dict | None = None,
+               settings: dict | None = None) -> Mesh:
     """形状 spec からメッシュを作る。
 
     spec 例: {"kind": "box", "lx": 100, "ly": 20, "lz": 10}
@@ -515,7 +832,10 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
 
     gmsh = _gmsh_init()
     try:
-        if kind == "model":
+        shell = kind == "model" and is_shell_model(spec)
+        if shell:
+            thick = _build_shell_features(gmsh, spec.get("features", []))
+        elif kind == "model":
             _build_features(gmsh, spec.get("features", []))
         elif kind in PRIMITIVES:
             _build_primitive(gmsh, kind, spec)
@@ -531,23 +851,44 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
         else:
             raise GeometryError(f"未知の形状指定: {spec}")
 
+        ms = dict(MESH_DEFAULTS)
+        ms.update(settings or {})
         diag = _bbox_diag(gmsh)
-        h = size if size > 0 else diag / 25.0
+        h = resolved_size(diag, size, ms)
         log(f"メッシュ生成中（要素サイズ {h:.3g} mm, {'2次' if order == 2 else '1次'}要素）…")
         gmsh.option.setNumber("Mesh.MeshSizeMax", h)
-        gmsh.option.setNumber("Mesh.MeshSizeMin", h * 0.05)
-        gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", curvature)
+        hmin = float(ms.get("curvature_min_size") or 0) or h * 0.05
+        gmsh.option.setNumber("Mesh.MeshSizeMin", hmin)
+        if ms.get("capture_curvature", True):
+            ang = max(1.0, float(ms.get("curvature_normal_angle", 30.0)))
+            gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", max(1, int(round(360.0 / ang))))
+        else:
+            gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
         gmsh.option.setNumber("Mesh.Algorithm3D", 10)  # HXT（並列・高速）
-        gmsh.option.setNumber("Mesh.Optimize", 1)
-        if local_sizes:
-            _apply_local_sizes(gmsh, h, local_sizes)
-            gmsh.option.setNumber("Mesh.MeshSizeMin", min([h * 0.05] + [float(x["size"]) * 0.5
-                                                                         for x in local_sizes]))
-        gmsh.model.mesh.generate(3)
-        if order == 2:
-            gmsh.option.setNumber("Mesh.SecondOrderLinear", 0)  # 曲面に沿わせる
-            gmsh.model.mesh.setOrder(2)
-        mesh = _extract_mesh(gmsh, share)
+        gmsh.option.setNumber("Mesh.Optimize", 1 if ms.get("optimize", True) else 0)
+        gmsh.option.setNumber("Mesh.Smoothing", {"low": 1, "medium": 3, "high": 6}.get(ms.get("smoothing"), 3))
+        if ms.get("smoothing") == "high":
+            gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
+        ctrl = [x for x in (local_sizes or []) if not x.get("suppressed")]
+        sweeps = [x for x in ctrl if x.get("type") == "sweep"]
+        if ctrl:
+            mins = _apply_local_sizes(gmsh, h, [x for x in ctrl if x.get("type") != "sweep"],
+                                      ms.get("growth_rate", 1.5))
+            if mins:
+                gmsh.option.setNumber("Mesh.MeshSizeMin", min([hmin] + [v * 0.5 for v in mins]))
+        if shell:
+            gmsh.model.mesh.generate(2)
+            mesh = _extract_shell_mesh(gmsh, thick)
+            log(f"シェルメッシュ完了: 節点 {mesh.n_nodes:,} / 要素 {mesh.n_elems:,} / 面 {mesh.n_surf} / 辺 {len(mesh.edges)}")
+            return mesh
+        if sweeps:
+            mesh = _sweep_mesh(gmsh, sweeps[-1], order, h, log)
+        else:
+            gmsh.model.mesh.generate(3)
+            if order == 2:
+                gmsh.option.setNumber("Mesh.SecondOrderLinear", 0)  # 曲面に沿わせる
+                gmsh.model.mesh.setOrder(2)
+            mesh = _extract_mesh(gmsh, share)
         if np.any(mesh.element_volumes() <= 0):
             raise GeometryError("不正な要素ができました。要素サイズを小さくして再試行してください。")
         log(f"メッシュ完了: 節点 {mesh.n_nodes:,} / 要素 {mesh.n_elems:,} / 面 {mesh.n_faces}")

@@ -249,6 +249,7 @@ class BC:
     name: str = ""
     nodes: list[int] = field(default_factory=list)   # 面の代わりに節点を直接指定（線・点の拘束用）
     step_factors: list = field(default_factory=list)  # ステップごとの倍率（空ならすべて 1）
+    bodies: list = field(default_factory=list)        # 熱条件などボディに与える条件（空 = すべてのボディ）
 
     def to_dict(self):
         d = {"kind": self.kind, "faces": list(map(int, self.faces)),
@@ -257,19 +258,21 @@ class BC:
             d["nodes"] = list(map(int, self.nodes))
         if self.step_factors:
             d["step_factors"] = [float(x) for x in self.step_factors]
+        if self.bodies:
+            d["bodies"] = [int(b) for b in self.bodies]
         return d
 
     @staticmethod
     def from_dict(d):
         return BC(d["kind"], d.get("faces", []), d.get("values", [0, 0, 0]), d.get("name", ""),
-                  d.get("nodes", []), d.get("step_factors", []))
+                  d.get("nodes", []), d.get("step_factors", []), d.get("bodies", []))
 
     def label(self) -> str:
         jp = {"fixed": "固定支持", "displacement": "強制変位", "force": "力",
-              "pressure": "圧力", "moment": "モーメント", "gravity": "重力加速度"}
+              "pressure": "圧力", "moment": "モーメント", "gravity": "重力加速度", "thermal": "熱条件"}
         name = self.name or jp.get(self.kind, self.kind)
         unit = {"force": "N", "pressure": "MPa", "moment": "N·mm",
-                "gravity": "mm/s²", "displacement": "mm"}.get(self.kind, "")
+                "gravity": "mm/s²", "displacement": "mm", "thermal": "°C"}.get(self.kind, "")
         v = ""
         if self.kind != "fixed":
             v = " [" + ", ".join("自由" if x is None else f"{x:g}" for x in self.values) + f"] {unit}"

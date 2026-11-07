@@ -2198,7 +2198,7 @@ class MainWindow(QMainWindow):
             mesh = build_mesh(self.project.geometry, self.project.mesh_size, self.project.mesh_order,
                               log=lambda m: (self.log(str(m)), QApplication.processEvents()),
                               local_sizes=self.project.local_sizes + self.project.body_local_sizes(self.mesh),
-                              share=self.project.share_map())
+                              share=self.project.share_map(), settings=self.project.mesh_settings)
         except Exception as e:
             self._busy(False)
             msg = str(e) if isinstance(e, (GeometryError, ValueError, RuntimeError)) else traceback.format_exc()
