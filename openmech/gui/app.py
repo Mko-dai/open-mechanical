@@ -35,11 +35,14 @@ import pyvista as pv
 from pyvistaqt import QtInteractor
 
 from .. import __version__
+from ..contact import (BEHAVIORS, CONTACT_TYPES, FORMULATIONS, INTERFACE, STATUS_JP, ContactRegion,
+                       detect_contacts)
 from ..export import write_csv, write_report, write_vtu
 from ..geometry import (AXES, CAD_EXT, FEATURES, OPS, PLANES, PRIMITIVES, GeometryError, build_mesh,
                         feature_body_keys, gmsh_available, new_feature, primitive_to_features)
 from ..materials import LIBRARY, Material
 from ..project import Project
+from ..nonlinear import solve_static
 from ..solver import BC, solve
 from .femtet_dialogs import BCDialog, BodyAttrDialog, FeatureDialog, MaterialDialog
 from .viewer import FIELD_EN, feature_edges, surface_polydata
@@ -62,6 +65,8 @@ RESULT_GROUPS = {
            ("せん断応力 τxy [MPa]", "せん断応力 XY"), ("せん断応力 τyz [MPa]", "せん断応力 YZ"),
            ("せん断応力 τzx [MPa]", "せん断応力 ZX")],
     "ツール": [("安全率（降伏基準）", "安全率（応力ツール）")],
+    "接触ツール": [("接触:接触状態", "接触状態"), ("接触:接触圧 [MPa]", "接触圧"), ("接触:貫通量 [mm]", "貫通量"),
+               ("接触:すべり距離 [mm]", "すべり距離"), ("接触:摩擦応力 [MPa]", "摩擦応力"), ("接触:隙間 [mm]", "隙間")],
 }
 RESULT_NAME = {k: v for g in RESULT_GROUPS.values() for k, v in g}
 RESULT_TYPE_JP = {
@@ -71,6 +76,7 @@ RESULT_TYPE_JP = {
 OP_COLORS = {"new": "#4a78c2", "add": "#2c7fb8", "cut": "#c0392b", "intersect": "#8e44ad", "union": "#2c7fb8"}
 MAT_PALETTE = ["#8fb8de", "#e5b25d", "#a7d3a6", "#d9a0c8", "#9fd6d2", "#e8a08f", "#b9b3e6", "#c9d68a"]
 GEOM_COLOR = "#c9cdd3"
+CONTACT_COLOR, TARGET_COLOR = "#e03131", "#1c7ed6"
 SELECT_COLOR = "#33d633"
 STATUS_OK, STATUS_PENDING, STATUS_ERROR, STATUS_NONE = "ok", "pending", "error", ""
 
@@ -132,6 +138,7 @@ class Worker(QThread):
         try:
             self.done.emit(self.fn(*self.args, log=lambda m: self.log.emit(str(m)), **self.kw))
         except (GeometryError, ValueError, RuntimeError) as e:
+            self.history = getattr(e, "history", None)
             self.failed.emit(str(e))
         except Exception:
             self.failed.emit(traceback.format_exc())
@@ -259,6 +266,8 @@ class MainWindow(QMainWindow):
         self.mesh = None
         self.mesh_dirty = True
         self.result = None
+        self.results: list = []
+        self.result_index = -1
         self.solve_error = ""
         self.solver_log: list[str] = []
         self.selected_faces: list[int] = []
@@ -422,6 +431,17 @@ class MainWindow(QMainWindow):
         R.button(g, "ボディ属性\n材料定数", make_icon("#b07b2c", "材"), lambda: self.set_attr_mode(0))
         R.button(g, "境界条件", make_icon(BC_COLORS["fixed"], "境"), lambda: self.set_attr_mode(1))
         self.tab_model = R.count() - 1
+        # --- 接続（Ansys の Connections）
+        t = R.add_tab("接続")
+        g = R.add_group(t, "接触")
+        R.button(g, "自動検出", make_icon("#e8590c", "自"), self.auto_contacts)
+        R.button(g, "接触領域", make_icon("#e8590c", "接"), self.add_contact)
+        m = QMenu(self)
+        for k, v in CONTACT_TYPES.items():
+            menu_action(m, v, lambda k=k: self.set_contact_type(k))
+        R.button(g, "タイプ", make_icon("#e8590c", "型"), menu=m)
+        R.button(g, "反転", make_icon("#e8590c", "⇄"), self.flip_contact)
+        self.tab_conn = R.count() - 1
         # --- 環境（静的構造）
         t = R.add_tab("環境")
         g = R.add_group(t, "静的構造")
@@ -787,6 +807,7 @@ class MainWindow(QMainWindow):
         if mesh:
             self.mesh_dirty = True
         self.result = None
+        self.results = []
         self.solve_error = ""
         self.rebuild_tree(keep=True, details=False)
 
@@ -808,6 +829,14 @@ class MainWindow(QMainWindow):
                 return STATUS_OK
             except ValueError:
                 return STATUS_ERROR
+        if k == "contact":
+            c = self.project.contacts[node[1]]
+            if c.suppressed:
+                return STATUS_NONE
+            return STATUS_OK if (c.contact_faces and c.target_faces) else STATUS_ERROR
+        if k in ("connections", "contacts"):
+            bad = any(self.status_of(("contact", i)) == STATUS_ERROR for i in range(len(self.project.contacts)))
+            return STATUS_ERROR if bad else STATUS_OK
         if k == "body":
             return STATUS_OK if self.project.assignment(node[1]).get("mat") in self.project.materials else STATUS_ERROR
         if k in ("mesh", "sizing"):
@@ -884,6 +913,13 @@ class MainWindow(QMainWindow):
         for name in self.project.materials:
             n = sum(1 for b in live if self.project.assignment(b).get("mat") == name)
             add(mt, f"{name}（{n} ボディ）", ("mat", name), "#b07b2c", "材")
+        if len(live) > 1 or self.project.contacts:
+            cn = add(model, "接続", ("connections",), "#e8590c", "接")
+            ct = add(cn, "接触", ("contacts",), "#e8590c", "接")
+            for i, c in enumerate(self.project.contacts):
+                label = f"{c.name}　[{CONTACT_TYPES[c.type]}]" + ("（抑制）" if c.suppressed else "")
+                add(ct, label, ("contact", i), "#e8590c" if not c.suppressed else "#aaaaaa",
+                    CONTACT_TYPES[c.type][0])
         add(model, "座標系", ("coords",), "#6c7a89", "XY")
         mesh = add(model, "メッシュ", ("mesh",), "#3a8fa8", "網")
         for i, ls in enumerate(self.project.local_sizes):
@@ -943,6 +979,10 @@ class MainWindow(QMainWindow):
                     self.attr_name.setEditText(self.current[1])
                 if k == "mat":
                     self.mat_name.setEditText(self.current[1])
+        elif k in ("connections", "contacts", "contact"):
+            self.ribbon.setCurrentIndex(self.tab_conn)
+            if k == "contact":
+                self.set_select_mode("face")
         elif k in ("analysis", "bc", "settings"):
             self.ribbon.setCurrentIndex(self.tab_env)
         elif k in ("solution", "result", "info"):
@@ -1002,7 +1042,15 @@ class MainWindow(QMainWindow):
             menu_action(m, "新しい材料定数…", lambda: self.edit_material(f"材料{len(self.project.materials) + 1}"))
         if k in ("attrs", "attr"):
             menu_action(m, "新しいボディ属性…", lambda: (self.attr_name.setEditText(""), self.edit_attr()))
-        if k in ("bc", "result", "sizing", "feature", "attr", "mat"):
+        if k in ("connections", "contacts", "contact"):
+            menu_action(m, "接続を作成（自動検出）", self.auto_contacts)
+            menu_action(m, "接触領域を挿入", self.add_contact)
+            tm = m.addMenu("タイプを変更")
+            for kk, v in CONTACT_TYPES.items():
+                menu_action(tm, v, lambda kk=kk: self.set_contact_type(kk))
+            if k == "contact":
+                menu_action(m, "接触とターゲットを反転", self.flip_contact)
+        if k in ("bc", "result", "sizing", "feature", "attr", "mat", "contact"):
             m.addSeparator()
             menu_action(m, "削除", self.delete_current)
         if not m.isEmpty():
@@ -1024,6 +1072,10 @@ class MainWindow(QMainWindow):
             name = self.current[1]
         elif k in ("attrs", "mats"):
             name = "ボディ属性" if k == "attrs" else "材料定数"
+        elif k == "contact":
+            name = self.project.contacts[self.current[1]].name
+        elif k in ("connections", "contacts"):
+            name = "接続" if k == "connections" else "接触"
         elif k == "bc":
             bc = self.project.bcs[self.current[1]]
             name = bc.name or BC_JP[bc.kind]
@@ -1383,6 +1435,165 @@ class MainWindow(QMainWindow):
             used = [f"B{b}" for b in self.mesh.body_ids() if self.project.assignment(b).get("attr") == name]
             self._row(self._section("使用しているボディ"), "", ", ".join(used) or "なし")
 
+    # ---------------------------------------------------------------- 接続（接触）
+    def _details_connections(self):
+        s = self._section("接触の自動検出")
+        tol = dspin(self.project.contact_tolerance, 0.0, 1e6, 4, 0.1, "mm")
+        tol.setSpecialValueText("プログラム制御")
+        tol.valueChanged.connect(lambda v: setattr(self.project, "contact_tolerance", v))
+        self._row(s, "許容値", tol)
+        b = QPushButton("接続を作成（自動検出）")
+        b.clicked.connect(lambda: self._later(self.auto_contacts))
+        self._row(s, "", b)
+        s2 = self._section("情報")
+        self._row(s2, "接触領域の数", len(self.project.contacts))
+        if self.mesh is not None:
+            self._row(s2, "ボディ数", len(self.mesh.body_ids()))
+        self._row(s2, "", "ボディ同士は接触でつながります（既定は「結合」）")
+
+    _details_contacts = _details_connections
+
+    def _details_contact(self):
+        i = self.current[1]
+        c = self.project.contacts[i]
+        s = self._section("スコープ")
+        self._row(s, "スコープ方法", "ジオメトリの選択")
+        self._scope_row_named(s, "接触", c.contact_faces, lambda f: self._contact_set(i, "contact_faces", f))
+        self._scope_row_named(s, "ターゲット", c.target_faces, lambda f: self._contact_set(i, "target_faces", f))
+        bodies = lambda faces: ", ".join(sorted({f"B{int(b)}" for f in faces for b in  # noqa: E731
+                                                 ([self.mesh.tri_body()[self.mesh.face_ids == f][0]]
+                                                  if self.mesh is not None and np.any(self.mesh.face_ids == f) else [])}))
+        self._row(s, "接触ボディ", bodies(c.contact_faces) or "-")
+        self._row(s, "ターゲットボディ", bodies(c.target_faces) or "-")
+        s = self._section("定義")
+        self._row(s, "タイプ", self._combo(list((v, k) for k, v in CONTACT_TYPES.items()), c.type,
+                                         lambda v: self._contact_set(i, "type", v, rebuild=True)))
+        if c.type == "frictional":
+            mu = dspin(c.mu, 0.0, 10.0, 4, 0.05)
+            mu.valueChanged.connect(lambda v: self._contact_set(i, "mu", v))
+            self._row(s, "摩擦係数", mu)
+        self._row(s, "スコープモード", "自動" if c.auto else "手動")
+        self._row(s, "動作", self._combo(list((v, k) for k, v in BEHAVIORS.items()), c.behavior,
+                                       lambda v: self._contact_set(i, "behavior", v)))
+        sup = QCheckBox("抑制")
+        sup.setChecked(c.suppressed)
+        sup.toggled.connect(lambda on: self._contact_set(i, "suppressed", on, rebuild=True))
+        self._row(s, "抑制", sup)
+        name = QLineEdit(c.name)
+        name.editingFinished.connect(lambda: self._contact_set(i, "name", name.text().strip() or c.name))
+        self._row(s, "名前", name)
+        s = self._section("高度な設定")
+        self._row(s, "定式化", self._combo(list((v, k) for k, v in FORMULATIONS.items()), c.formulation,
+                                        lambda v: self._contact_set(i, "formulation", v)))
+        self._row(s, "検出方法", "節点（ターゲット面の法線方向）")
+        kf = dspin(c.stiffness_factor, 0.0, 1e6, 3, 0.1)
+        kf.setSpecialValueText("プログラム制御")
+        kf.valueChanged.connect(lambda v: self._contact_set(i, "stiffness_factor", v))
+        self._row(s, "法線剛性係数", kf)
+        pb = dspin(c.pinball, 0.0, 1e6, 3, 0.5, "mm")
+        pb.setSpecialValueText("プログラム制御")
+        pb.valueChanged.connect(lambda v: self._contact_set(i, "pinball", v))
+        self._row(s, "ピンボール領域（半径）", pb)
+        s = self._section("ジオメトリ修正")
+        self._row(s, "インターフェース処理", self._combo(list((v, k) for k, v in INTERFACE.items()), c.interface,
+                                                 lambda v: self._contact_set(i, "interface", v, rebuild=True)))
+        if c.interface == "offset":
+            off = dspin(c.offset, -1e6, 1e6, 4, 0.01, "mm")
+            off.valueChanged.connect(lambda v: self._contact_set(i, "offset", v))
+            self._row(s, "オフセット", off)
+
+    def _scope_row_named(self, sec, label, faces, apply_fn):
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        lab = QLabel(f"{len(faces)} 面" if faces else "未選択")
+        if not faces:
+            lab.setStyleSheet("background:#fff3b0; padding:1px 4px;")
+        h.addWidget(lab)
+        b = QPushButton("適用")
+
+        def _apply():
+            if not self.selected_faces:
+                QMessageBox.information(self, "面を選択", "グラフィックスで面をクリックして選んでから「適用」を押してください。")
+                return
+            apply_fn(list(self.selected_faces))
+            self._later(lambda: (self.build_details(), self.refresh_view()))
+        b.clicked.connect(_apply)
+        h.addWidget(b)
+        h.addStretch()
+        self._row(sec, label, w)
+
+    def _contact_set(self, i, key, value, rebuild=False):
+        c = self.project.contacts[i]
+        setattr(c, key, value)
+        if key in ("contact_faces", "target_faces"):
+            c.auto = False
+        self.invalidate()
+        if rebuild or key in ("type", "name"):
+            self._later(lambda: (self.rebuild_tree(), self.refresh_view()))
+        else:
+            self.refresh_view()
+
+    def auto_contacts(self, quiet=False):
+        """接続の自動作成（手動で作った接触領域は残す）"""
+        if self.mesh is None:
+            return
+        old_auto = {(c.contact_body, c.target_body): c for c in self.project.contacts if c.auto}
+        manual = [c for c in self.project.contacts if not c.auto]
+        found = detect_contacts(self.mesh, self.project.contact_tolerance)
+        for c in found:
+            o = old_auto.get((c.contact_body, c.target_body))
+            if o is not None:   # 以前の設定（タイプ・摩擦係数など）を引き継ぐ
+                for k in ("type", "mu", "behavior", "formulation", "stiffness_factor", "pinball", "interface",
+                          "offset", "suppressed", "name"):
+                    setattr(c, k, getattr(o, k))
+        self.project.contacts = found + manual
+        if not quiet:
+            self.log(f"接触を自動検出しました: {len(found)} 領域")
+        self.invalidate()
+        self.rebuild_tree()
+        self.refresh_view()
+
+    def add_contact(self):
+        """手動の接触領域（選択中の面を接触側に）"""
+        c = ContactRegion(name=f"接触領域 {len(self.project.contacts) + 1}", contact_faces=list(self.selected_faces),
+                          auto=False)
+        self.project.contacts.append(c)
+        self.invalidate()
+        self.select_node(("contact", len(self.project.contacts) - 1))
+        self.log("接触領域を追加しました。接触側・ターゲット側の面を選び、詳細の「適用」で割り当ててください。")
+
+    def set_contact_type(self, kind):
+        if self.current[0] == "contact":
+            idx = [self.current[1]]
+        else:
+            idx = list(range(len(self.project.contacts)))
+            if not idx:
+                return
+            if QMessageBox.question(self, "接触タイプ", f"すべての接触領域を「{CONTACT_TYPES[kind]}」にしますか？") != QMessageBox.Yes:
+                return
+        for i in idx:
+            self.project.contacts[i].type = kind
+        self.invalidate()
+        self.rebuild_tree()
+
+    def flip_contact(self):
+        if self.current[0] != "contact":
+            QMessageBox.information(self, "反転", "ツリーで接触領域を選んでから押してください。")
+            return
+        c = self.project.contacts[self.current[1]]
+        c.contact_faces, c.target_faces = c.target_faces, c.contact_faces
+        c.contact_body, c.target_body = c.target_body, c.contact_body
+        self.invalidate()
+        self.build_details()
+        self.refresh_view()
+
+    def _fields(self, r):
+        out = dict(r.fields())
+        for k, v in (getattr(r, "contact", None) or {}).items():
+            out["接触:" + k] = v
+        return out
+
     def _details_material(self):
         m = self.project.material
         s = self._section("割り当て")
@@ -1493,16 +1704,116 @@ class MainWindow(QMainWindow):
         self._row(s, "支持", "あり" if self._has_support() else "なし（固定支持を追加してください）")
         self._row(s, "荷重・支持の数", len(self.project.bcs))
 
+    def _combo(self, items, current, on_change):
+        c = QComboBox()
+        for label, key in items:
+            c.addItem(label, key)
+        c.setCurrentIndex(max(0, c.findData(current)))
+        c.currentIndexChanged.connect(lambda _: on_change(c.currentData()))
+        return c
+
+    def _set_setting(self, key, value, rebuild=False):
+        setattr(self.project.settings, key, value)
+        self.invalidate()
+        if rebuild:
+            self._later(self.build_details)
+
     def _details_settings(self):
+        """Ansys の「解析設定」と同じ項目"""
+        st = self.project.settings
+        # ステップ制御
+        s = self._section("ステップ制御")
+        ns = QDoubleSpinBox()
+        ns.setDecimals(0)
+        ns.setRange(1, 100)
+        ns.setValue(st.n_steps)
+        ns.setKeyboardTracking(False)
+
+        def set_ns(v):
+            st.n_steps = int(v)
+            st.step_end_times = st.end_times()
+            self.invalidate()
+            self._later(self.build_details)
+        ns.valueChanged.connect(set_ns)
+        self._row(s, "ステップ数", ns)
+        cur = getattr(self, "_cur_step", 1)
+        cur = min(max(1, cur), st.n_steps)
+        cs_ = QDoubleSpinBox()
+        cs_.setDecimals(0)
+        cs_.setRange(1, st.n_steps)
+        cs_.setValue(cur)
+        cs_.setKeyboardTracking(False)
+        cs_.valueChanged.connect(lambda v: (setattr(self, "_cur_step", int(v)), self._later(self.build_details)))
+        self._row(s, "現在のステップ番号", cs_)
+        ends = st.end_times()
+        et = dspin(ends[cur - 1], 1e-9, 1e9, 4, 1.0, "s")
+
+        def set_end(v, k=cur - 1):
+            e = st.end_times()
+            e[k] = v
+            st.step_end_times = e
+            self.invalidate()
+        et.valueChanged.connect(set_end)
+        self._row(s, "ステップ終了時間", et)
+        self._row(s, "自動時間ステップ", self._combo([("プログラム制御", "auto"), ("オン", "on"), ("オフ", "off")],
+                                              st.auto_time_stepping, lambda v: self._set_setting("auto_time_stepping", v)))
+        self._row(s, "定義方法", "サブステップ")
+        for key, label in [("initial_substeps", "初期サブステップ"), ("min_substeps", "最小サブステップ"),
+                           ("max_substeps", "最大サブステップ")]:
+            sp = QDoubleSpinBox()
+            sp.setDecimals(0)
+            sp.setRange(1, 10000)
+            sp.setValue(getattr(st, key))
+            sp.setKeyboardTracking(False)
+            sp.valueChanged.connect(lambda v, key=key: self._set_setting(key, int(v)))
+            self._row(s, label, sp)
+        # ソルバー制御
         s = self._section("ソルバー制御")
-        combo = QComboBox()
-        for label, key in [("プログラム制御（推奨）", "auto"), ("直接法", "scipy"), ("反復法（AMG）", "amg")]:
-            combo.addItem(label, key)
-        combo.setCurrentIndex(max(0, combo.findData(self.project.solver)))
-        combo.currentIndexChanged.connect(lambda _: setattr(self.project, "solver", combo.currentData()))
-        self._row(s, "ソルバータイプ", combo)
-        self._row(s, "大変形", "オフ")
-        self._row(s, "ステップ数", "1")
+        self._row(s, "ソルバータイプ", self._combo([("プログラム制御", "auto"), ("直接法", "scipy"), ("反復法", "amg")],
+                                             st.solver_type, lambda v: self._set_setting("solver_type", v)))
+        self._row(s, "弱いバネ", self._combo([("オフ", False), ("オン", True)], st.weak_springs,
+                                         lambda v: self._set_setting("weak_springs", v)))
+        self._row(s, "大変形", self._combo([("オフ", False), ("オン", True)], st.large_deflection,
+                                        lambda v: self._set_setting("large_deflection", v)))
+        self._row(s, "慣性リリーフ", "オフ")
+        # 非線形制御
+        s = self._section("非線形制御")
+        self._row(s, "ニュートン・ラフソン オプション", self._combo([("プログラム制御", "auto"), ("フル", "full")],
+                                                           st.newton, lambda v: self._set_setting("newton", v)))
+        fc = dspin(st.force_convergence * 100, 0.001, 100, 3, 0.1, "%")
+        fc.valueChanged.connect(lambda v: self._set_setting("force_convergence", v / 100))
+        self._row(s, "力の収束（許容値）", fc)
+        dc = dspin(st.displacement_convergence * 100, 0.0, 100, 3, 0.1, "%")
+        dc.setSpecialValueText("除外")
+        dc.valueChanged.connect(lambda v: self._set_setting("displacement_convergence", v / 100))
+        self._row(s, "変位の収束（許容値）", dc)
+        self._row(s, "ラインサーチ", self._combo([("プログラム制御", "auto"), ("オン", "on"), ("オフ", "off")],
+                                           st.line_search, lambda v: self._set_setting("line_search", v)))
+        mi = QDoubleSpinBox()
+        mi.setDecimals(0)
+        mi.setRange(1, 1000)
+        mi.setValue(st.max_iterations)
+        mi.setKeyboardTracking(False)
+        mi.valueChanged.connect(lambda v: self._set_setting("max_iterations", int(v)))
+        self._row(s, "最大平衡反復回数", mi)
+        pt = dspin(st.penetration_tolerance, 0.001, 10, 3, 0.05)
+        pt.valueChanged.connect(lambda v: self._set_setting("penetration_tolerance", v))
+        self._row(s, "貫通許容係数（要素サイズ比）", pt)
+        self._row(s, "安定化", "オフ")
+        # 出力制御
+        s = self._section("出力制御")
+        self._row(s, "応力", "はい")
+        self._row(s, "ひずみ", "はい")
+        self._row(s, "接触の結果", self._combo([("はい", True), ("いいえ", False)], st.calc_contact,
+                                           lambda v: self._set_setting("calc_contact", v)))
+        self._row(s, "結果の保存", self._combo([("すべてのステップ", "all"), ("最後のステップのみ", "last")],
+                                          st.store_results, lambda v: self._set_setting("store_results", v)))
+        # 解析データ管理
+        s = self._section("解析データ管理")
+        nl = self.project.needs_nonlinear_solver(self.mesh) if self.mesh is not None else False
+        self._row(s, "非線形解析", "はい" if (nl and (st.large_deflection or any(
+            c.type not in ("bonded", "no_separation") for c in self.project.contacts))) else "いいえ")
+        self._row(s, "ソルバー単位", "アクティブシステム（mm, t, N, s, MPa）")
 
     def _details_bc(self):
         i = self.current[1]
@@ -1547,6 +1858,20 @@ class MainWindow(QMainWindow):
                     sp = dspin(float(v or 0), dec=6 if bc.kind == "gravity" else 4, suffix=unit)
                     sp.valueChanged.connect(lambda val, c=c: self._bc_value(i, c, val))
                     self._row(s2, f"{ax} 成分", sp)
+        ns = self.project.settings.n_steps
+        if ns > 1 and bc.kind != "fixed":
+            s4 = self._section("ステップごとの大きさ（倍率）")
+            fac = list(bc.step_factors) + [1.0] * max(0, ns - len(bc.step_factors))
+            for k in range(ns):
+                sp = dspin(float(fac[k]), -1e6, 1e6, 4, 0.1)
+
+                def setf(v, k=k):
+                    f = list(bc.step_factors) + [1.0] * max(0, ns - len(bc.step_factors))
+                    f[k] = v
+                    bc.step_factors = f[:ns]
+                    self.invalidate()
+                sp.valueChanged.connect(setf)
+                self._row(s4, f"ステップ {k + 1}（終了 {self.project.settings.end_times()[k]:g} s）", sp)
         if self.result is not None and i in self.result.reactions:
             r = self.result.reactions[i]
             s3 = self._section("反力（解析結果）")
@@ -1581,6 +1906,13 @@ class MainWindow(QMainWindow):
                 self._row(s, k, f"{v:.6g}" if isinstance(v, float) else str(v))
 
     def _details_info(self):
+        hist = getattr(self.result, "history", None) or getattr(self, "_fail_history", None)
+        if hist:
+            s0 = self._section("収束の履歴（力の残差比 / 許容値 " +
+                               f"{self.project.settings.force_convergence * 100:g}%）")
+            for h in hist[-40:]:
+                self._row(s0, f"時間 {h['時間']:g} 反復 {h['反復']}",
+                          f"残差 {h['力の残差比']:.2e}　状態変化 {h['接触状態の変化']}　貫通 {h['最大貫通 [mm]']:.1e}")
         s = self._section("ソルバー出力")
         if self.result is not None:
             for k, v in self.result.info.items():
@@ -1596,17 +1928,36 @@ class MainWindow(QMainWindow):
         key = self.project.results[self.current[1]]
         s = self._section("スコープ")
         self._row(s, "スコープ方法", "ジオメトリの選択")
-        self._row(s, "ジオメトリ", "すべてのボディ")
+        self._row(s, "ジオメトリ", "接触面" if key.startswith("接触:") else "すべてのボディ")
+        if len(self.results) > 1:
+            st = self._section("時間")
+            c = QComboBox()
+            for j, r in enumerate(self.results):
+                c.addItem(f"ステップ {r.info.get('ステップ', j + 1)}（{getattr(r, 'time', j + 1):g} s）", j)
+            c.setCurrentIndex(self.result_index if self.result_index >= 0 else len(self.results) - 1)
+
+            def pick(_):
+                self.result_index = c.currentData()
+                self.result = self.results[self.result_index]
+                self._later(lambda: (self.build_details(), self.refresh_view()))
+            c.currentIndexChanged.connect(pick)
+            self._row(st, "表示時間", c)
         s2 = self._section("定義")
         self._row(s2, "タイプ", RESULT_TYPE_JP.get(key, RESULT_NAME.get(key, key)))
         self._row(s2, "単位", key.split("[")[-1].rstrip("]") if "[" in key else "なし")
         if self.result is not None:
-            vals = np.asarray(self.result.fields().get(key, []), float)
+            vals = np.asarray(self._fields(self.result).get(key, []), float)
+            vals = vals[np.isfinite(vals)]
             if len(vals):
                 s3 = self._section("結果")
                 self._row(s3, "最小", f"{vals.min():.6g}")
                 self._row(s3, "最大", f"{vals.max():.6g}")
                 self._row(s3, "平均", f"{vals.mean():.6g}")
+                if key == "接触:接触状態":
+                    for code, lab in STATUS_JP.items():
+                        self._row(s3, f"{code}: {lab}", f"{int(np.sum(vals == code))} 節点")
+            elif key.startswith("接触:"):
+                self._row(self._section("結果"), "", "接触の結果がありません（接触領域がないか、出力がオフ）")
             if self.probe_text:
                 s4 = self._section("プローブ（クリックした点）")
                 for line in self.probe_text.splitlines():
@@ -1664,6 +2015,11 @@ class MainWindow(QMainWindow):
             self.current = ("geometry",)
             self.selected_bodies = []
             self.remesh()
+            return
+        if k == "contact":
+            del self.project.contacts[self.current[1]]
+            self.invalidate()
+            self.select_node(("contacts",))
             return
         if k == "attr":
             name = self.current[1]
@@ -1756,6 +2112,11 @@ class MainWindow(QMainWindow):
             p.assign(mesh.body_ids().tolist(), mat=p.material.name)
         self.selected_bodies = [b for b in self.selected_bodies if b in set(mesh.body_ids().tolist())]
         self._fill_attr_combos()
+        if len(mesh.body_ids()) > 1:
+            # Ansys と同じく、ボディ同士の接触を自動で作成（手動の接触は残す）
+            self.auto_contacts(quiet=True)
+        else:
+            self.project.contacts = [c for c in self.project.contacts if not c.auto]
         self.selected_faces = [f for f in self.selected_faces if f < mesh.n_faces]
         self.result = None
         self.solve_error = ""
@@ -1800,9 +2161,21 @@ class MainWindow(QMainWindow):
             self.ribbon.setCurrentIndex(self.tab_model)
             return
         self.solver_log = []
+        self._fail_history = None
+        p = self.project
+        if p.needs_nonlinear_solver(self.mesh) and not p.contacts and len(self.mesh.body_ids()) > 1:
+            self.auto_contacts(quiet=True)
+        bad_c = [c.name for c in p.contacts if not c.suppressed and not (c.contact_faces and c.target_faces)]
+        if bad_c:
+            QMessageBox.warning(self, "接触", "面が割り当てられていない接触領域があります: " + ", ".join(bad_c))
+            return
         self._busy(True, "解析を実行しています…")
-        self.worker = Worker(solve, self.mesh, self.project.material, list(self.project.bcs),
-                             method=self.project.solver, elem_materials=em)
+        if p.needs_nonlinear_solver(self.mesh):
+            self.worker = Worker(solve_static, self.mesh, p.material, list(p.bcs), list(p.contacts), p.settings,
+                                 elem_materials=em)
+        else:
+            self.worker = Worker(solve, self.mesh, p.material, list(p.bcs), method=p.settings.solver_type,
+                                 elem_materials=em)
         self.worker.log.connect(lambda m: (self.solver_log.append(m), self.log(m)))
         self.worker.done.connect(self._on_solved)
         self.worker.failed.connect(self._on_solve_failed)
@@ -1810,6 +2183,9 @@ class MainWindow(QMainWindow):
 
     def _on_solved(self, result):
         self._busy(False)
+        self.results = list(result) if isinstance(result, list) else [result]
+        self.result_index = len(self.results) - 1
+        result = self.results[-1]
         self.result = result
         self.solve_error = ""
         self.log("解析が完了しました（" + ", ".join(f"{k} {v}" for k, v in result.info.items()
@@ -1820,6 +2196,7 @@ class MainWindow(QMainWindow):
 
     def _on_solve_failed(self, msg):
         self._busy(False)
+        self._fail_history = getattr(self.worker, "history", None)
         self.solve_error = msg.strip().splitlines()[-1]
         self.log("エラー: " + msg)
         self.rebuild_tree()
@@ -2035,6 +2412,26 @@ class MainWindow(QMainWindow):
         elif k == "sizing":
             for f in self.project.local_sizes[self.current[1]]["faces"]:
                 rgb[fid == f] = _hex("#3a8fa8")
+        elif k in ("connections", "contacts", "contact"):
+            # Ansys と同じく 接触側＝赤、ターゲット側＝青（他は半透明風の淡色）
+            rgb[:] = _hex("#e6e8eb")
+            show = range(len(self.project.contacts)) if k != "contact" else [self.current[1]]
+            for i in show:
+                c = self.project.contacts[i]
+                if c.suppressed:
+                    continue
+                rgb[np.isin(fid, c.contact_faces)] = _hex(CONTACT_COLOR)
+                rgb[np.isin(fid, c.target_faces)] = _hex(TARGET_COLOR)
+            if k == "contact":
+                c = self.project.contacts[self.current[1]]
+                overlay = [f"<b>{c.name}</b>", f"タイプ: {CONTACT_TYPES[c.type]}"
+                           + (f"（μ = {c.mu:g}）" if c.type == "frictional" else ""),
+                           f"<span style='color:{CONTACT_COLOR}'>■</span> 接触 {len(c.contact_faces)} 面",
+                           f"<span style='color:{TARGET_COLOR}'>■</span> ターゲット {len(c.target_faces)} 面"]
+            else:
+                overlay = ["<b>接続</b>", f"接触領域 {len(self.project.contacts)}",
+                           f"<span style='color:{CONTACT_COLOR}'>■</span> 接触　"
+                           f"<span style='color:{TARGET_COLOR}'>■</span> ターゲット"]
         elif k in ("geometry", "feature", "attrs", "attr", "mats", "mat", "model", "project", "coords") \
                 and mesh.elem_body is not None:
             # ボディごとに材料の色で塗り分け（未定義は灰色）
@@ -2069,6 +2466,8 @@ class MainWindow(QMainWindow):
                 _labels(pl, pts, labs, 14, "white", bg="#333333")
             head = "<b>静的構造</b><br>" + datetime.datetime.now().strftime("%Y/%m/%d %H:%M") + "<br>"
             self._set_overlay(head + "<br>".join(overlay))
+        elif k in ("connections", "contacts", "contact"):
+            self._set_overlay("<br>".join(overlay))
         elif overlay:
             self._set_overlay("<b>ボディ</b>（ボディ属性 / 材料）<br>" + "<br>".join(overlay))
         elif k in ("mesh", "sizing"):
@@ -2136,9 +2535,10 @@ class MainWindow(QMainWindow):
     def _draw_result(self):
         pl, mesh, r = self.plotter, self.mesh, self.result
         key = self.project.results[self.current[1]]
-        fields = r.fields()
+        fields = self._fields(r)
         if key not in fields:
-            self._set_overlay(f"<b>{RESULT_NAME.get(key, key)}</b><br>（降伏応力が未設定のため表示できません）")
+            why = "接触の結果がありません" if key.startswith("接触:") else "降伏応力が未設定のため表示できません"
+            self._set_overlay(f"<b>{RESULT_NAME.get(key, key)}</b><br>（{why}）")
             self._draw_model()
             return
         vals = np.asarray(fields[key], float)
@@ -2149,15 +2549,23 @@ class MainWindow(QMainWindow):
         en = FIELD_EN.get(key, key)
         poly.point_data[en] = vals
         used = np.unique(mesh.boundary_tris_full)
+        fin = used[np.isfinite(vals[used])]
+        if len(fin) == 0:
+            self._set_overlay(f"<b>{RESULT_NAME.get(key, key)}</b><br>（値がありません）")
+            self._draw_model()
+            return
+        used = fin
         vmin, vmax = float(vals[used].min()), float(vals[used].max())
         if vmax - vmin < 1e-30:
             vmax = vmin + 1e-30
         n_colors = self.bands.currentData() or 9
         cmap = "jet_r" if "Safety" in en else "jet"
+        if key == "接触:接触状態":
+            n_colors, vmin, vmax = 4, -0.5, 3.5
         show_el = self.edges_combo.currentIndex() == 2
         self._main_actor = pl.add_mesh(
             poly, scalars=en, cmap=cmap, n_colors=n_colors, clim=[vmin, vmax], show_edges=show_el,
-            edge_color="#303030", line_width=0.4, smooth_shading=False,
+            edge_color="#303030", line_width=0.4, smooth_shading=False, nan_color="#d9d9d9",
             scalar_bar_args={"title": "", "vertical": True, "fmt": "%.4g", "n_labels": min(n_colors + 1, 10),
                              "position_x": 0.015, "position_y": 0.25, "height": 0.5, "width": 0.045,
                              "label_font_size": 13, "title_font_size": 1})
@@ -2179,7 +2587,7 @@ class MainWindow(QMainWindow):
             f"<b>B: 静的構造</b><br>{RESULT_NAME.get(key, key)}<br>"
             f"タイプ: {RESULT_TYPE_JP.get(key, RESULT_NAME.get(key, key))}<br>"
             + (f"単位: {unit}<br>" if unit else "")
-            + f"時間: 1 s<br>{datetime.datetime.now():%Y/%m/%d %H:%M}<br>"
+            + f"時間: {getattr(r, 'time', 1.0):g} s<br>{datetime.datetime.now():%Y/%m/%d %H:%M}<br>"
             f"変形倍率: {'変形なし' if scale == 0 else f'{scale:g} 倍'}<br><br>"
             f"<span style='color:#c00'>最大 {vmax:.5g}</span><br><span style='color:#00c'>最小 {vmin:.5g}</span>")
 
@@ -2190,7 +2598,7 @@ class MainWindow(QMainWindow):
         pts = self.mesh.nodes + scale * r.u
         cand = self.mesh.boundary_tris_full[tri]
         i = int(cand[np.argmin(np.linalg.norm(pts[cand] - pos, axis=1))])
-        v = r.fields()[key][i]
+        v = self._fields(r)[key][i]
         x = self.mesh.nodes[i]
         self._probe_pt = i
         self._probe_val = f"{v:.5g}"
@@ -2219,6 +2627,7 @@ class MainWindow(QMainWindow):
         self.project_path = None
         self.selected_faces = []
         self.result = None
+        self.results = []
         self.current = ("geometry",)
         self._update_title()
         self.remesh(reset_camera=True)
@@ -2295,7 +2704,7 @@ class MainWindow(QMainWindow):
             images["荷重・支持"] = os.path.join(tmp, "bc.png")
             self.plotter.screenshot(images["荷重・支持"])
             for i, key in enumerate(self.project.results):
-                if key in self.result.fields():
+                if key in self._fields(self.result):
                     self.current = ("result", i)
                     self.refresh_view()
                     p = os.path.join(tmp, f"r{i}.png")
