@@ -33,6 +33,7 @@ class Mesh:
     elem_body: np.ndarray | None = None  # 要素ごとのボディ番号（ボディキー）
     body_names: dict | None = None       # ボディ番号 → 表示名
     _btri_owner: np.ndarray | None = field(default=None, repr=False)
+    node_origin: np.ndarray | None = None   # 分離前の節点番号（ボディ境界で複製した節点用）
 
     def __post_init__(self):
         self.nodes = np.asarray(self.nodes, dtype=float)
@@ -97,6 +98,41 @@ class Mesh:
         new.elem_body = None if self.elem_body is None else self.elem_body.copy()
         new.body_names = self.body_names
         return new
+
+    def split_body_interfaces(self) -> "Mesh":
+        """ボディ同士で共有している節点を複製し、ボディごとに独立したメッシュにする。
+
+        Ansys と同じく、ボディ間のつながりは「接触（結合を含む）」で与えるため。
+        複製した節点は同じ座標なので、接触面は節点どうしがぴったり向かい合います。
+        """
+        if self.elem_body is None or len(np.unique(self.elem_body)) <= 1:
+            out = self
+            out.node_origin = np.arange(self.n_nodes)
+            return out
+        owner = np.full(self.n_nodes, -1, dtype=np.int64)
+        nodes = [self.nodes]
+        origin = [np.arange(self.n_nodes)]
+        elems = self.elems.copy()
+        nxt = self.n_nodes
+        for b in np.unique(self.elem_body):
+            em = self.elem_body == b
+            nb = np.unique(self.elems[em])
+            taken = owner[nb] >= 0
+            owner[nb[~taken]] = b
+            dup = nb[taken]
+            if len(dup):
+                new_idx = np.arange(nxt, nxt + len(dup))
+                nxt += len(dup)
+                lut = np.arange(self.n_nodes)
+                lut[dup] = new_idx
+                elems[em] = lut[self.elems[em]]
+                nodes.append(self.nodes[dup])
+                origin.append(dup)
+        out = Mesh(np.vstack(nodes), elems)
+        out.elem_body = self.elem_body.copy()
+        out.body_names = self.body_names
+        out.node_origin = np.concatenate(origin)
+        return out
 
     # ------------------------------------------------------------------ 境界
     def _compute_boundary(self):

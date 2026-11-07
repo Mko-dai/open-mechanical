@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 
 from .geometry import PRIMITIVES, build_mesh
 from .materials import DEFAULT, LIBRARY, Material
+from .contact import ContactRegion
+from .nonlinear import AnalysisSettings, solve_static
 from .solver import BC, solve
 
 
@@ -30,6 +32,9 @@ class Project:
     materials: dict = field(default_factory=dict)       # 材料名 → Material（材料定数）
     body_attrs: dict = field(default_factory=dict)      # ボディ属性名 → {"mesh_size": mm}
     body_assign: dict = field(default_factory=dict)     # "ボディ番号" → {"attr": 名, "mat": 名}
+    contacts: list = field(default_factory=list)        # ContactRegion（接続 → 接触）
+    contact_tolerance: float = 0.0                      # 自動検出の許容距離（0 = 自動）
+    settings: AnalysisSettings = field(default_factory=AnalysisSettings)
 
     # ------------------------------------------------------------- ボディ属性・材料
     def assignment(self, body: int) -> dict:
@@ -96,7 +101,9 @@ class Project:
                 "bcs": [b.to_dict() for b in self.bcs],
                 "results": list(self.results), "solver": self.solver,
                 "materials": {k: m.to_dict() for k, m in self.materials.items()},
-                "body_attrs": self.body_attrs, "body_assign": self.body_assign}
+                "body_attrs": self.body_attrs, "body_assign": self.body_assign,
+                "contacts": [c.to_dict() for c in self.contacts], "contact_tolerance": self.contact_tolerance,
+                "settings": self.settings.to_dict()}
 
     @staticmethod
     def from_dict(d) -> "Project":
@@ -111,7 +118,10 @@ class Project:
                        materials={k: Material.from_dict(v) for k, v in d.get("materials", {}).items()},
                        body_attrs=(d.get("body_attrs") if isinstance(d.get("body_attrs"), dict)
                                    else {n: {"mesh_size": 0.0} for n in d.get("body_attrs", [])}),
-                       body_assign=d.get("body_assign", {}))
+                       body_assign=d.get("body_assign", {}),
+                       contacts=[ContactRegion.from_dict(c) for c in d.get("contacts", [])],
+                       contact_tolerance=d.get("contact_tolerance", 0.0),
+                       settings=AnalysisSettings.from_dict(d.get("settings", {})))
 
     def save(self, path):
         with open(path, "w", encoding="utf-8") as f:
@@ -126,7 +136,24 @@ class Project:
         return build_mesh(self.geometry, self.mesh_size, self.mesh_order, log=log,
                           local_sizes=self.local_sizes)
 
+    def needs_nonlinear_solver(self, mesh) -> bool:
+        s = self.settings
+        multi = mesh is not None and mesh.elem_body is not None and len(mesh.body_ids()) > 1
+        return bool(self.contacts or multi or s.large_deflection or s.n_steps > 1 or s.weak_springs
+                    or any(b.step_factors for b in self.bcs))
+
     def run(self, mesh=None, log=print, progress=None):
+        """解析を実行して最終時点の結果を返す（全ステップは run_all）"""
+        return self.run_all(mesh, log, progress)[-1]
+
+    def run_all(self, mesh=None, log=print, progress=None):
         mesh = mesh if mesh is not None else self.mesh(log=log)
-        return solve(mesh, self.material, self.bcs, progress=progress, log=log,
-                     elem_materials=self.elem_materials(mesh))
+        em = self.elem_materials(mesh)
+        if not self.needs_nonlinear_solver(mesh):
+            return [solve(mesh, self.material, self.bcs, progress=progress, log=log, elem_materials=em,
+                          method=self.settings.solver_type)]
+        if not self.contacts and mesh.elem_body is not None and len(mesh.body_ids()) > 1:
+            from .contact import detect_contacts
+            self.contacts = detect_contacts(mesh, self.contact_tolerance)
+        return solve_static(mesh, self.material, self.bcs, self.contacts, self.settings, elem_materials=em,
+                            log=log, progress=progress)

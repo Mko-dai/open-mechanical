@@ -190,18 +190,21 @@ class BC:
     values: list = field(default_factory=lambda: [0.0, 0.0, 0.0])
     name: str = ""
     nodes: list[int] = field(default_factory=list)   # 面の代わりに節点を直接指定（線・点の拘束用）
+    step_factors: list = field(default_factory=list)  # ステップごとの倍率（空ならすべて 1）
 
     def to_dict(self):
         d = {"kind": self.kind, "faces": list(map(int, self.faces)),
              "values": list(self.values), "name": self.name}
         if self.nodes:
             d["nodes"] = list(map(int, self.nodes))
+        if self.step_factors:
+            d["step_factors"] = [float(x) for x in self.step_factors]
         return d
 
     @staticmethod
     def from_dict(d):
         return BC(d["kind"], d.get("faces", []), d.get("values", [0, 0, 0]), d.get("name", ""),
-                  d.get("nodes", []))
+                  d.get("nodes", []), d.get("step_factors", []))
 
     def label(self) -> str:
         jp = {"fixed": "固定支持", "displacement": "強制変位", "force": "力",

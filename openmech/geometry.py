@@ -423,10 +423,14 @@ def _extract_mesh(gmsh) -> Mesh:
         elems = _reorder_tet10(nodes, elems)
     mesh = Mesh(nodes, elems)
     mesh.elem_body = elem_body
+    # ボディ同士の境界の節点を分ける（つながりは接触で与える）
+    mesh = mesh.split_body_interfaces()
 
     # CAD のサーフェスを「面」として割り当てる
+    surfs = sorted(gmsh.model.getEntities(2), key=lambda e: e[1])
+    n_surf = len(surfs)
     key_of = {}
-    for fid, (_, stag) in enumerate(sorted(gmsh.model.getEntities(2), key=lambda e: e[1])):
+    for fid, (_, stag) in enumerate(surfs):
         ets, _, ens = gmsh.model.mesh.getElements(2, stag)
         for t, en in zip(ets, ens):
             npe = {2: 3, 9: 6}.get(int(t))
@@ -435,15 +439,22 @@ def _extract_mesh(gmsh) -> Mesh:
             tri = remap[tag2idx[en.astype(np.int64)].reshape(-1, npe)[:, :3]]
             for k in map(tuple, np.sort(tri, axis=1)):
                 key_of[k] = fid
-    bt = np.sort(mesh.boundary_tris, axis=1)
+    orig = mesh.node_origin[mesh.boundary_tris]
+    bt = np.sort(orig, axis=1)
     fids = np.array([key_of.get(tuple(k), -1) for k in bt])
     if (fids < 0).any():
         # 対応が取れない場合は角度で自動分割
         mesh.group_faces()
-    else:
-        # 境界に現れない（内部の）サーフェスを除いて詰め直す
-        _, fids = np.unique(fids, return_inverse=True)
-        mesh.set_face_ids(fids)
+        return mesh
+    # ボディ境界のサーフェスは両側に現れる: 番号の小さいボディ側はそのまま、もう一方は n_surf + 番号
+    tb = mesh.tri_body()
+    first_body = {}
+    for f, b in zip(fids.tolist(), tb.tolist()):
+        first_body[f] = min(b, first_body.get(f, b))
+    second = np.array([b != first_body[f] for f, b in zip(fids.tolist(), tb.tolist())])
+    fids = np.where(second, fids + n_surf, fids)
+    _, fids = np.unique(fids, return_inverse=True)
+    mesh.set_face_ids(fids)
     return mesh
 
 
@@ -456,7 +467,8 @@ def _apply_local_sizes(gmsh, h, local_sizes):
     surfs = [t for _, t in sorted(gmsh.model.getEntities(2), key=lambda e: e[1])]
     fields = []
     for ls in local_sizes:
-        tags = [surfs[f] for f in ls.get("faces", []) if 0 <= f < len(surfs)]
+        # ボディ境界の裏側の面（番号 >= サーフェス数）は表側と同じサーフェスなので省略
+        tags = sorted({surfs[f] for f in ls.get("faces", []) if 0 <= f < len(surfs)})
         hs = float(ls.get("size", 0))
         if not tags or hs <= 0:
             continue
