@@ -1147,29 +1147,32 @@ class MainWindow(QMainWindow):
 
     # ======================================================================= 選択
     def _install_picking(self):
-        iren = self.plotter.iren
-        iren.add_observer("LeftButtonPressEvent", self._on_press)
-        iren.add_observer("LeftButtonReleaseEvent", self._on_release)
+        """クリック（ドラッグでない）を Qt のイベントで検出する。
 
-    def _on_press(self, obj, _ev):
-        self.log(f"[debug] press {obj.GetEventPosition()}")
-        try:
-            self._press = tuple(obj.GetEventPosition())
-        except Exception:
-            self._press = None
+        VTK の LeftButtonRelease は回転操作に吸収されて届かないことがあるため、Qt 側で拾う。
+        """
+        from PySide6.QtCore import QEvent, QObject
 
-    def _on_release(self, obj, _ev):
-        if self._press is None:
-            return
-        try:
-            pos = tuple(obj.GetEventPosition())
-        except Exception:
-            return
-        moved = abs(pos[0] - self._press[0]) + abs(pos[1] - self._press[1])
-        self._press = None
-        if moved > 4:
-            return  # ドラッグ（回転）だった
-        self._pick(pos)
+        win = self
+
+        class ClickFilter(QObject):
+            def eventFilter(self, obj, ev):
+                t = ev.type()
+                if t == QEvent.MouseButtonPress and ev.button() == Qt.LeftButton:
+                    win._press = ev.position().toPoint()
+                elif t == QEvent.MouseButtonRelease and ev.button() == Qt.LeftButton and win._press is not None:
+                    p = ev.position().toPoint()
+                    moved = abs(p.x() - win._press.x()) + abs(p.y() - win._press.y())
+                    win._press = None
+                    if moved <= 4:
+                        dpr = obj.devicePixelRatioF() if hasattr(obj, "devicePixelRatioF") else 1.0
+                        x = int(p.x() * dpr)
+                        y = int((obj.height() - p.y() - 1) * dpr)
+                        QTimer.singleShot(0, lambda: win._pick((x, y)))
+                return False
+
+        self._click_filter = ClickFilter(self)
+        self.plotter.interactor.installEventFilter(self._click_filter)
 
     def _pick(self, pos):
         if self.mesh is None or self._main_actor is None:
@@ -1181,7 +1184,7 @@ class MainWindow(QMainWindow):
         picker.AddPickList(self._main_actor)
         hit = picker.Pick(pos[0], pos[1], 0, self.plotter.renderer)
         cell = picker.GetCellId() if hit else -1
-        if True:  # TODO: 確認後に削除
+        if True:  # 動作確認用（後で削除）
             self.log(f"[debug] click {pos} hit={hit} cell={cell}")
         add = bool(QApplication.keyboardModifiers() & (Qt.ControlModifier | Qt.MetaModifier | Qt.ShiftModifier))
         if self.current[0] == "result" and self.result is not None:
