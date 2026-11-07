@@ -2467,8 +2467,21 @@ class MainWindow(QMainWindow):
                     hl |= np.isin(fid, c.contact_faces) | np.isin(fid, c.target_faces)
             hl |= np.isin(fid, self.selected_faces)
             if hl.any():
-                fc = np.asarray(poly.faces).reshape(-1, 4)[:, 1:]
-                sub = pv.PolyData(poly.points, faces=np.c_[np.full(hl.sum(), 3), fc[hl]].ravel())
+                # 接触面とターゲット面は同じ位置にあるので、それぞれ自分のボディ側へ少しずらして重なりのちらつきを防ぐ
+                fc = np.asarray(poly.faces).reshape(-1, 4)[:, 1:][hl]
+                P = np.asarray(poly.points)[fc]                       # (n, 3, 3)
+                cen = P.mean(axis=1)
+                tb = mesh.tri_body()[src][hl]
+                bc_ = {int(b): mesh.nodes[np.unique(mesh.elems[mesh.elem_body == b])].mean(axis=0)
+                       for b in np.unique(tb)}
+                toward = np.array([bc_[int(b)] for b in tb]) - cen
+                nrm = np.cross(P[:, 1] - P[:, 0], P[:, 2] - P[:, 0])
+                nrm /= np.linalg.norm(nrm, axis=1, keepdims=True) + 1e-30
+                nrm *= np.sign(np.sum(nrm * toward, axis=1))[:, None]
+                lo_, hi_ = mesh.bounds()
+                P = P + 0.002 * float(np.linalg.norm(hi_ - lo_)) * nrm[:, None, :]
+                n = len(P)
+                sub = pv.PolyData(P.reshape(-1, 3), faces=np.c_[np.full(n, 3), np.arange(3 * n).reshape(-1, 3)].ravel())
                 sub.cell_data["rgb"] = (rgb[hl] * 255).astype(np.uint8)
                 pl.add_mesh(sub, scalars="rgb", rgb=True, pickable=False, show_scalar_bar=False)
         fe = feature_edges(mesh)
