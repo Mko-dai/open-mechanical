@@ -74,7 +74,7 @@ class Project:
             attr = self.assignment(b).get("attr")
             h = float(self.body_attrs.get(attr, {}).get("mesh_size", 0) or 0) if attr else 0.0
             if h > 0:
-                out.append({"faces": mesh.body_faces(b), "size": h})
+                out.append({"type": "sizing", "scope": "bodies", "bodies": [int(b)], "size": h})
         return out
 
     def body_temperature(self, b) -> float:
@@ -86,7 +86,8 @@ class Project:
         return T
 
     def body_rotation(self, b):
-        cs = self.assignment(b).get("cs")
+        attr = self.assignment(b).get("attr")
+        cs = (self.body_attrs.get(attr, {}) if attr else {}).get("cs") or self.assignment(b).get("cs")
         if not cs or not any(float(x) for x in cs):
             return None
         from .materials import rotation_xyz
@@ -109,7 +110,9 @@ class Project:
         for b in bodies:
             mat = self.materials[self.assignment(b)["mat"]] if use_assign else self.material
             T = self.body_temperature(b)
-            cs = tuple(float(x) for x in (self.assignment(b).get("cs") or [0, 0, 0]))
+            attr = self.assignment(b).get("attr")
+            cs = tuple(float(x) for x in ((self.body_attrs.get(attr, {}) if attr else {}).get("cs")
+                                          or self.assignment(b).get("cs") or [0, 0, 0]))
             key = (mat.name, T, cs)
             if key not in keys:
                 keys.append(key)

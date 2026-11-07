@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
                                QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-                               QRadioButton, QTabWidget, QVBoxLayout, QWidget)
+                               QPushButton, QRadioButton, QTabWidget, QVBoxLayout, QWidget)
 
 from ..geometry import AXES, FEATURES, PLANES
 from ..materials import LIBRARY, Material
@@ -98,13 +98,58 @@ class FeatureDialog(QDialog):
 
 # ---------------------------------------------------------------------------- 材料定数
 
+def _table(headers, rows, n_min=3):
+    from PySide6.QtWidgets import QTableWidget, QTableWidgetItem
+    t = QTableWidget(max(len(rows), n_min), len(headers))
+    t.setHorizontalHeaderLabels(headers)
+    for i, r in enumerate(rows):
+        for j, v in enumerate(r):
+            t.setItem(i, j, QTableWidgetItem(f"{float(v):g}"))
+    t.horizontalHeader().setStretchLastSection(True)
+    t.setMinimumHeight(140)
+    return t
+
+
+def _table_rows(t, ncol):
+    rows = []
+    for i in range(t.rowCount()):
+        vals = []
+        for j in range(ncol):
+            it = t.item(i, j)
+            txt = it.text().strip() if it is not None else ""
+            if not txt:
+                break
+            try:
+                vals.append(float(txt))
+            except ValueError:
+                break
+        if len(vals) == ncol:
+            rows.append(vals)
+    return rows
+
+
+def _table_buttons(t):
+    w = QWidget()
+    h = QHBoxLayout(w)
+    h.setContentsMargins(0, 0, 0, 0)
+    a = QPushButton("行を追加")
+    a.clicked.connect(lambda: t.insertRow(t.rowCount()))
+    d = QPushButton("選択行を削除")
+    d.clicked.connect(lambda: [t.removeRow(r) for r in sorted({i.row() for i in t.selectedIndexes()}, reverse=True)])
+    h.addWidget(a)
+    h.addWidget(d)
+    h.addStretch()
+    return w
+
+
 class MaterialDialog(QDialog):
-    """［材料定数の編集］"""
+    """［材料定数の編集］（Ansys Engineering Data 相当: 弾性・温度依存・異方性・熱膨張・塑性）"""
 
     def __init__(self, name: str, mat: Material | None, parent=None):
+        from ..materials import ELASTIC_MODELS, PLASTIC_MODELS
         super().__init__(parent)
         self.setWindowTitle("材料定数の編集")
-        self.resize(460, 380)
+        self.resize(560, 560)
         lay = QVBoxLayout(self)
         form = QFormLayout()
         self.name = QLineEdit(name)
@@ -116,28 +161,106 @@ class MaterialDialog(QDialog):
         form.addRow("材料DB", self.db)
         lay.addLayout(form)
         m = mat or LIBRARY.get(name) or Material(name, 200000.0, 0.3, 7850.0, 0.0, 0.0)
+        self._m = m
         tabs = QTabWidget()
+        # --- 弾性
         t1 = QWidget()
-        f1 = QFormLayout(t1)
+        v1 = QVBoxLayout(t1)
+        f1 = QFormLayout()
+        self.model = QComboBox()
+        for k, lab in ELASTIC_MODELS.items():
+            self.model.addItem(lab, k)
+        self.model.setCurrentIndex(max(0, self.model.findData(m.elastic)))
+        f1.addRow("弾性モデル", self.model)
+        v1.addLayout(f1)
+        from PySide6.QtWidgets import QStackedWidget
+        self.stack = QStackedWidget()
+        # 等方
+        w_iso = QWidget()
+        fi = QVBoxLayout(w_iso)
+        ff = QFormLayout()
         self.E = _spin(m.E, 1e-3, 1e8, 1, "MPa")
         self.nu = _spin(m.nu, 0.0, 0.4999, 4)
-        f1.addRow("ヤング率", self.E)
-        f1.addRow("ポアソン比", self.nu)
-        f1.addRow(QLabel("等方性・線形弾性"))
-        tabs.addTab(t1, "弾性定数")
+        ff.addRow("ヤング率", self.E)
+        ff.addRow("ポアソン比", self.nu)
+        fi.addLayout(ff)
+        fi.addWidget(QLabel("温度依存（行があれば温度で補間。範囲外は端の値）"))
+        self.ttab = _table(["温度 [°C]", "ヤング率 [MPa]", "ポアソン比"], m.temp_table, 3)
+        fi.addWidget(self.ttab)
+        fi.addWidget(_table_buttons(self.ttab))
+        self.stack.addWidget(w_iso)
+        # 直交異方性
+        w_or = QWidget()
+        fo = QFormLayout(w_or)
+        o = dict(Ex=m.E, Ey=m.E, Ez=m.E, nuxy=m.nu, nuyz=m.nu, nuxz=m.nu,
+                 Gxy=m.E / (2 * (1 + m.nu)), Gyz=m.E / (2 * (1 + m.nu)), Gxz=m.E / (2 * (1 + m.nu)))
+        o.update(m.ortho or {})
+        self.ortho = {}
+        for k, lab, unit in (("Ex", "ヤング率 X", "MPa"), ("Ey", "ヤング率 Y", "MPa"), ("Ez", "ヤング率 Z", "MPa"),
+                             ("nuxy", "ポアソン比 XY", ""), ("nuyz", "ポアソン比 YZ", ""), ("nuxz", "ポアソン比 XZ", ""),
+                             ("Gxy", "せん断弾性係数 XY", "MPa"), ("Gyz", "せん断弾性係数 YZ", "MPa"),
+                             ("Gxz", "せん断弾性係数 XZ", "MPa")):
+            sp = _spin(o[k], 0.0 if k.startswith("nu") else 1e-3, 0.99 if k.startswith("nu") else 1e8,
+                       4 if k.startswith("nu") else 1, unit)
+            self.ortho[k] = sp
+            fo.addRow(lab, sp)
+        fo.addRow(QLabel("X, Y, Z は材料座標系（ボディ属性の「材料の向き」で回転できます）"))
+        self.stack.addWidget(w_or)
+        # 異方性
+        w_an = QWidget()
+        fa = QVBoxLayout(w_an)
+        fa.addWidget(QLabel("剛性マトリクス D [MPa]（成分順 xx, yy, zz, xy, yz, zx・工学せん断ひずみ、対称）"))
+        D0 = m.aniso if len(m.aniso) == 6 else m.D_local().tolist() if m.elastic != "anisotropic" else m.aniso
+        self.atab = _table(["xx", "yy", "zz", "xy", "yz", "zx"], D0, 6)
+        self.atab.setRowCount(6)
+        self.atab.setVerticalHeaderLabels(["xx", "yy", "zz", "xy", "yz", "zx"])
+        fa.addWidget(self.atab)
+        self.stack.addWidget(w_an)
+        v1.addWidget(self.stack)
+        self.model.currentIndexChanged.connect(lambda i: self.stack.setCurrentIndex(i))
+        self.stack.setCurrentIndex(self.model.currentIndex())
+        tabs.addTab(t1, "弾性")
+        # --- 密度
         t2 = QWidget()
         f2 = QFormLayout(t2)
         self.rho = _spin(m.density, 0.0, 1e6, 2, "kg/m³")
         f2.addRow("密度", self.rho)
         tabs.addTab(t2, "密度")
+        # --- 熱膨張
+        t4 = QWidget()
+        f4 = QFormLayout(t4)
+        self.alpha = _spin(m.alpha * 1e6, 0.0, 1e4, 4, "×10⁻⁶ /°C")
+        f4.addRow("線膨張係数（等方）", self.alpha)
+        ao = list(m.alpha_ortho or [0, 0, 0]) + [0, 0, 0]
+        self.ao = [_spin(ao[i] * 1e6, 0.0, 1e4, 4, "×10⁻⁶ /°C") for i in range(3)]
+        for i, ax in enumerate("XYZ"):
+            f4.addRow(f"線膨張係数 {ax}（直交異方性）", self.ao[i])
+        self.tref = _spin(m.ref_temp, -273, 1e4, 2, "°C")
+        f4.addRow("ゼロ熱ひずみの参照温度", self.tref)
+        f4.addRow(QLabel("熱ひずみ = α ×（温度 − 参照温度）。温度は［環境］タブの「熱条件」か環境温度"))
+        tabs.addTab(t4, "熱膨張")
+        # --- 強度・塑性
         t3 = QWidget()
-        f3 = QFormLayout(t3)
+        v3 = QVBoxLayout(t3)
+        f3 = QFormLayout()
         self.sy = _spin(m.yield_strength, 0.0, 1e6, 2, "MPa")
         self.su = _spin(m.tensile_strength, 0.0, 1e6, 2, "MPa")
         f3.addRow("引張降伏応力", self.sy)
         f3.addRow("引張強さ", self.su)
-        f3.addRow(QLabel("降伏応力を入れると安全率を表示できます"))
-        tabs.addTab(t3, "強度")
+        self.plast = QComboBox()
+        for k, lab in PLASTIC_MODELS.items():
+            self.plast.addItem(lab, k)
+        self.plast.setCurrentIndex(max(0, self.plast.findData(m.plasticity)))
+        f3.addRow("塑性（ミーゼス）", self.plast)
+        self.et = _spin(m.tangent_modulus, 0.0, 1e8, 1, "MPa")
+        f3.addRow("接線係数（2直線）", self.et)
+        v3.addLayout(f3)
+        v3.addWidget(QLabel("多直線: 塑性ひずみ と 応力（1行目 = 塑性ひずみ 0 の降伏応力）"))
+        self.mtab = _table(["塑性ひずみ [-]", "応力 [MPa]"], m.ml_table, 4)
+        v3.addWidget(self.mtab)
+        v3.addWidget(_table_buttons(self.mtab))
+        v3.addWidget(QLabel("塑性を設定すると非線形解析（弾塑性）になります。安全率は降伏応力で評価します。"))
+        tabs.addTab(t3, "強度・塑性")
         lay.addWidget(tabs)
         _buttons(self, lay)
 
@@ -150,12 +273,28 @@ class MaterialDialog(QDialog):
         self.rho.setValue(m.density)
         self.sy.setValue(m.yield_strength)
         self.su.setValue(m.tensile_strength)
+        self.alpha.setValue(m.alpha * 1e6)
         if not self.name.text().strip():
             self.name.setText(m.name)
 
     def material(self) -> Material:
+        model = self.model.currentData()
+        aniso = _table_rows(self.atab, 6) if model == "anisotropic" else []
+        if model == "anisotropic" and len(aniso) != 6:
+            raise ValueError("異方性の剛性マトリクスは 6 行すべて入力してください")
+        mt = _table_rows(self.mtab, 2)
+        if self.plast.currentData().startswith("multilinear") and not mt:
+            raise ValueError("多直線硬化の表（塑性ひずみ・応力）を入力してください")
+        if self.plast.currentData().startswith("bilinear") and self.sy.value() <= 0:
+            raise ValueError("2直線硬化には降伏応力が必要です")
         return Material(self.name.text().strip(), self.E.value(), self.nu.value(), self.rho.value(),
-                        self.sy.value(), self.su.value())
+                        self.sy.value(), self.su.value(), elastic=model,
+                        temp_table=_table_rows(self.ttab, 3),
+                        ortho={k: sp.value() for k, sp in self.ortho.items()} if model == "orthotropic" else {},
+                        aniso=aniso, alpha=self.alpha.value() * 1e-6,
+                        alpha_ortho=[sp.value() * 1e-6 for sp in self.ao] if any(sp.value() for sp in self.ao) else [],
+                        ref_temp=self.tref.value(), plasticity=self.plast.currentData(),
+                        tangent_modulus=self.et.value(), ml_table=mt)
 
 
 # ---------------------------------------------------------------------------- Body 属性
@@ -178,6 +317,14 @@ class BodyAttrDialog(QDialog):
         self.mesh.setSpecialValueText("自動（全体の設定に従う）")
         f.addRow("メッシュサイズ", self.mesh)
         tabs.addTab(t, "メッシュサイズ")
+        t3 = QWidget()
+        f3 = QFormLayout(t3)
+        cs = list(props.get("cs") or [0, 0, 0]) + [0, 0, 0]
+        self.cs = [_spin(cs[i], -360, 360, 3, "°") for i in range(3)]
+        for i, ax in enumerate("XYZ"):
+            f3.addRow(f"{ax} 軸まわりの回転", self.cs[i])
+        f3.addRow(QLabel("直交異方性・異方性の材料の向き（材料座標系）。X→Y→Z の順に回転"))
+        tabs.addTab(t3, "材料の向き")
         t2 = QWidget()
         f2 = QFormLayout(t2)
         f2.addRow(QLabel("解析領域: このボディを解析に含める（静的構造解析）"))
@@ -186,7 +333,7 @@ class BodyAttrDialog(QDialog):
         _buttons(self, lay)
 
     def result(self):
-        return self.name.text().strip(), {"mesh_size": self.mesh.value()}
+        return self.name.text().strip(), {"mesh_size": self.mesh.value(), "cs": [sp.value() for sp in self.cs]}
 
 
 # ---------------------------------------------------------------------------- 境界条件

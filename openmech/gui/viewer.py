@@ -52,6 +52,11 @@ def feature_edges(mesh: Mesh, points=None) -> pv.PolyData | None:
     if mesh.face_ids is None:
         return None
     pts = mesh.nodes if points is None else points
+    if getattr(mesh, "is_shell", False):
+        if not mesh.edges:
+            return None
+        lines = np.vstack(mesh.edges)
+        return pv.PolyData(pts.copy(), lines=np.hstack([np.full((len(lines), 1), 2), lines]).ravel())
     tris = mesh.boundary_tris
     fid = mesh.face_ids
     e = np.concatenate([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]])

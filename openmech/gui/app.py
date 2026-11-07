@@ -38,7 +38,8 @@ from .. import __version__
 from ..contact import (BEHAVIORS, CONTACT_TYPES, FORMULATIONS, INTERFACE, STATUS_JP, ContactRegion,
                        detect_contacts)
 from ..export import write_csv, write_report, write_vtu
-from ..geometry import (AXES, CAD_EXT, FEATURES, OPS, PLANES, PRIMITIVES, GeometryError, build_mesh,
+from ..geometry import (AXES, CAD_EXT, CONTROL_TYPES, FEATURES, MESH_DEFAULTS, OPS, PLANES, PRIMITIVES,
+                        GeometryError, build_mesh, mesh_quality,
                         feature_body_keys, gmsh_available, new_feature, primitive_to_features)
 from ..materials import LIBRARY, Material
 from ..project import Project
@@ -50,10 +51,11 @@ from .viewer import FIELD_EN, feature_edges, surface_polydata
 # ---------------------------------------------------------------------------- 定義
 
 BC_JP = {"fixed": "固定支持", "displacement": "変位", "force": "力", "pressure": "圧力",
-         "moment": "モーメント", "gravity": "標準地球重力"}
+         "moment": "モーメント", "gravity": "標準地球重力", "thermal": "熱条件"}
 BC_COLORS = {"fixed": "#5a4fcf", "displacement": "#e8b100", "force": "#e03131",
-             "pressure": "#d6336c", "moment": "#ae3ec9", "gravity": "#f08c00"}
-BC_UNIT = {"displacement": "mm", "force": "N", "pressure": "MPa", "moment": "N·mm", "gravity": "mm/s²"}
+             "pressure": "#d6336c", "moment": "#ae3ec9", "gravity": "#f08c00", "thermal": "#c92a2a"}
+BC_UNIT = {"displacement": "mm", "force": "N", "pressure": "MPa", "moment": "N·mm", "gravity": "mm/s²",
+           "thermal": "°C"}
 
 # 解析結果の種類（Ansys の名称に合わせる）  key = Result.fields() のキー
 RESULT_GROUPS = {
@@ -65,6 +67,8 @@ RESULT_GROUPS = {
            ("せん断応力 τxy [MPa]", "せん断応力 XY"), ("せん断応力 τyz [MPa]", "せん断応力 YZ"),
            ("せん断応力 τzx [MPa]", "せん断応力 ZX")],
     "ツール": [("安全率（降伏基準）", "安全率（応力ツール）")],
+    "ひずみ・シェル": [("相当塑性ひずみ", "相当塑性ひずみ"), ("相当応力（上面） [MPa]", "相当応力（シェル上面）"),
+                 ("相当応力（下面） [MPa]", "相当応力（シェル下面）")],
     "接触ツール": [("接触:接触状態", "接触状態"), ("接触:接触圧 [MPa]", "接触圧"), ("接触:貫通量 [mm]", "貫通量"),
                ("接触:すべり距離 [mm]", "すべり距離"), ("接触:摩擦応力 [MPa]", "摩擦応力"), ("接触:隙間 [mm]", "隙間")],
 }
@@ -402,11 +406,14 @@ class MainWindow(QMainWindow):
         R.button(g, "簡単形状", make_icon("#4a78c2", "形"), lambda: self.select_node(("geometry",)))
         g = R.add_group(t, "メッシュ")
         R.button(g, "生成", make_icon("#3a8fa8", "網"), lambda: self.remesh())
-        R.button(g, "面サイズ", make_icon("#3a8fa8", "細"), self.add_sizing)
+        mm = QMenu(self)
+        for key, lab in self._control_menu_items():
+            menu_action(mm, lab, lambda key=key: self.add_control(key))
+        R.button(g, "メッシュ制御", make_icon("#3a8fa8", "細"), menu=mm)
         g = R.add_group(t, "挿入")
         R.button(g, "支持", make_icon(BC_COLORS["fixed"], "支"), menu=self._bc_menu(["fixed", "displacement"]))
         R.button(g, "荷重", make_icon(BC_COLORS["force"], "荷"),
-                 menu=self._bc_menu(["force", "pressure", "moment", "gravity"]))
+                 menu=self._bc_menu(["force", "pressure", "moment", "gravity", "thermal"]))
         g = R.add_group(t, "出力")
         R.button(g, "レポート", make_icon("#7a5cc2", "報"), self.export_report)
         R.button(g, "VTU", make_icon("#7a5cc2", "V"), self.export_vtu)
@@ -416,6 +423,10 @@ class MainWindow(QMainWindow):
         g = R.add_group(t, "作成")
         for ft in ["box", "cylinder", "pipe", "cone", "sphere", "extrude"]:
             R.button(g, FEATURES[ft][0], make_icon(OP_COLORS["new"], FEATURES[ft][1]),
+                     lambda _=False, ft=ft: self.create_body(ft))
+        g = R.add_group(t, "サーフェス（シェル）")
+        for ft in ["plate", "sheet", "cyl_shell"]:
+            R.button(g, FEATURES[ft][0].replace("（シェル）", ""), make_icon("#0ca678", FEATURES[ft][1]),
                      lambda _=False, ft=ft: self.create_body(ft))
         g = R.add_group(t, "ブール演算")
         R.button(g, "結合", make_icon(OP_COLORS["union"], "∪"), lambda: self.boolean("union"))
@@ -453,9 +464,9 @@ class MainWindow(QMainWindow):
         t = R.add_tab("環境")
         g = R.add_group(t, "静的構造")
         R.button(g, "荷重", make_icon(BC_COLORS["force"], "荷"),
-                 menu=self._bc_menu(["force", "pressure", "moment", "gravity"]))
+                 menu=self._bc_menu(["force", "pressure", "moment", "gravity", "thermal"]))
         R.button(g, "支持", make_icon(BC_COLORS["fixed"], "支"), menu=self._bc_menu(["fixed", "displacement"]))
-        for k in ["fixed", "displacement", "force", "pressure", "moment", "gravity"]:
+        for k in ["fixed", "displacement", "force", "pressure", "moment", "gravity", "thermal"]:
             R.button(g, BC_JP[k], make_icon(BC_COLORS[k], BC_JP[k][0]), lambda _=False, k=k: self.add_bc(k))
         g = R.add_group(t, "解析")
         R.button(g, "解析", make_icon("#2e9d3a", "⚡"), self.run_solve)
@@ -520,6 +531,9 @@ class MainWindow(QMainWindow):
         h.setSpacing(2)
         self.sel_face_btn = Ribbon.button(h, "面", make_icon(SELECT_COLOR, "面"), checkable=True, big=False)
         self.sel_body_btn = Ribbon.button(h, "ボディ", make_icon("#888888", "体"), checkable=True, big=False)
+        self.sel_edge_btn = Ribbon.button(h, "辺", make_icon("#0ca678", "辺"), checkable=True, big=False)
+        self.sel_edge_btn.setToolTip("シェル（サーフェス）の辺を選びます（支持・力を辺に与えるとき）")
+        self.sel_edge_btn.clicked.connect(lambda: self.set_select_mode("edge"))
         self.sel_face_btn.setChecked(True)
         self.sel_face_btn.clicked.connect(lambda: self.set_select_mode("face"))
         self.sel_body_btn.clicked.connect(lambda: self.set_select_mode("body"))
@@ -616,6 +630,9 @@ class MainWindow(QMainWindow):
     def set_select_mode(self, mode):
         self.sel_body_btn.setChecked(mode == "body")
         self.sel_face_btn.setChecked(mode == "face")
+        self.sel_edge_btn.setChecked(mode == "edge")
+        if mode == "edge" and not getattr(self.mesh, "is_shell", False):
+            self.log("辺の選択はシェル（サーフェス）のモデルで使えます")
         if mode == "body":
             self.selected_faces = []
             self.attr_hint.setText("ボディをクリックして選び、名前を入力して［設定］")
@@ -664,7 +681,11 @@ class MainWindow(QMainWindow):
         dlg = MaterialDialog(name, None, self)
         if not dlg.exec():
             return False
-        m = dlg.material()
+        try:
+            m = dlg.material()
+        except ValueError as e:
+            QMessageBox.warning(self, "材料定数", str(e))
+            return False
         m.name = m.name or name
         self.project.materials[m.name] = m
         if m.name != name:
@@ -736,7 +757,11 @@ class MainWindow(QMainWindow):
         dlg = MaterialDialog(name, mat, self)
         if not dlg.exec():
             return
-        m = dlg.material()
+        try:
+            m = dlg.material()
+        except ValueError as e:
+            QMessageBox.warning(self, "材料定数", str(e))
+            return False
         m.name = m.name or name
         if m.name != name and name in self.project.materials:
             del self.project.materials[name]
@@ -847,12 +872,14 @@ class MainWindow(QMainWindow):
         if k == "body":
             return STATUS_OK if self.project.assignment(node[1]).get("mat") in self.project.materials else STATUS_ERROR
         if k in ("mesh", "sizing"):
-            if k == "sizing" and not self.project.local_sizes[node[1]]["faces"]:
+            ls_ = self.project.local_sizes[node[1]] if k == "sizing" else {}
+            if k == "sizing" and ls_.get("type", "sizing") in ("sizing", "refinement") and \
+                    not (ls_.get("faces") if ls_.get("scope", "faces") == "faces" else ls_.get("bodies")):
                 return STATUS_ERROR
             return STATUS_PENDING if self.mesh_dirty else STATUS_OK
         if k == "bc":
             bc = self.project.bcs[node[1]]
-            return STATUS_ERROR if (bc.kind != "gravity" and not bc.faces) else STATUS_OK
+            return STATUS_ERROR if (bc.kind not in ("gravity", "thermal") and not bc.faces) else STATUS_OK
         if k == "analysis":
             bad = any(self.status_of(("bc", i)) == STATUS_ERROR for i in range(len(self.project.bcs)))
             return STATUS_ERROR if bad or not self._has_support() else STATUS_OK
@@ -936,7 +963,8 @@ class MainWindow(QMainWindow):
         add(model, "座標系", ("coords",), "#6c7a89", "XY")
         mesh = add(model, "メッシュ", ("mesh",), "#3a8fa8", "網")
         for i, ls in enumerate(self.project.local_sizes):
-            add(mesh, f"面サイズ指定 {i + 1}", ("sizing", i), "#3a8fa8", "細")
+            add(mesh, self._control_label(i, ls), ("sizing", i), "#3a8fa8" if not ls.get("suppressed") else "#aaaaaa",
+                {"sweep": "掃", "refinement": "再", "sphere": "球"}.get(ls.get("type", "sizing"), "細"))
         an = add(model, "静的構造 (A5)", ("analysis",), "#2e6db4", "S")
         add(an, "解析設定", ("settings",), "#6c7a89", "設")
         for i, bc in enumerate(self.project.bcs):
@@ -1039,7 +1067,9 @@ class MainWindow(QMainWindow):
             menu_action(m, "解析", self.run_solve, make_icon("#2e9d3a", "⚡"))
         if k in ("mesh", "sizing"):
             menu_action(m, "メッシュを生成", lambda: self.remesh())
-            menu_action(m, "挿入 → 面サイズ指定", self.add_sizing)
+            ins = m.addMenu("挿入")
+            for key, lab in self._control_menu_items():
+                menu_action(ins, lab, lambda key=key: self.add_control(key))
         if k in ("geometry", "feature"):
             ins = m.addMenu("作成")
             for ft in ["box", "cylinder", "pipe", "cone", "sphere", "extrude"]:
@@ -1074,7 +1104,7 @@ class MainWindow(QMainWindow):
         d = self.details
         d.clear()
         k = self.current[0]
-        title = {"geometry": "ジオメトリ", "material": "材料", "mesh": "メッシュ", "sizing": "面サイズ指定",
+        title = {"geometry": "ジオメトリ", "material": "材料", "mesh": "メッシュ", "sizing": "メッシュ制御",
                  "analysis": "静的構造 (A5)", "settings": "解析設定", "solution": "解析結果 (A6)",
                  "info": "解析情報", "project": "プロジェクト", "model": "モデル (A4)", "coords": "座標系"}
         if k == "feature":
@@ -1500,10 +1530,21 @@ class MainWindow(QMainWindow):
             sp = dspin(getattr(m, attr), lo, hi, dec, step)
             sp.valueChanged.connect(lambda v, attr=attr: (setattr(m, attr, v), self.invalidate()))
             self._row(s, label, sp)
+        from ..materials import ELASTIC_MODELS, PLASTIC_MODELS
+        s2 = self._section("モデル（詳しくは［編集］で）")
+        self._row(s2, "弾性", ELASTIC_MODELS.get(m.elastic, m.elastic)
+                  + ("（温度依存 %d 点）" % len(m.temp_table) if m.elastic == "isotropic" and m.temp_table else ""))
+        if m.elastic == "orthotropic" and m.ortho:
+            o = m.ortho
+            self._row(s2, "Ex / Ey / Ez", f"{o['Ex']:g} / {o['Ey']:g} / {o['Ez']:g} MPa")
+        self._row(s2, "線膨張係数", f"{m.alpha * 1e6:g} ×10⁻⁶/°C（参照 {m.ref_temp:g}°C）")
+        self._row(s2, "塑性", PLASTIC_MODELS.get(m.plasticity, m.plasticity)
+                  + (f"（接線係数 {m.tangent_modulus:g} MPa）" if m.plasticity.startswith("bilinear") else "")
+                  + (f"（{len(m.ml_table)} 点）" if m.plasticity.startswith("multilinear") else ""))
         if self.mesh is not None:
             used = [f"B{b}" for b in self.mesh.body_ids() if self.project.assignment(b).get("mat") == name]
             self._row(self._section("使用しているボディ"), "", ", ".join(used) or "なし")
-        b = QPushButton("編集（名前変更・材料DB）…")
+        b = QPushButton("編集（弾性・温度依存・異方性・熱膨張・塑性）…")
         b.clicked.connect(lambda: self._later(lambda: self.edit_material(name)))
         self._row(self._section("操作"), "", b)
 
@@ -1520,6 +1561,18 @@ class MainWindow(QMainWindow):
             self.invalidate(mesh=True)
         sp.valueChanged.connect(setsize)
         self._row(s, "メッシュサイズ", sp)
+        s3 = self._section("材料の向き（材料座標系, X→Y→Z の順に回転）")
+        cs = list(props.get("cs") or [0, 0, 0])
+        for k, ax in enumerate("XYZ"):
+            spr = dspin(float(cs[k]), -360, 360, 2, 5, "°")
+
+            def setcs(v, k=k):
+                c = list(self.project.body_attrs.setdefault(name, {}).get("cs") or [0, 0, 0])
+                c[k] = v
+                self.project.body_attrs[name]["cs"] = c
+                self.invalidate()
+            spr.valueChanged.connect(setcs)
+            self._row(s3, f"{ax} 軸まわり", spr)
         if self.mesh is not None:
             used = [f"B{b}" for b in self.mesh.body_ids() if self.project.assignment(b).get("attr") == name]
             self._row(self._section("使用しているボディ"), "", ", ".join(used) or "なし")
@@ -1716,25 +1769,77 @@ class MainWindow(QMainWindow):
             m.name += "（変更）"
         self.invalidate()
 
+    def _ms(self, key):
+        return self.project.mesh_settings.get(key, MESH_DEFAULTS[key])
+
+    def _ms_set(self, key, v, rebuild=False):
+        self.project.mesh_settings[key] = v
+        self.invalidate(mesh=True)
+        if rebuild:
+            self._later(self.build_details)
+
     def _details_mesh(self):
+        """Ansys の「メッシュ」の詳細と同じ並び"""
         s = self._section("既定")
+        self._row(s, "物理プリファレンス", "メカニカル")
         order = QComboBox()
-        order.addItem("2次（Tet10・推奨）", 2)
+        order.addItem("プログラム制御（2次）", 2)
+        order.addItem("2次（Tet10）", 2)
         order.addItem("1次（Tet4）", 1)
-        order.setCurrentIndex(0 if self.project.mesh_order == 2 else 1)
+        order.setCurrentIndex(0 if self.project.mesh_order == 2 else 2)
         order.currentIndexChanged.connect(lambda _: self._mesh_set("order", order.currentData()))
         self._row(s, "要素次数", order)
         size = dspin(self.project.mesh_size, 0.0, 1e6, 3, 0.5, "mm")
-        size.setSpecialValueText("自動")
+        size.setSpecialValueText("既定（解像度から決定）")
         size.valueChanged.connect(lambda v: self._mesh_set("size", v))
         self._row(s, "要素サイズ", size)
+        s = self._section("サイズ調整")
+        res = QDoubleSpinBox()
+        res.setDecimals(0)
+        res.setRange(0, 7)
+        res.setValue(self._ms("resolution"))
+        res.setKeyboardTracking(False)
+        res.valueChanged.connect(lambda v: self._ms_set("resolution", int(v)))
+        self._row(s, "解像度（0 粗い 〜 7 細かい）", res)
+        gr = dspin(self._ms("growth_rate"), 1.01, 5.0, 2, 0.05)
+        gr.valueChanged.connect(lambda v: self._ms_set("growth_rate", v))
+        self._row(s, "成長率", gr)
+        self._row(s, "曲率の捕捉", self._combo([("はい", True), ("いいえ", False)], self._ms("capture_curvature"),
+                                           lambda v: self._ms_set("capture_curvature", v, True)))
+        if self._ms("capture_curvature"):
+            ang = dspin(self._ms("curvature_normal_angle"), 1.0, 90.0, 1, 5.0, "°")
+            ang.valueChanged.connect(lambda v: self._ms_set("curvature_normal_angle", v))
+            self._row(s, "曲率法線角度", ang)
+            cmin = dspin(self._ms("curvature_min_size"), 0.0, 1e6, 3, 0.1, "mm")
+            cmin.setSpecialValueText("既定（要素サイズの 5%）")
+            cmin.valueChanged.connect(lambda v: self._ms_set("curvature_min_size", v))
+            self._row(s, "曲率の最小サイズ", cmin)
+        if self.mesh is not None:
+            lo, hi = self.mesh.bounds()
+            self._row(s, "バウンディングボックスの対角", f"{np.linalg.norm(hi - lo):.4g} mm")
+        s = self._section("品質")
+        self._row(s, "スムージング", self._combo([("低", "low"), ("中", "medium"), ("高", "high")],
+                                            self._ms("smoothing"), lambda v: self._ms_set("smoothing", v)))
+        self._row(s, "形状の最適化", self._combo([("はい", True), ("いいえ", False)], self._ms("optimize"),
+                                             lambda v: self._ms_set("optimize", v)))
         b = QPushButton("メッシュを生成")
         b.clicked.connect(lambda: self.remesh())
-        self._row(s, "", b)
+        self._row(self._section("操作"), "", b)
         if self.mesh is not None:
             s2 = self._section("統計")
             self._row(s2, "節点数", f"{self.mesh.n_nodes:,}")
             self._row(s2, "要素数", f"{self.mesh.n_elems:,}")
+            if getattr(self.mesh, "is_shell", False):
+                self._row(s2, "要素", "シェル（3節点, SHELL181 相当）")
+            else:
+                self._row(s2, "要素", "2次四面体（Tet10, SOLID187 相当）" if self.mesh.order == 2 else "1次四面体（Tet4）")
+                q = getattr(self, "_mesh_q", None)
+                if q is None or q[0] is not self.mesh:
+                    q = (self.mesh, mesh_quality(self.mesh))
+                    self._mesh_q = q
+                for key in ("要素品質", "歪度", "アスペクト比"):
+                    v = q[1][key]
+                    self._row(s2, f"{key}（最小/平均/最大）", f"{v['最小']:.3f} / {v['平均']:.3f} / {v['最大']:.3f}")
             self._row(s2, "状態", "最新" if not self.mesh_dirty else "再生成が必要（⚡）")
 
     def _mesh_set(self, what, v):
@@ -1744,23 +1849,133 @@ class MainWindow(QMainWindow):
             self.project.mesh_size = v
         self.invalidate(mesh=True)
 
+    # ------------------------------------------------------------ メッシュ制御（Ansys のメッシュ制御）
+    @staticmethod
+    def _control_menu_items():
+        return [("face_sizing", "サイズ指定（面）"), ("body_sizing", "サイズ指定（ボディ）"),
+                ("sphere", "影響球サイズ"), ("refinement", "リファインメント（面）"), ("sweep", "手法：スイープ")]
+
+    def _control_label(self, i, ls):
+        t = ls.get("type", "sizing")
+        if t == "sizing":
+            sc = "ボディ" if ls.get("scope") == "bodies" else "面"
+            return f"サイズ指定（{sc}） {i + 1}: {float(ls.get('size', 0)):g} mm"
+        if t == "sphere":
+            return f"影響球サイズ {i + 1}: {float(ls.get('size', 0)):g} mm"
+        if t == "refinement":
+            return f"リファインメント {i + 1}: レベル {int(ls.get('level', 1))}"
+        if t == "sweep":
+            return f"手法：スイープ {i + 1}" + (f"（{int(ls['divs'])} 分割）" if ls.get("divs") else "")
+        return f"メッシュ制御 {i + 1}"
+
+    def add_control(self, key):
+        if key == "face_sizing":
+            ls = {"type": "sizing", "scope": "faces", "faces": list(self.selected_faces), "size": 1.0,
+                  "behavior": "soft"}
+        elif key == "body_sizing":
+            ls = {"type": "sizing", "scope": "bodies", "bodies": list(self.selected_bodies), "size": 2.0}
+        elif key == "sphere":
+            c = [0.0, 0.0, 0.0]
+            if self.mesh is not None and self.selected_faces:
+                info = {f["id"]: f for f in self.mesh.face_info()}
+                c = np.mean([info[f]["centroid"] for f in self.selected_faces], axis=0).tolist()
+            ls = {"type": "sphere", "center": c, "radius": 10.0, "size": 1.0}
+        elif key == "refinement":
+            ls = {"type": "refinement", "faces": list(self.selected_faces), "level": 1}
+        else:
+            ls = {"type": "sweep", "divs": 0, "axis": "auto"}
+        self.project.local_sizes.append(ls)
+        self.invalidate(mesh=True)
+        self.select_node(("sizing", len(self.project.local_sizes) - 1))
+
+    def add_sizing(self):
+        self.add_control("face_sizing")
+
+    def _ls_set(self, i, key, v, rebuild=False):
+        self.project.local_sizes[i][key] = v
+        self.invalidate(mesh=True)
+        if rebuild:
+            self._later(lambda: (self.rebuild_tree(), self.build_details()))
+
     def _details_sizing(self):
         i = self.current[1]
         ls = self.project.local_sizes[i]
+        t = ls.get("type", "sizing")
         s = self._section("スコープ")
-        self._scope_row(s, ls["faces"], lambda faces: self._sizing_apply(i, faces))
+        if t == "sizing" and ls.get("scope") == "bodies":
+            w = QWidget()
+            h = QHBoxLayout(w)
+            h.setContentsMargins(0, 0, 0, 0)
+            bl = ls.get("bodies", [])
+            lab = QLabel(", ".join(f"B{b}" for b in bl) if bl else "未選択")
+            if not bl:
+                lab.setStyleSheet("background:#fff3b0; padding:1px 4px;")
+            h.addWidget(lab)
+            ap = QPushButton("適用")
+
+            def _apply_b():
+                if not self.selected_bodies:
+                    QMessageBox.information(self, "ボディを選択", "ボディ選択モードでボディを選んでから「適用」を押してください。")
+                    return
+                self._ls_set(i, "bodies", list(self.selected_bodies), True)
+            ap.clicked.connect(_apply_b)
+            h.addWidget(ap)
+            h.addStretch()
+            self._row(s, "スコープ方法", "ジオメトリの選択")
+            self._row(s, "ジオメトリ", w)
+        elif t in ("sizing", "refinement"):
+            self._scope_row(s, ls.get("faces", []), lambda faces: self._ls_set(i, "faces", list(faces), True))
+        elif t == "sweep":
+            self._row(s, "ジオメトリ", "モデルのボディ（ボディが1つのモデル）")
+        else:
+            self._row(s, "ジオメトリ", "影響球の中の領域")
         s2 = self._section("定義")
-        sp = dspin(float(ls["size"]), 0.001, 1e6, 3, 0.1, "mm")
-        sp.valueChanged.connect(lambda v: self._sizing_size(i, v))
-        self._row(s2, "要素サイズ", sp)
+        sup = QCheckBox("抑制")
+        sup.setChecked(bool(ls.get("suppressed")))
+        sup.toggled.connect(lambda on: self._ls_set(i, "suppressed", on, True))
+        self._row(s2, "抑制", sup)
+        if t in ("sizing", "sphere"):
+            sp = dspin(float(ls.get("size", 1.0)), 0.001, 1e6, 3, 0.1, "mm")
+            sp.valueChanged.connect(lambda v: self._ls_set(i, "size", v))
+            self._row(s2, "要素サイズ", sp)
+        if t == "sizing" and ls.get("scope") != "bodies":
+            self._row(s2, "挙動", self._combo([("ソフト", "soft"), ("ハード", "hard")], ls.get("behavior", "soft"),
+                                             lambda v: self._ls_set(i, "behavior", v)))
+        if t == "sphere":
+            for k, ax in enumerate("XYZ"):
+                c = dspin(float(ls["center"][k]), -1e7, 1e7, 3, 1.0, "mm")
 
-    def _sizing_apply(self, i, faces):
-        self.project.local_sizes[i]["faces"] = list(faces)
-        self.invalidate(mesh=True)
-
-    def _sizing_size(self, i, v):
-        self.project.local_sizes[i]["size"] = v
-        self.invalidate(mesh=True)
+                def setc(v, k=k):
+                    ls["center"][k] = v
+                    self.invalidate(mesh=True)
+                c.valueChanged.connect(setc)
+                self._row(s2, f"中心 {ax}", c)
+            r = dspin(float(ls.get("radius", 10)), 0.001, 1e7, 3, 1.0, "mm")
+            r.valueChanged.connect(lambda v: self._ls_set(i, "radius", v))
+            self._row(s2, "球の半径", r)
+        if t == "refinement":
+            lv = QDoubleSpinBox()
+            lv.setDecimals(0)
+            lv.setRange(1, 3)
+            lv.setValue(int(ls.get("level", 1)))
+            lv.setKeyboardTracking(False)
+            lv.valueChanged.connect(lambda v: self._ls_set(i, "level", int(v), True))
+            self._row(s2, "リファインメント（1〜3）", lv)
+        if t == "sweep":
+            self._row(s2, "手法", "スイープ")
+            self._row(s2, "要素次数", "メッシュの設定に従う")
+            self._row(s2, "ソース/ターゲットの選択", self._combo(
+                [("自動（薄い方向）", "auto"), ("X 方向", "X"), ("Y 方向", "Y"), ("Z 方向", "Z")],
+                ls.get("axis", "auto"), lambda v: self._ls_set(i, "axis", v)))
+            dv = QDoubleSpinBox()
+            dv.setDecimals(0)
+            dv.setRange(0, 1000)
+            dv.setSpecialValueText("自動（要素サイズから）")
+            dv.setValue(int(ls.get("divs", 0)))
+            dv.setKeyboardTracking(False)
+            dv.valueChanged.connect(lambda v: self._ls_set(i, "divs", int(v), True))
+            self._row(s2, "スイープ分割数", dv)
+            self._row(s2, "", "断面のメッシュを掃引方向に層状に押し出します（各層は2次四面体）")
 
     def _scope_row(self, sec, faces, apply_fn):
         """Ansys と同じ「ジオメトリ: n 面 [適用] [キャンセル]」"""
@@ -1792,6 +2007,14 @@ class MainWindow(QMainWindow):
         self._row(s, "物理タイプ", "構造")
         self._row(s, "支持", "あり" if self._has_support() else "なし（固定支持を追加してください）")
         self._row(s, "荷重・支持の数", len(self.project.bcs))
+        s2 = self._section("オプション")
+        et = dspin(self.project.env_temp, -273, 1e5, 2, 1.0, "°C")
+
+        def set_env(v):
+            self.project.env_temp = v
+            self.invalidate()
+        et.valueChanged.connect(set_env)
+        self._row(s2, "環境温度", et)
 
     def _combo(self, items, current, on_change):
         c = QComboBox()
@@ -1916,7 +2139,23 @@ class MainWindow(QMainWindow):
     def _details_bc(self):
         i = self.current[1]
         bc = self.project.bcs[i]
-        if bc.kind != "gravity":
+        if bc.kind == "thermal":
+            s = self._section("スコープ")
+            w = QWidget()
+            h = QHBoxLayout(w)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.addWidget(QLabel(", ".join(f"B{b}" for b in bc.bodies) if bc.bodies else "すべてのボディ"))
+            ap = QPushButton("選択中のボディに適用")
+
+            def _apb():
+                bc.bodies = list(self.selected_bodies)
+                self.invalidate()
+                self._later(lambda: (self.build_details(), self.refresh_view()))
+            ap.clicked.connect(_apb)
+            h.addWidget(ap)
+            h.addStretch()
+            self._row(s, "ジオメトリ", w)
+        elif bc.kind != "gravity":
             s = self._section("スコープ")
             self._scope_row(s, bc.faces, lambda faces: self._bc_apply(i, faces))
         s2 = self._section("定義")
@@ -1927,7 +2166,12 @@ class MainWindow(QMainWindow):
         self._row(s2, "名前", name)
         unit = BC_UNIT.get(bc.kind, "")
         if bc.kind == "fixed":
-            self._row(s2, "拘束", "X, Y, Z 方向すべて固定")
+            self._row(s2, "拘束", "X, Y, Z 方向すべて固定" + ("（シェルは回転も固定）" if getattr(self.mesh, "is_shell", False) else ""))
+        elif bc.kind == "thermal":
+            sp = dspin(float(bc.values[0] or 0), -273, 1e5, 3, 10.0, "°C")
+            sp.valueChanged.connect(lambda v: self._bc_value(i, 0, v))
+            self._row(s2, "大きさ（温度）", sp)
+            self._row(s2, "", f"材料の物性をこの温度で評価し、熱ひずみ α(T − 参照温度) を与えます（環境温度 {self.project.env_temp:g}°C）")
         elif bc.kind == "pressure":
             self._row(s2, "定義方法", "垂直方向")
             sp = dspin(float(bc.values[0] or 0), dec=6, suffix=unit)
@@ -2067,24 +2311,23 @@ class MainWindow(QMainWindow):
 
     # ======================================================================= 追加・削除
     def add_bc(self, kind):
-        faces = [] if kind == "gravity" else list(self.selected_faces)
+        faces = [] if kind in ("gravity", "thermal") else list(self.selected_faces)
         vals = {"fixed": [0.0, 0.0, 0.0], "displacement": [0.0, None, None], "force": [0.0, 0.0, -1000.0],
-                "pressure": [1.0], "moment": [0.0, 0.0, 1000.0], "gravity": [0.0, 0.0, -9806.65]}[kind]
-        self.project.bcs.append(BC(kind, faces, vals, ""))
+                "pressure": [1.0], "moment": [0.0, 0.0, 1000.0], "gravity": [0.0, 0.0, -9806.65],
+                "thermal": [100.0]}[kind]
+        bc = BC(kind, faces, vals, "")
+        if kind == "thermal":
+            bc.bodies = list(self.selected_bodies)
+        self.project.bcs.append(bc)
         self.invalidate()
         self.select_node(("bc", len(self.project.bcs) - 1))
-        if kind != "gravity" and not faces:
+        if kind not in ("gravity", "thermal") and not faces:
             self.log(f"{BC_JP[kind]} を追加しました。面を選択して詳細の「適用」を押してください。")
 
     def add_result(self, key):
         self.project.results.append(key)
         self.rebuild_tree()
         self.select_node(("result", len(self.project.results) - 1))
-
-    def add_sizing(self):
-        self.project.local_sizes.append({"faces": list(self.selected_faces), "size": 1.0})
-        self.invalidate(mesh=True)
-        self.select_node(("sizing", len(self.project.local_sizes) - 1))
 
     def delete_current(self):
         k = self.current[0]
@@ -2217,7 +2460,7 @@ class MainWindow(QMainWindow):
             p.assign(mesh.body_ids().tolist(), mat=p.material.name)
         self.selected_bodies = [b for b in self.selected_bodies if b in set(mesh.body_ids().tolist())]
         self._fill_attr_combos()
-        if len(mesh.body_ids()) > 1:
+        if len(mesh.body_ids()) > 1 and not getattr(mesh, "is_shell", False):
             # Ansys と同じく、ボディ同士の接触を自動で作成（手動の接触は残す）
             self.auto_contacts(quiet=True)
         else:
@@ -2247,7 +2490,7 @@ class MainWindow(QMainWindow):
     def run_solve(self):
         if self.worker and self.worker.isRunning():
             return
-        bad = [b for b in self.project.bcs if b.kind != "gravity" and not b.faces]
+        bad = [b for b in self.project.bcs if b.kind not in ("gravity", "thermal") and not b.faces]
         if bad:
             QMessageBox.warning(self, "解析", "面が割り当てられていない荷重・支持があります（? マーク）。\n"
                                 "面を選択して詳細の「適用」を押してください。")
@@ -2268,17 +2511,29 @@ class MainWindow(QMainWindow):
         self.solver_log = []
         self._fail_history = None
         p = self.project
-        if p.needs_nonlinear_solver(self.mesh) and not p.contacts and len(self.mesh.body_ids()) > 1:
+        if not getattr(self.mesh, "is_shell", False) and p.needs_nonlinear_solver(self.mesh) and not p.contacts \
+                and len(self.mesh.body_ids()) > 1:
             self.auto_contacts(quiet=True)
         bad_c = [c.name for c in p.contacts if not c.suppressed and not (c.contact_faces and c.target_faces)]
         if bad_c:
             QMessageBox.warning(self, "接触", "面が割り当てられていない接触領域があります: " + ", ".join(bad_c))
             return
-        self._busy(True, "解析を実行しています…")
-        if p.needs_nonlinear_solver(self.mesh):
+        if getattr(self.mesh, "is_shell", False):
+            try:
+                p.check_shell_supported()
+            except ValueError as e:
+                QMessageBox.warning(self, "シェル", str(e))
+                return
+            from ..shell import solve_shell
+            self._busy(True, "解析を実行しています…")
+            self.worker = Worker(solve_shell, self.mesh, p.material, list(p.bcs), elem_materials=em,
+                                 n_cores=p.settings.n_cores)
+        elif p.needs_nonlinear_solver(self.mesh):
+            self._busy(True, "解析を実行しています…")
             self.worker = Worker(solve_static, self.mesh, p.material, list(p.bcs), list(p.contacts), p.settings,
                                  elem_materials=em)
         else:
+            self._busy(True, "解析を実行しています…")
             self.worker = Worker(solve, self.mesh, p.material, list(p.bcs), method=p.settings.solver_type,
                                  elem_materials=em, n_cores=p.settings.n_cores)
         self.worker.log.connect(lambda m: (self.solver_log.append(m), self.log(m)))
@@ -2357,6 +2612,20 @@ class MainWindow(QMainWindow):
                 self.set_body_selection([])
             return
         tri = self._tri_src[cell]
+        if self.sel_edge_btn.isChecked() and getattr(self.mesh, "is_shell", False):
+            lo, hi = self.mesh.bounds()
+            e = self.mesh.nearest_edge(np.array(picker.GetPickPosition()), tol=0.05 * float(np.linalg.norm(hi - lo)))
+            if e < 0:
+                if not add:
+                    self.set_selection([])
+                return
+            sel = list(self.selected_faces)
+            if add:
+                sel.remove(e) if e in sel else sel.append(e)
+            else:
+                sel = [e]
+            self.set_selection(sel)
+            return
         if self.sel_body_btn.isChecked():
             b = int(self.mesh.tri_body()[tri])
             sel = list(self.selected_bodies)
@@ -2381,6 +2650,15 @@ class MainWindow(QMainWindow):
         m = QMenu(self)
         for f in self.mesh.face_info():
             c, n = f["centroid"], f["normal"]
+            if f.get("edge"):
+                txt = (f"辺{f['id'] + 1}  長さ {f['area']:.4g} mm  中心 ({c[0]:.3g}, {c[1]:.3g}, {c[2]:.3g})")
+                a = QAction(txt, m)
+                a.setCheckable(True)
+                a.setChecked(f["id"] in self.selected_faces)
+                a.toggled.connect(lambda on, fid=f["id"]: self.set_selection(
+                    (set(self.selected_faces) | {fid}) if on else (set(self.selected_faces) - {fid})))
+                m.addAction(a)
+                continue
             txt = (f"面{f['id'] + 1}  {'平面' if f['flat'] else '曲面'}  面積 {f['area']:.4g} mm²  "
                    f"中心 ({c[0]:.3g}, {c[1]:.3g}, {c[2]:.3g})"
                    + (f"  法線 ({n[0]:.2f}, {n[1]:.2f}, {n[2]:.2f})" if f["flat"] else ""))
@@ -2428,8 +2706,12 @@ class MainWindow(QMainWindow):
         self.selected_faces = sorted(set(int(f) for f in faces))
         if self.mesh is not None and self.selected_faces:
             info = {f["id"]: f for f in self.mesh.face_info()}
-            A = sum(info[f]["area"] for f in self.selected_faces)
-            txt = f"{len(self.selected_faces)} 面を選択中　面積 = {A:.6g} mm²"
+            ne = sum(1 for f in self.selected_faces if info.get(f, {}).get("edge"))
+            A = sum(info[f]["area"] for f in self.selected_faces if f in info and not info[f].get("edge"))
+            Lsum = sum(info[f]["area"] for f in self.selected_faces if f in info and info[f].get("edge"))
+            nf = len(self.selected_faces) - ne
+            txt = (f"{nf} 面" + (f"・{ne} 辺" if ne else "") + "を選択中　"
+                   + (f"面積 = {A:.6g} mm²" if nf else "") + (f"　長さ = {Lsum:.6g} mm" if ne else ""))
             if len(self.selected_faces) == 1:
                 c = info[self.selected_faces[0]]["centroid"]
                 txt += f"　重心 = ({c[0]:.4g}, {c[1]:.4g}, {c[2]:.4g}) mm"
@@ -2504,8 +2786,19 @@ class MainWindow(QMainWindow):
             pts, labs = [], []
             for n, i in enumerate(show):
                 bc = self.project.bcs[i]
+                if bc.kind == "thermal" and k == "bc":
+                    tb = mesh.tri_body()[src]
+                    for b in (bc.bodies or mesh.body_ids().tolist()):
+                        rgb[tb == b] = 0.5 * _hex(BC_COLORS["thermal"]) + 0.5
+                is_sh = getattr(mesh, "is_shell", False)
                 for f in bc.faces:
-                    rgb[fid == f] = _hex(BC_COLORS[bc.kind])
+                    if is_sh and mesh.is_edge(f):
+                        seg = mesh.edges[f - mesh.n_surf]
+                        lines = np.hstack([np.full((len(seg), 1), 2), seg]).ravel()
+                        pl.add_mesh(pv.PolyData(mesh.nodes.copy(), lines=lines), color=BC_COLORS[bc.kind],
+                                    line_width=6, pickable=False)
+                    else:
+                        rgb[fid == f] = _hex(BC_COLORS[bc.kind])
                 L = letters(i)
                 overlay.append(f"<span style='color:{BC_COLORS[bc.kind]}'>■</span> {L}: "
                                f"{bc.name or BC_JP[bc.kind]}{self._bc_value_text(bc)}")
@@ -2515,8 +2808,16 @@ class MainWindow(QMainWindow):
                     labs.append(L)
             self._draw_bc_glyphs(show)
         elif k == "sizing":
-            for f in self.project.local_sizes[self.current[1]]["faces"]:
+            ls = self.project.local_sizes[self.current[1]]
+            for f in ls.get("faces", []):
                 rgb[fid == f] = _hex("#3a8fa8")
+            if ls.get("scope") == "bodies" and mesh.elem_body is not None:
+                tb = mesh.tri_body()[src]
+                for b in ls.get("bodies", []):
+                    rgb[tb == b] = _hex("#3a8fa8")
+            if ls.get("type") == "sphere":
+                pl.add_mesh(pv.Sphere(radius=float(ls.get("radius", 1)), center=ls.get("center", [0, 0, 0])),
+                            color="#3a8fa8", opacity=0.25, pickable=False)
         elif k in ("connections", "contacts", "contact"):
             # Ansys と同じく 接触側＝赤、ターゲット側＝青（他は半透明風の淡色）
             rgb[:] = _hex("#e6e8eb")
@@ -2561,6 +2862,11 @@ class MainWindow(QMainWindow):
                 for b in self.selected_bodies:
                     rgb[tb == b] = _hex(SELECT_COLOR)
         for f in self.selected_faces:
+            if getattr(mesh, "is_shell", False) and mesh.is_edge(f):
+                seg = mesh.edges[f - mesh.n_surf]
+                pl.add_mesh(pv.PolyData(mesh.nodes.copy(), lines=np.hstack([np.full((len(seg), 1), 2), seg]).ravel()),
+                            color=SELECT_COLOR, line_width=7, pickable=False)
+                continue
             rgb[fid == f] = _hex(SELECT_COLOR)
         poly.cell_data["rgb"] = (rgb * 255).astype(np.uint8)
         self._main_actor = pl.add_mesh(poly, scalars="rgb", rgb=True, show_edges=show_mesh,
@@ -2616,6 +2922,8 @@ class MainWindow(QMainWindow):
             return ""
         if bc.kind == "pressure":
             return f": {bc.values[0]:g} MPa"
+        if bc.kind == "thermal":
+            return f": {bc.values[0]:g} °C"
         vals = [v for v in bc.values[:3]]
         if bc.kind in ("force", "moment", "gravity"):
             mag = float(np.linalg.norm([v or 0 for v in vals]))
@@ -2624,7 +2932,7 @@ class MainWindow(QMainWindow):
 
     def _bc_anchor(self, bc):
         if not bc.faces:
-            if bc.kind == "gravity":
+            if bc.kind in ("gravity", "thermal"):
                 lo, hi = self.mesh.bounds()
                 return 0.5 * (lo + hi)
             return None
@@ -2636,6 +2944,8 @@ class MainWindow(QMainWindow):
         p = np.mean(cs, axis=0)
         m = np.isin(self.mesh.face_ids, bc.faces)
         cc = c[m]
+        if len(cc) == 0:
+            return p
         return cc[np.argmin(np.linalg.norm(cc - p, axis=1))]
 
     def _draw_bc_glyphs(self, which):
