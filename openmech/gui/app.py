@@ -1151,6 +1151,7 @@ class MainWindow(QMainWindow):
         iren.add_observer("LeftButtonReleaseEvent", self._on_release)
 
     def _on_press(self, obj, _ev):
+        self.log(f"[debug] press {obj.GetEventPosition()}")
         try:
             self._press = tuple(obj.GetEventPosition())
         except Exception:
@@ -1179,7 +1180,7 @@ class MainWindow(QMainWindow):
         picker.AddPickList(self._main_actor)
         hit = picker.Pick(pos[0], pos[1], 0, self.plotter.renderer)
         cell = picker.GetCellId() if hit else -1
-        if os.environ.get("OPENMECH_DEBUG"):
+        if True:  # TODO: 確認後に削除
             self.log(f"[debug] click {pos} hit={hit} cell={cell}")
         add = bool(QApplication.keyboardModifiers() & (Qt.ControlModifier | Qt.MetaModifier | Qt.ShiftModifier))
         if self.current[0] == "result" and self.result is not None:
