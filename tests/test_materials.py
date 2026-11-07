@@ -74,7 +74,7 @@ def test_kinematic_bauschinger():
     iso = Material("i", 200000, 0.3, 7850, 250, plasticity="bilinear_iso", tangent_modulus=2000)
     # 引張後、弾性除荷で σ が smax - 2*250 まで下がるひずみ
     ep = (0.005 - smax / 200000)
-    e_rev = ep + (smax - 2 * 250) / 200000 - 0.0002   # 逆降伏の少し手前
+    e_rev = ep + (smax - 2 * 250) / 200000 + 0.0002   # 逆降伏の少し手前
     sk = _uniaxial(kin, [0.05, e_rev * 10])
     si = _uniaxial(iso, [0.05, e_rev * 10])
     assert abs(sk[1] - si[1]) < 1e-6          # まだ弾性（両者同じ）
