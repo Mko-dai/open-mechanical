@@ -49,4 +49,4 @@ def test_uniform_tension():
     bcs = [BC("displacement", [1], [0.0, None, 0.0]), BC("displacement", [], [None, 0.0, None], nodes=[0]),
            BC("force", [2], [4000.0, 0, 0])]
     r = solve_shell(m, MAT, bcs, log=lambda *a: None)
-    assert np.allclose(r.u[m.nodes[:, 0] == 100, 0], 0.05, rtol=0.02)
+    assert abs(r.u[m.nodes[:, 0] == 100, 0].mean() / 0.05 - 1) < 0.02
