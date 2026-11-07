@@ -211,9 +211,15 @@ def hole_plate(size=5.0, hole_size=0.5):
     q = d / W
     kt = 3 - 3.14 * q + 3.667 * q**2 - 1.527 * q**3
     target = kt * F / ((W - d) * t)
-    near = np.linalg.norm(X[:, :2] - [L / 2, W / 2], axis=1) < d / 2 + 1e-6 * L
-    smax = float(r.stress[near, 0].max())
-    return m, Check("穴あき板の引張（gmsh自由メッシュ）", "穴縁 最大σx", target, smax, "MPa", "Peterson 式")
+    hn = m.face_nodes(hole)
+    sx, z = r.stress[hn, 0], X[hn, 2]
+    # 板厚方向に 10 分割し、各層での穴縁の最大 σx を平均（＝2次元平面応力解に相当する値）
+    bins = np.clip((z / t * 10).astype(int), 0, 9)
+    peak = [sx[bins == b].max() for b in range(10) if np.any(bins == b)]
+    return m, [Check("穴あき板の引張（gmsh自由メッシュ）", "穴縁 σx（板厚平均）", target, float(np.mean(peak)),
+                     "MPa", "Peterson 式（平面応力）"),
+               Check("穴あき板の引張（gmsh自由メッシュ）", "穴縁 σx（最大・3D効果込み）", target,
+                     float(sx.max()), "MPa", "参考: 板厚中央は3D効果で数%高くなる")]
 
 
 # ---------------------------------------------------------------------------- 実行
