@@ -22,7 +22,7 @@ FIELDS = {
     "HOLE": [("方向応力 X（σx）", lambda r: r.stress[:, 0], "MPa"),
              ("相当応力（ミーゼス）", lambda r: r.von_mises, "MPa")],
 }
-VIEWS = {"VMC1": "iso", "LE1": "xy", "LE10": "iso", "LAME": "xy", "HOLE": "iso"}
+VIEWS = {"VMC1": "below", "LE1": "xy", "LE10": "iso", "LAME": "xy", "HOLE": "hole"}
 
 
 def _font():
@@ -53,19 +53,34 @@ def render(mesh, values, title, unit, path, view="iso"):
     if fe is not None:
         pl.add_mesh(fe, color="black", line_width=2)
     imax, imin = used[np.argmax(vals[used])], used[np.argmin(vals[used])]
-    for i, lab, col in ((imax, f"Max {vals[imax]:.4g}", "red"), (imin, f"Min {vals[imin]:.4g}", "blue")):
-        pl.add_point_labels(mesh.nodes[[i]], [lab], font_size=22, point_color=col, point_size=14,
-                            shape_color="white", text_color="black", always_visible=True)
-    try:
-        pl.add_text(f"{title}  [{unit}]", position="upper_edge", font_size=16, color="black", font_file=font)
-    except TypeError:
-        pass
+    # 最大・最小の位置は印だけ付け、値は右上にまとめて表示（ラベルの重なりを防ぐ）
+    pl.add_points(mesh.nodes[[imax]], color="red", point_size=18, render_points_as_spheres=True)
+    pl.add_points(mesh.nodes[[imin]], color="blue", point_size=18, render_points_as_spheres=True)
+    pl.add_text(f"Max {vals[imax]:.5g} {unit}  (red)\nMin {vals[imin]:.5g} {unit}  (blue)",
+                position="upper_right", font_size=14, color="black")
     if view == "xy":
         pl.view_xy()
+        pl.reset_camera()
+        pl.camera.zoom(1.15)
+    elif view == "below":
+        lo, hi = mesh.bounds()
+        c = 0.5 * (lo + hi)
+        L = float(np.linalg.norm(hi - lo))
+        pl.camera.focal_point = c
+        pl.camera.position = c + np.array([1.0, 1.0, -0.8]) * L
+        pl.camera.up = (0, 0, -1)
+        pl.reset_camera()
+        pl.camera.zoom(1.1)
+    elif view == "hole":
+        lo, hi = mesh.bounds()
+        c = np.array([0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1]), hi[2]])
+        pl.camera.focal_point = c
+        pl.camera.position = c + np.array([-1.0, -1.2, 1.4]) * 40
+        pl.camera.up = (0, 0, 1)
     else:
         pl.view_isometric()
-    pl.reset_camera()
-    pl.camera.zoom(1.15)
+        pl.reset_camera()
+        pl.camera.zoom(1.15)
     pl.screenshot(path)
     pl.close()
 
