@@ -234,6 +234,27 @@ class MainWindow(QMainWindow):
         b = QPushButton("メッシュを作成")
         b.clicked.connect(self.make_mesh)
         lay.addWidget(b)
+        g = QGroupBox("面のサイズ指定（穴・角など応力が集中する面を細かく）")
+        gl = QVBoxLayout(g)
+        hb = QHBoxLayout()
+        self.local_size = dspin(0.5, 0.001, 1e5, 3, 0.1)
+        hb.addWidget(QLabel("サイズ [mm]"))
+        hb.addWidget(self.local_size)
+        b2 = QPushButton("選択中の面に設定")
+        b2.clicked.connect(self.add_local_size)
+        hb.addWidget(b2)
+        gl.addLayout(hb)
+        self.local_list = QListWidget()
+        self.local_list.setMaximumHeight(90)
+        gl.addWidget(self.local_list)
+        b3 = QPushButton("削除")
+        b3.clicked.connect(self.delete_local_size)
+        gl.addWidget(b3)
+        tip2 = QLabel("面は「4 境界条件」タブか3D画面の右クリックで選択してから設定します。")
+        tip2.setWordWrap(True)
+        tip2.setStyleSheet("color:#666")
+        gl.addWidget(tip2)
+        lay.addWidget(g)
         self.show_edges = QCheckBox("メッシュの線を表示")
         self.show_edges.setChecked(True)
         self.show_edges.toggled.connect(self.refresh_view)
@@ -428,11 +449,16 @@ class MainWindow(QMainWindow):
     def _set_geometry(self, spec):
         old = self.project.geometry
         self.project.geometry = spec
+        if old != spec and not self.project.bcs:
+            self.project.local_sizes = []
+            self.refresh_local_list()
         if old != spec and self.project.bcs:
             r = QMessageBox.question(self, "境界条件", "形状が変わります。設定済みの境界条件を削除しますか？")
             if r == QMessageBox.Yes:
                 self.project.bcs = []
+                self.project.local_sizes = []
                 self.refresh_bc_list()
+                self.refresh_local_list()
         self.geo_label.setText("現在の形状: " + self.project.geometry_desc())
         self.make_mesh(reset_camera=True)
 
@@ -444,7 +470,8 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         try:
             mesh = build_mesh(self.project.geometry, self.project.mesh_size, self.project.mesh_order,
-                              log=lambda m: (self.log(str(m)), QApplication.processEvents()))
+                              log=lambda m: (self.log(str(m)), QApplication.processEvents()),
+                              local_sizes=self.project.local_sizes)
         except (GeometryError, ValueError, RuntimeError) as e:
             self.on_failed(str(e))
             return
@@ -477,6 +504,27 @@ class MainWindow(QMainWindow):
         if reset_camera:
             self.plotter.view_isometric()
             self.plotter.reset_camera()
+
+    def add_local_size(self):
+        if not self.selected_faces:
+            QMessageBox.information(self, "面を選択してください",
+                                    "3D画面で面を右クリックするか、「4 境界条件」の面の一覧から選択してください。")
+            return
+        self.project.local_sizes.append({"faces": list(self.selected_faces), "size": self.local_size.value()})
+        self.refresh_local_list()
+        if QMessageBox.question(self, "メッシュ", "今すぐメッシュを作り直しますか？") == QMessageBox.Yes:
+            self.make_mesh()
+
+    def delete_local_size(self):
+        i = self.local_list.currentRow()
+        if 0 <= i < len(self.project.local_sizes):
+            del self.project.local_sizes[i]
+            self.refresh_local_list()
+
+    def refresh_local_list(self):
+        self.local_list.clear()
+        for ls in self.project.local_sizes:
+            self.local_list.addItem(", ".join(f"面{f + 1}" for f in ls["faces"]) + f"  →  {ls['size']:g} mm")
 
     # ======================================================================= 材料
     def on_material_pick(self, name):
@@ -834,6 +882,7 @@ class MainWindow(QMainWindow):
         self._set_mat_fields(p.material)
         self.geo_label.setText("現在の形状: " + p.geometry_desc())
         self.refresh_bc_list()
+        self.refresh_local_list()
 
     def new_project(self):
         self.project = Project()

@@ -183,7 +183,7 @@ def face_where(mesh, axis, value, sign, tol=1e-6):
     raise ValueError("face not found")
 
 
-def hole_plate(size=1.5):
+def hole_plate(size=5.0, hole_size=0.5):
     """穴あき板の引張（gmsh の自由四面体メッシュ＝Ansys Mechanical と同じ作り方）
 
     W=50, d=10 (d/W=0.2), t=5, 荷重 5000 N。応力集中係数（正味断面基準）は
@@ -192,8 +192,12 @@ def hole_plate(size=1.5):
     from .geometry import build_mesh
     L, W, t, d, F = 200.0, 50.0, 5.0, 10.0, 5000.0
     mat = Material("steel", 200000.0, 0.3, 7850.0)
-    m = build_mesh({"kind": "plate_hole", "lx": L, "ly": W, "t": t, "d": d}, size=size, order=2,
-                   log=lambda *a: None)
+    spec = {"kind": "plate_hole", "lx": L, "ly": W, "t": t, "d": d}
+    # 穴の面を見つけて、そこだけ細かくする（Ansys の面サイズ指定と同じ使い方）
+    m0 = build_mesh(spec, size=size, order=1, log=lambda *a: None)
+    hole = [f["id"] for f in m0.face_info() if not f["flat"]]
+    m = build_mesh(spec, size=size, order=2, log=lambda *a: None,
+                   local_sizes=[{"faces": hole, "size": hole_size}])
     x0, x1 = face_where(m, 0, 0.0, -1), face_where(m, 0, L, +1)
     # 左端は x 方向のみ拘束（ポアソン収縮を妨げない）、剛体運動は最小限の拘束で止める
     X = m.nodes
@@ -227,7 +231,7 @@ def run_all(level="normal"):
     ]
     from .geometry import gmsh_available
     if gmsh_available():
-        cases.append(lambda: hole_plate({"coarse": 2.5, "normal": 1.25, "fine": 0.6}[level]))
+        cases.append(lambda: hole_plate(5.0, {"coarse": 1.0, "normal": 0.5, "fine": 0.25}[level]))
     for f in cases:
         t0 = time.time()
         m, chk = f()

@@ -201,8 +201,38 @@ def _extract_mesh(gmsh) -> Mesh:
     return mesh
 
 
+def _apply_local_sizes(gmsh, h, local_sizes):
+    """面ごとのメッシュサイズ（Ansys の「面サイズ指定」相当）。
+
+    local_sizes: [{"faces": [面番号...], "size": mm}, ...]  面番号は本ソフトの面番号（0始まり）
+    指定面から離れるにつれて全体サイズ h へなめらかに大きくなります。
+    """
+    surfs = [t for _, t in sorted(gmsh.model.getEntities(2), key=lambda e: e[1])]
+    fields = []
+    for ls in local_sizes:
+        tags = [surfs[f] for f in ls.get("faces", []) if 0 <= f < len(surfs)]
+        hs = float(ls.get("size", 0))
+        if not tags or hs <= 0:
+            continue
+        fd = gmsh.model.mesh.field.add("Distance")
+        gmsh.model.mesh.field.setNumbers(fd, "SurfacesList", tags)
+        gmsh.model.mesh.field.setNumber(fd, "Sampling", 40)
+        ft = gmsh.model.mesh.field.add("Threshold")
+        gmsh.model.mesh.field.setNumber(ft, "InField", fd)
+        gmsh.model.mesh.field.setNumber(ft, "SizeMin", hs)
+        gmsh.model.mesh.field.setNumber(ft, "SizeMax", h)
+        gmsh.model.mesh.field.setNumber(ft, "DistMin", 0.0)
+        gmsh.model.mesh.field.setNumber(ft, "DistMax", max(h - hs, 0.0) * 4.0)  # 成長率 約1.25
+        fields.append(ft)
+    if fields:
+        fm = gmsh.model.mesh.field.add("Min")
+        gmsh.model.mesh.field.setNumbers(fm, "FieldsList", fields)
+        gmsh.model.mesh.field.setAsBackgroundMesh(fm)
+        gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+
+
 def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 12,
-               log=print) -> Mesh:
+               log=print, local_sizes: list | None = None) -> Mesh:
     """形状 spec からメッシュを作る。
 
     spec 例: {"kind": "box", "lx": 100, "ly": 20, "lz": 10}
@@ -249,6 +279,10 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
         gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", curvature)
         gmsh.option.setNumber("Mesh.Algorithm3D", 10)  # HXT（並列・高速）
         gmsh.option.setNumber("Mesh.Optimize", 1)
+        if local_sizes:
+            _apply_local_sizes(gmsh, h, local_sizes)
+            gmsh.option.setNumber("Mesh.MeshSizeMin", min([h * 0.05] + [float(x["size"]) * 0.5
+                                                                         for x in local_sizes]))
         gmsh.model.mesh.generate(3)
         if order == 2:
             gmsh.option.setNumber("Mesh.SecondOrderLinear", 0)  # 曲面に沿わせる

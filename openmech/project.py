@@ -21,6 +21,7 @@ class Project:
     material: Material = field(default_factory=lambda: LIBRARY[DEFAULT])
     bcs: list[BC] = field(default_factory=list)
     title: str = "構造解析"
+    local_sizes: list = field(default_factory=list)  # [{"faces": [...], "size": mm}]
 
     def geometry_desc(self) -> str:
         g = self.geometry
@@ -31,7 +32,8 @@ class Project:
 
     def to_dict(self):
         return {"version": 1, "title": self.title, "geometry": self.geometry,
-                "mesh": {"size": self.mesh_size, "order": self.mesh_order},
+                "mesh": {"size": self.mesh_size, "order": self.mesh_order,
+                         "local_sizes": self.local_sizes},
                 "material": self.material.to_dict(),
                 "bcs": [b.to_dict() for b in self.bcs]}
 
@@ -41,7 +43,8 @@ class Project:
                        mesh_order=d.get("mesh", {}).get("order", 2),
                        material=Material.from_dict(d["material"]),
                        bcs=[BC.from_dict(b) for b in d.get("bcs", [])],
-                       title=d.get("title", "構造解析"))
+                       title=d.get("title", "構造解析"),
+                       local_sizes=d.get("mesh", {}).get("local_sizes", []))
 
     def save(self, path):
         with open(path, "w", encoding="utf-8") as f:
@@ -53,7 +56,8 @@ class Project:
             return Project.from_dict(json.load(f))
 
     def mesh(self, log=print):
-        return build_mesh(self.geometry, self.mesh_size, self.mesh_order, log=log)
+        return build_mesh(self.geometry, self.mesh_size, self.mesh_order, log=log,
+                          local_sizes=self.local_sizes)
 
     def run(self, mesh=None, log=print, progress=None):
         mesh = mesh if mesh is not None else self.mesh(log=log)

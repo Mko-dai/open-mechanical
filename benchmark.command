@@ -3,6 +3,6 @@
 cd "$(dirname "$0")"
 mkdir -p logs
 source .venv/bin/activate
-python -m openmech.benchmarks --converge 2>&1 | tee logs/benchmark.txt
+python -u -m openmech.benchmarks --converge 2>&1 | tee logs/benchmark.txt
 echo ""
 echo "結果は logs/benchmark.txt に保存しました。"
