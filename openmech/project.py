@@ -152,7 +152,9 @@ class Project:
 
     def needs_nonlinear_solver(self, mesh) -> bool:
         s = self.settings
-        multi = mesh is not None and mesh.elem_body is not None and len(mesh.body_ids()) > 1
+        # ボディ同士が節点を共有していない（＝接触でつなぐ必要がある）かどうか
+        multi = (mesh is not None and getattr(mesh, "node_origin", None) is not None
+                 and len(np.unique(mesh.node_origin)) < mesh.n_nodes)
         return bool(self.contacts or multi or s.large_deflection or s.n_steps > 1 or s.weak_springs
                     or any(b.step_factors for b in self.bcs))
 
