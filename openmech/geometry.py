@@ -508,8 +508,8 @@ def _halfspace(occ, bodies_tags, axis, c, positive=True):
 def _edge_filter(gmsh, f, vol_tags):
     """丸み付け・面取りの対象の辺（方向と範囲で絞り込み）"""
     gmsh.model.occ.synchronize()
-    curves = sorted({abs(c[1]) for c in gmsh.model.getBoundary(vol_tags, combined=False, oriented=False,
-                                                                 recursive=True) if c[0] == 1})
+    surfs = gmsh.model.getBoundary(vol_tags, combined=False, oriented=False)
+    curves = sorted({abs(c[1]) for c in gmsh.model.getBoundary(surfs, combined=False, oriented=False) if c[0] == 1})
     kind = str(f.get("edges", "すべての辺"))
     box = [float(f.get(k, d)) for k, d in (("x0", -1e6), ("y0", -1e6), ("z0", -1e6),
                                            ("x1", 1e6), ("y1", 1e6), ("z1", 1e6))]
