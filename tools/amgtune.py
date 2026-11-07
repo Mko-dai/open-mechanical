@@ -20,11 +20,11 @@ def system(m, bcs):
 
 from openmech.amg import ChebyshevAMG
 cfgs = {
- "A pyamg標準":        dict(bsr=False, kw=dict(strength="symmetric")),
- "L cheb3 mc3000":     dict(bsr=False, cheb=3, kw=dict(strength="symmetric", max_coarse=3000)),
- "M cheb2 mc3000":     dict(bsr=False, cheb=2, kw=dict(strength="symmetric", max_coarse=3000)),
- "N cheb4 mc3000":     dict(bsr=False, cheb=4, kw=dict(strength="symmetric", max_coarse=3000)),
- "O cheb3 mc1000":     dict(bsr=False, cheb=3, kw=dict(strength="symmetric", max_coarse=1000)),
+ "L cheb3":              dict(bsr=False, cheb=3, kw=dict(strength="symmetric", max_coarse=3000)),
+ "P cheb3 noimprove":    dict(bsr=False, cheb=3, kw=dict(strength="symmetric", max_coarse=3000, improve_candidates=None)),
+ "Q cheb3 noimp bsr":    dict(bsr=True, cheb=3, kw=dict(strength="symmetric", max_coarse=3000, improve_candidates=None)),
+ "R cheb3 unsmoothed":   dict(bsr=False, cheb=3, kw=dict(strength="symmetric", max_coarse=3000, improve_candidates=None, smooth=None)),
+ "S cheb3 noimp mc8000": dict(bsr=False, cheb=3, kw=dict(strength="symmetric", max_coarse=8000, improve_candidates=None)),
 }
 for name, fn, n in [("片持ち梁", cantilever, 40), ("立方体", block, 18), ("立方体", block, 26)]:
     m, bcs = fn(n)
