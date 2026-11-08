@@ -1169,12 +1169,12 @@ def _proximity_points(gmsh, h, cells, pmin):
     """表面メッシュから板厚・すき間を測り、(点, 要素サイズ) を返す（Ansys の近接の捕捉と同じ考え方）。
 
     各表面三角形の重心から法線の両向きに光線を飛ばし、最初に当たる別の三角形までの距離を板厚（すき間）とする。
-    サイズ = 板厚 / cells（pmin 以上 h 未満のところだけ返す）。
+    サイズ = 板厚 / cells（pmin 以上 h 未満のところだけ返す）。返り値 (重心, サイズ, 三角形の外接半径)
     """
     from scipy.spatial import cKDTree
     ntags, xyz, _ = gmsh.model.mesh.getNodes()
     if len(ntags) == 0:
-        return np.zeros((0, 3)), np.zeros(0)
+        return np.zeros((0, 3)), np.zeros(0), np.zeros(0)
     P = np.asarray(xyz).reshape(-1, 3)
     idx = np.zeros(int(np.max(ntags)) + 1, dtype=np.int64)
     idx[np.asarray(ntags, dtype=np.int64)] = np.arange(len(ntags))
@@ -1185,7 +1185,7 @@ def _proximity_points(gmsh, h, cells, pmin):
             if int(t) == 2:
                 tris.append(idx[np.asarray(en, dtype=np.int64).reshape(-1, 3)])
     if not tris:
-        return np.zeros((0, 3)), np.zeros(0)
+        return np.zeros((0, 3)), np.zeros(0), np.zeros(0)
     T = np.concatenate(tris)
     A, B, C = P[T[:, 0]], P[T[:, 1]], P[T[:, 2]]
     cen = (A + B + C) / 3
@@ -1235,7 +1235,7 @@ def _proximity_points(gmsh, h, cells, pmin):
     sel = np.isfinite(thick)
     size = np.clip(thick[sel] / cells, pmin, None)
     keep = size < 0.99 * h
-    return cen[sel][keep], size[keep]
+    return cen[sel][keep], size[keep], tri_r[sel][keep]
 
 
 def _apply_proximity(gmsh, h, ms, log):
@@ -1244,19 +1244,36 @@ def _apply_proximity(gmsh, h, ms, log):
     cells = max(1, int(ms.get("proximity_cells", 3)))
     pmin = float(ms.get("proximity_min_size") or 0) or float(ms.get("curvature_min_size") or 0) or h * 0.05
     gmsh.model.mesh.generate(2)
-    pts, size = _proximity_points(gmsh, h, cells, pmin)
+    pts, size, rad = _proximity_points(gmsh, h, cells, pmin)
     gmsh.model.mesh.clear()
     if not len(pts):
         log("近接の捕捉: 薄い部分・狭いすき間は見つかりませんでした")
         return None
     g = max(1.05, float(ms.get("growth_rate", 1.5)))
     tree = cKDTree(pts)
-    k = min(16, len(pts))
+    # 要素サイズを格子に前計算しておき、コールバックでは格子を引くだけにする（gmsh は点ごとに呼ぶので速さが大事）
+    lo = np.asarray(gmsh.model.getBoundingBox(-1, -1)[:3]) - h
+    hi = np.asarray(gmsh.model.getBoundingBox(-1, -1)[3:]) + h
+    ext = hi - lo
+    dx = max(float(size.min()), float(np.prod(ext) / 4e6) ** (1 / 3))
+    n = np.maximum(2, np.ceil(ext / dx).astype(int) + 1)
+    ax = [np.linspace(lo[i], hi[i], n[i]) for i in range(3)]
+    G = np.stack(np.meshgrid(*ax, indexing="ij"), -1).reshape(-1, 3)
+    kk = min(8, len(pts))
+    grid = np.full(len(G), h)
+    for c0 in range(0, len(G), 500000):
+        dist, ii = tree.query(G[c0:c0 + 500000], k=kk)
+        dist, ii = dist.reshape(len(dist), -1), ii.reshape(len(ii), -1)
+        # 各点は自分の三角形の範囲（外接半径）を覆う。その外側では成長率で大きくなる
+        grid[c0:c0 + 500000] = np.min(size[ii] + (g - 1.0) * np.maximum(dist - rad[ii], 0.0), axis=1)
+    grid = np.clip(grid, pmin, h).reshape(n)
+    step = ext / (n - 1)
 
     def cb(dim, tag, x, y, z, lc):
-        dist, ii = tree.query((x, y, z), k=k)
-        val = float(np.min(np.atleast_1d(size[ii]) + (g - 1.0) * np.atleast_1d(dist)))
-        return min(lc, max(val, pmin))
+        i = min(max(int(round((x - lo[0]) / step[0])), 0), n[0] - 1)
+        j = min(max(int(round((y - lo[1]) / step[1])), 0), n[1] - 1)
+        k = min(max(int(round((z - lo[2]) / step[2])), 0), n[2] - 1)
+        return min(lc, float(grid[i, j, k]))
     gmsh.model.mesh.setSizeCallback(cb)
     log(f"近接の捕捉: 薄い部分・すき間 {len(pts):,} か所（最小 {float(size.min()):.3g} mm、すき間に {cells} 要素）")
     return float(size.min())

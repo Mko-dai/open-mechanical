@@ -26,10 +26,10 @@ def _fake(m):
 
 
 def test_thin_plate_detected():
-    pts, size = _proximity_points(_fake(structured_box(100, 50, 0.8, 17, 8, 1)), 6.0, 3, 0.05)
+    pts, size, _ = _proximity_points(_fake(structured_box(100, 50, 0.8, 17, 8, 1)), 6.0, 3, 0.05)
     assert len(pts) > 0 and np.allclose(size, 0.8 / 3)
 
 
 def test_thick_block_untouched():
-    pts, _ = _proximity_points(_fake(structured_box(100, 50, 40, 10, 5, 4)), 6.0, 3, 0.05)
+    pts, _, _ = _proximity_points(_fake(structured_box(100, 50, 40, 10, 5, 4)), 6.0, 3, 0.05)
     assert len(pts) == 0
