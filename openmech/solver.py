@@ -721,9 +721,10 @@ def _linear_solve(A: sp.csc_matrix, b: np.ndarray, log=print, coords=None,
             t1 = time.time()
             xsol, info, it = _pcg(A.tocsr(), b, M, tol=1e-10, maxiter=400)
             t2 = time.time()
-            if info == 0 and _rel_res(A, xsol, b) < 1e-8:
+            rr = _rel_res(A, xsol, b)
+            if rr < 1e-8 or (info == 0 and rr < 1e-6):   # 条件数が大きいと真の残差は 1e-8 まで下がらないことがある
                 log(f"  反復回数 {it}（AMG 準備 {t1 - t0:.1f} s / 反復 {t2 - t1:.1f} s / 階層 "
-                    + " → ".join(f"{L.A.shape[0]:,}" for L in M.levels) + f" → {M.coarse_n:,}）")
+                    + " → ".join(f"{L.A.shape[0]:,}" for L in M.levels) + f" → {M.coarse_n:,} / 相対残差 {rr:.1e}）")
                 return xsol
             # 収束が遅い（剛性差の大きい材料・薄い層など）→ 頑健な AMG に作り直して続きから解く
             log(f"  {it} 回で収束しないため、頑健な AMG（平滑化集約）に切り替えます")
@@ -731,8 +732,14 @@ def _linear_solve(A: sp.csc_matrix, b: np.ndarray, log=print, coords=None,
             M = build_amg(A, B, comps=coords[:, 3].astype(int) if coords is not None else None, robust=True)
             t3 = time.time()
             xsol, info, it2 = _pcg(A.tocsr(), b, M, tol=1e-10, maxiter=3000, x0=xsol)
-            if info == 0 and _rel_res(A, xsol, b) < 1e-8:
-                log(f"  反復回数 {it} + {it2}（頑健 AMG 準備 {t3 - t2:.1f} s / 反復 {time.time() - t3:.1f} s）")
+            rr = _rel_res(A, xsol, b)
+            if rr < 1e-6:
+                log(f"  反復回数 {it} + {it2}（頑健 AMG 準備 {t3 - t2:.1f} s / 反復 {time.time() - t3:.1f} s / "
+                    f"相対残差 {rr:.1e}）")
+                return xsol
+            if n > 300_000:
+                log(f"⚠ 反復法の相対残差が {rr:.1e} までしか下がりませんでした。自由度が大きく直接法はメモリ不足になるため、"
+                    "この解を使います（拘束不足・浮いた部品がないか確認してください）")
                 return xsol
             log("反復法が収束しなかったため直接法に切り替えます")
         except ImportError:
