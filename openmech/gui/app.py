@@ -2624,6 +2624,17 @@ class MainWindow(QMainWindow):
             cmin.setSpecialValueText("既定（要素サイズの 5%）")
             cmin.valueChanged.connect(lambda v: self._ms_set("curvature_min_size", v))
             self._row(s, "曲率の最小サイズ", cmin)
+        self._row(s, "近接の捕捉", self._combo([("はい", True), ("いいえ", False)], self._ms("capture_proximity"),
+                                           lambda v: self._ms_set("capture_proximity", v, True)))
+        if self._ms("capture_proximity"):
+            nc = dspin(float(self._ms("proximity_cells")), 1, 10, 0, 1)
+            nc.valueChanged.connect(lambda v: self._ms_set("proximity_cells", int(v)))
+            self._row(s, "すき間を横切る要素数", nc)
+            pm = dspin(self._ms("proximity_min_size"), 0.0, 1e6, 3, 0.1, "mm")
+            pm.setSpecialValueText("既定（曲率の最小サイズ）")
+            pm.valueChanged.connect(lambda v: self._ms_set("proximity_min_size", v))
+            self._row(s, "近接の最小サイズ", pm)
+            self._row(s, "", "薄肉や狭いすき間を見つけて、板厚方向にこの数の要素が入るよう細かくします（Ansys の近接の捕捉）")
         if self.mesh is not None:
             lo, hi = self.mesh.bounds()
             self._row(s, "バウンディングボックスの対角", f"{np.linalg.norm(hi - lo):.4g} mm")

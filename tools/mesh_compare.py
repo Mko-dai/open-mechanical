@@ -167,25 +167,31 @@ def render(mesh, eq, path_base):
     return out
 
 
-def run(n):
+VARIANTS = {"既定": {}, "近接の捕捉": {"capture_proximity": True, "proximity_cells": 3}}
+SKIP = {(5, "近接の捕捉")}      # 0.17 mm の層が多い iPhone は近接の捕捉だと数百万要素になるため省く
+
+
+def run(n, variant="既定"):
     res = MODELS[n]()
     name, feats, size = res[:3]
     share = res[3] if len(res) > 3 else None
     spec = {"kind": "model", "features": feats}
-    step = os.path.join(OUT, f"model{n}.step")
+    tag = f"model{n}" + ("" if variant == "既定" else "_prox")
+    step = os.path.join(OUT, f"model{n}.step") if variant == "既定" else None
     logs = []
     t0 = time.time()
     try:
-        mesh = build_mesh(spec, size, 2, log=lambda m: logs.append(str(m)), share=share, step_out=step)
+        mesh = build_mesh(spec, size, 2, log=lambda m: logs.append(str(m)), share=share, step_out=step,
+                          settings=VARIANTS[variant])
     except Exception as e:  # noqa: BLE001
         return {"名前": name, "エラー": str(e), "ログ": logs[-5:]}
     s, skew, eq = stats(mesh, time.time() - t0, getattr(mesh, "fix_log", []))
     s["名前"] = name
     s["要素サイズ [mm]"] = size if size else "自動"
-    s["画像"] = render(mesh, eq, os.path.join(OUT, f"model{n}"))
-    s["STEP"] = os.path.basename(step)
-    s["ログ"] = logs[-4:]
-    np.savez_compressed(os.path.join(OUT, f"model{n}_q.npz"), skew=skew.astype(np.float32), eq=eq.astype(np.float32))
+    s["画像"] = render(mesh, eq, os.path.join(OUT, tag))
+    s["STEP"] = f"model{n}.step"
+    s["ログ"] = logs[-5:]
+    np.savez_compressed(os.path.join(OUT, f"{tag}_q.npz"), skew=skew.astype(np.float32), eq=eq.astype(np.float32))
     return s
 
 
@@ -194,19 +200,25 @@ if __name__ == "__main__":
     path = os.path.join(OUT, "summary.json")
     allres = json.load(open(path)) if os.path.exists(path) else {}
     for n in todo:
-        print(f"--- モデル {n} ---", flush=True)
-        r = run(n)
-        allres[str(n)] = r
-        if "エラー" in r:
-            print(f"{r['名前']}: エラー {r['エラー']}", flush=True)
-        else:
-            print(f"{r['名前']}: 要素 {r['要素数']:,} / 節点 {r['節点数']:,} / {r['メッシュ時間 [s]']} s", flush=True)
-            print(f"  要素品質 最小 {r['要素品質']['最小']:.3f} 平均 {r['要素品質']['平均']:.3f} / 歪度 最大 "
-                  f"{r['歪度']['最大']:.3f} 平均 {r['歪度']['平均']:.3f} / アスペクト比 最大 {r['アスペクト比']['最大']:.1f}"
-                  f" / ヤコビアン比 最小 {r['ヤコビアン比']['最小']:.3f}", flush=True)
-            print("  歪度の区分 [%]: " + " ".join(f"{k} {v:.2f}" for k, v in r["歪度の区分 [%]"].items()), flush=True)
-            for m in r["自動修正"]:
-                print("  自動修正: " + m, flush=True)
-        with open(path, "w") as f:
-            json.dump(allres, f, ensure_ascii=False, indent=1)
+        for variant in VARIANTS:
+            if (n, variant) in SKIP:
+                continue
+            print(f"--- モデル {n}（{variant}） ---", flush=True)
+            r = run(n, variant)
+            allres.setdefault(str(n), {})
+            if "名前" in allres[str(n)]:
+                allres[str(n)] = {}
+            allres[str(n)][variant] = r
+            if "エラー" in r:
+                print(f"{r['名前']}: エラー {r['エラー']}", flush=True)
+            else:
+                print(f"{r['名前']}: 要素 {r['要素数']:,} / 節点 {r['節点数']:,} / {r['メッシュ時間 [s]']} s", flush=True)
+                print(f"  要素品質 最小 {r['要素品質']['最小']:.3f} 平均 {r['要素品質']['平均']:.3f} / 歪度 最大 "
+                      f"{r['歪度']['最大']:.3f} 平均 {r['歪度']['平均']:.3f} / アスペクト比 最大 {r['アスペクト比']['最大']:.1f}"
+                      f" / ヤコビアン比 最小 {r['ヤコビアン比']['最小']:.3f}", flush=True)
+                print("  歪度の区分 [%]: " + " ".join(f"{k} {v:.2f}" for k, v in r["歪度の区分 [%]"].items()), flush=True)
+                for m in r["自動修正"]:
+                    print("  自動修正: " + m, flush=True)
+            with open(path, "w") as f:
+                json.dump(allres, f, ensure_ascii=False, indent=1)
     print("完了", flush=True)

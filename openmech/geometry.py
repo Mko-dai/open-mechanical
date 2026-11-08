@@ -902,6 +902,10 @@ MESH_DEFAULTS = {
     "optimize": True,             # 要素形状の最適化
     "auto_fix": True,             # 品質の悪い要素を自動修正
     "min_quality": 0.05,          # 自動修正の目標: 要素品質の下限（Ansys の要素品質と同じ定義）
+    # 近接の捕捉（Ansys の Capture Proximity）: 薄肉・狭いすき間に指定の要素数が入るよう要素を小さくする
+    "capture_proximity": False,
+    "proximity_cells": 3,         # すき間（板厚）を横切る要素数（Ansys の Num Cells Across Gap、既定 3）
+    "proximity_min_size": 0.0,    # 近接の最小サイズ [mm]（0 = 曲率の最小サイズと同じ）
 }
 
 CONTROL_TYPES = {"sizing": "サイズ指定", "refinement": "リファインメント", "sweep": "手法：スイープ",
@@ -1161,6 +1165,103 @@ def straighten_bad_tet10(mesh, limit=0.2, log=print, rounds=4) -> int:
     return fixed
 
 
+def _proximity_points(gmsh, h, cells, pmin):
+    """表面メッシュから板厚・すき間を測り、(点, 要素サイズ) を返す（Ansys の近接の捕捉と同じ考え方）。
+
+    各表面三角形の重心から法線の両向きに光線を飛ばし、最初に当たる別の三角形までの距離を板厚（すき間）とする。
+    サイズ = 板厚 / cells（pmin 以上 h 未満のところだけ返す）。
+    """
+    from scipy.spatial import cKDTree
+    ntags, xyz, _ = gmsh.model.mesh.getNodes()
+    if len(ntags) == 0:
+        return np.zeros((0, 3)), np.zeros(0)
+    P = np.asarray(xyz).reshape(-1, 3)
+    idx = np.zeros(int(np.max(ntags)) + 1, dtype=np.int64)
+    idx[np.asarray(ntags, dtype=np.int64)] = np.arange(len(ntags))
+    tris = []
+    for _, tag in gmsh.model.getEntities(2):
+        ets, _, enodes = gmsh.model.mesh.getElements(2, tag)
+        for t, en in zip(ets, enodes):
+            if int(t) == 2:
+                tris.append(idx[np.asarray(en, dtype=np.int64).reshape(-1, 3)])
+    if not tris:
+        return np.zeros((0, 3)), np.zeros(0)
+    T = np.concatenate(tris)
+    A, B, C = P[T[:, 0]], P[T[:, 1]], P[T[:, 2]]
+    cen = (A + B + C) / 3
+    nrm = np.cross(B - A, C - A)
+    area2 = np.linalg.norm(nrm, axis=1)
+    ok = area2 > 0
+    nrm[ok] /= area2[ok, None]
+    tri_r = np.max(np.linalg.norm(np.stack([A, B, C], 1) - cen[:, None], axis=2), axis=1)
+    R = cells * h                        # これより広いすき間はサイズが h 以上になるので見なくてよい
+    tree = cKDTree(cen)
+    rad = R + 2 * float(tri_r.max())
+    thick = np.full(len(T), np.inf)
+    chunk = 4000
+    for c0 in range(0, len(T), chunk):
+        q = np.arange(c0, min(c0 + chunk, len(T)))
+        lists = tree.query_ball_point(cen[q], rad)
+        lens = np.fromiter((len(x) for x in lists), dtype=np.int64, count=len(q))
+        if lens.sum() == 0:
+            continue
+        i = np.repeat(q, lens)
+        j = np.fromiter((v for x in lists for v in x), dtype=np.int64, count=int(lens.sum()))
+        # 頂点を共有する三角形（隣どうし・自分自身）は除く
+        share = np.zeros(len(i), bool)
+        for a in range(3):
+            for b in range(3):
+                share |= T[i, a] == T[j, b]
+        i, j = i[~share], j[~share]
+        if not len(i):
+            continue
+        # 光線 o + t·d（d = 三角形 i の法線、両向き）と三角形 j の交差（Möller–Trumbore）
+        o, d = cen[i], nrm[i]
+        e1, e2 = B[j] - A[j], C[j] - A[j]
+        pv = np.cross(d, e2)
+        det = np.einsum("ij,ij->i", e1, pv)
+        good = np.abs(det) > 1e-14
+        inv = np.where(good, 1.0 / np.where(good, det, 1.0), 0.0)
+        tv = o - A[j]
+        u = np.einsum("ij,ij->i", tv, pv) * inv
+        qv = np.cross(tv, e1)
+        v = np.einsum("ij,ij->i", d, qv) * inv
+        t = np.abs(np.einsum("ij,ij->i", e2, qv) * inv)
+        hit = good & (u >= -1e-9) & (v >= -1e-9) & (u + v <= 1 + 1e-9) & (t > 1e-6 * h) & (t < R)
+        # 向かい合う面だけ（法線がほぼ平行）: 斜めに当たる面（角の近く）は板厚ではない
+        hit &= np.abs(np.einsum("ij,ij->i", nrm[i], nrm[j])) > 0.7
+        if hit.any():
+            np.minimum.at(thick, i[hit], t[hit])
+    sel = np.isfinite(thick)
+    size = np.clip(thick[sel] / cells, pmin, None)
+    keep = size < 0.99 * h
+    return cen[sel][keep], size[keep]
+
+
+def _apply_proximity(gmsh, h, ms, log):
+    """近接の捕捉: 表面を一度粗く切って板厚を測り、要素サイズの関数（コールバック）を付けて切り直す"""
+    from scipy.spatial import cKDTree
+    cells = max(1, int(ms.get("proximity_cells", 3)))
+    pmin = float(ms.get("proximity_min_size") or 0) or float(ms.get("curvature_min_size") or 0) or h * 0.05
+    gmsh.model.mesh.generate(2)
+    pts, size = _proximity_points(gmsh, h, cells, pmin)
+    gmsh.model.mesh.clear()
+    if not len(pts):
+        log("近接の捕捉: 薄い部分・狭いすき間は見つかりませんでした")
+        return None
+    g = max(1.05, float(ms.get("growth_rate", 1.5)))
+    tree = cKDTree(pts)
+    k = min(16, len(pts))
+
+    def cb(dim, tag, x, y, z, lc):
+        dist, ii = tree.query((x, y, z), k=k)
+        val = float(np.min(np.atleast_1d(size[ii]) + (g - 1.0) * np.atleast_1d(dist)))
+        return min(lc, max(val, pmin))
+    gmsh.model.mesh.setSizeCallback(cb)
+    log(f"近接の捕捉: 薄い部分・すき間 {len(pts):,} か所（最小 {float(size.min()):.3g} mm、すき間に {cells} 要素）")
+    return float(size.min())
+
+
 def _gmsh_quality_fix(gmsh, qmin, log):
     """gmsh の要素品質（γ）を見て、悪ければ最適化を重ねがけ。返り値 (修正前の不良数, 修正後の不良数)"""
     def count_bad():
@@ -1282,6 +1383,10 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
         if sweeps:
             mesh = _sweep_mesh(gmsh, sweeps[-1], order, h, log)
         else:
+            if ms.get("capture_proximity"):
+                pm = _apply_proximity(gmsh, h, ms, log)
+                if pm is not None:
+                    gmsh.option.setNumber("Mesh.MeshSizeMin", min(gmsh.option.getNumber("Mesh.MeshSizeMin"), pm))
             gmsh.model.mesh.generate(3)
             if ms.get("auto_fix", True):
                 n0, n1, w0, w1 = _gmsh_quality_fix(gmsh, float(ms.get("min_quality", 0.05)), log)
