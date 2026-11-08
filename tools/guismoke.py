@@ -49,7 +49,41 @@ def sel(bodies):
     w.selected_bodies = list(bodies)
 
 
-step("直方体", lambda: w.create_body("box"))
+def w2d(p):
+    ren = w.plotter.renderer
+    ren.SetWorldPoint(*p, 1.0)
+    ren.WorldToDisplay()
+    x, y, _ = ren.GetDisplayPoint()
+    return int(round(x)), int(round(y))
+
+
+def sketch_box():
+    w.create_body("box")
+    assert w._sk is not None, "作図モードに入らない"
+    w._sk.pitch = 1.0
+    for p in [(0, 0, 0), (50, 30, 0), (50, 30, 20)]:
+        x, y = w2d(p)
+        w._sketch_move(x, y)
+        app.processEvents()
+        w._sketch_click(x, y)
+        app.processEvents()
+    P("   作図の結果:", {k: w._features()[-1][k] for k in ("x", "y", "z", "dx", "dy", "dz")})
+
+
+step("直方体（マウスで作図）", sketch_box)
+w.grab().save(os.path.join(out, "gui_sketch_done.png"))
+w.create_body("cylinder")
+w._sk.pitch = 1.0
+x, y = w2d((80, 15, 20))
+w._sketch_move(x, y)
+x2, y2 = w2d((90, 15, 20))
+w._sketch_click(x, y)
+w._sketch_move(x2, y2)
+app.processEvents()
+w.grab().save(os.path.join(out, "gui_sketch_preview.png"))
+P("   円柱の作図中: 作業平面", w._sk.plane, w._sk.offset, "点", [list(map(float, q)) for q in w._sk.points])
+w.sketch_cancel()
+P("   作図の取り消し: OK" if w._sk is None else "NG 作図の取り消し")
 step("移動（コピー）", lambda: (sel([0]), w.edit_body_op("move")))
 f = w._features()
 step("コピーを Z に 30 移動", lambda: (f[-1].update(dz=30.0, copy="コピー"), w.remesh()))
@@ -74,7 +108,7 @@ P("フィーチャー:", [w._feature_label(x) for x in w._features()])
 w.project.geometry = {"kind": "model", "analysis_2d": "plane_stress", "features": []}
 w.project.bcs = []
 w.remesh()
-step("2D 平板", lambda: w.create_body("plate"))
+step("2D 平板", lambda: w.create_body("plate", dialog=True))
 step("2D 穴", lambda: (sel([]), w.create_hole()))
 m = w.mesh
 P("2D メッシュ:", type(m).__name__, getattr(m, "mode", None), m.n_nodes, "節点")

@@ -24,7 +24,7 @@ import traceback
 
 import numpy as np
 from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QFont, QIcon, QKeySequence, QPainter, QPixmap
+from PySide6.QtGui import QAction, QBrush, QColor, QFont, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFrame,
                                QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
                                QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
@@ -287,6 +287,7 @@ class MainWindow(QMainWindow):
         self._main_actor = None
         self._press = None
         self.probe_text = None
+        self._sk = None          # マウスでの作図中の状態（sketch.Sketch）
         # 操作履歴（Femtet と同じく、操作ごとに記録して どの時点にも戻れる）
         self.history = History()
         self.history.reset(self.project.to_dict())
@@ -346,7 +347,8 @@ class MainWindow(QMainWindow):
         g.setContentsMargins(0, 0, 0, 0)
         g.addWidget(self._graphics_toolbar(), 0, 0)
         g.addWidget(self._attr_bar(), 1, 0)
-        g.addWidget(self.plotter.interactor, 2, 0)
+        g.addWidget(self._sketch_bar(), 2, 0)
+        g.addWidget(self.plotter.interactor, 3, 0)
         self.overlay = QLabel(self.plotter.interactor)
         self.overlay.setStyleSheet("background: rgba(255,255,255,215); color:#111; padding:6px;"
                                    "border:1px solid #bbb; font-size:12px;")
@@ -1528,9 +1530,318 @@ class MainWindow(QMainWindow):
             return pts.min(axis=0), pts.max(axis=0)
         return self.mesh.bounds()
 
-    def create_body(self, ftype):
-        """［作成］→ ダイアログで基準点と寸法を入力 → 新しいボディ"""
+    # ======================================================================= マウスで作図
+    def _sketch_bar(self):
+        bar = QFrame()
+        bar.setStyleSheet("QFrame#skbar{background:#fff4d6;border-bottom:1px solid #e0b850;}")
+        bar.setObjectName("skbar")
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(6, 3, 6, 3)
+        self.sk_title = QLabel()
+        self.sk_title.setStyleSheet("font-weight:bold;")
+        h.addWidget(self.sk_title)
+        h.addWidget(QLabel("作業平面"))
+        self.sk_plane = QComboBox()
+        self.sk_plane.addItems(["XY", "YZ", "ZX"])
+        self.sk_plane.currentTextChanged.connect(lambda _: self._sketch_plane_changed())
+        h.addWidget(self.sk_plane)
+        self.sk_offset = dspin(0.0, dec=3, suffix="mm")
+        self.sk_offset.setToolTip("作業平面の位置（XY 平面なら Z 座標）。既存ボディの平らな面をクリックすると、その面に合わせます")
+        self.sk_offset.valueChanged.connect(lambda _: self._sketch_plane_changed())
+        h.addWidget(self.sk_offset)
+        h.addWidget(QLabel("スナップ"))
+        self.sk_pitch = dspin(1.0, 0.0, 1e6, 3, 1.0, "mm")
+        self.sk_pitch.setToolTip("クリック位置をこの間隔の格子に合わせます（0 = 合わせない）")
+        self.sk_pitch.valueChanged.connect(lambda v: self._sketch_pitch(v))
+        h.addWidget(self.sk_pitch)
+        self.sk_value = QLineEdit()
+        self.sk_value.setMinimumWidth(170)
+        self.sk_value.returnPressed.connect(self._sketch_typed)
+        h.addWidget(self.sk_value)
+        self.sk_close_btn = QPushButton("閉じる")
+        self.sk_close_btn.clicked.connect(self._sketch_enter)
+        h.addWidget(self.sk_close_btn)
+        b = QPushButton("1つ戻る")
+        b.setToolTip("直前のクリックを取り消します（Backspace）")
+        b.clicked.connect(self._sketch_back)
+        h.addWidget(b)
+        b = QPushButton("数値で入力…")
+        b.clicked.connect(lambda: self._sketch_finish(dialog_only=True))
+        h.addWidget(b)
+        b = QPushButton("中止")
+        b.setToolTip("Esc / 右クリックでも中止できます")
+        b.clicked.connect(self.sketch_cancel)
+        h.addWidget(b)
+        h.addStretch(1)
+        bar.hide()
+        self.sk_bar = bar
+        self._sk_shortcuts = []
+        for key, fn in ((Qt.Key_Escape, self.sketch_cancel), (Qt.Key_Backspace, self._sketch_back),
+                        (Qt.Key_Return, self._sketch_enter), (Qt.Key_Enter, self._sketch_enter)):
+            sc = QShortcut(QKeySequence(key), self)
+            sc.activated.connect(lambda fn=fn: fn() if self._sk is not None and not self.sk_value.hasFocus() else None)
+            sc.setEnabled(False)
+            self._sk_shortcuts.append(sc)
+        return bar
+
+    def sketch_start(self, ftype):
+        from .sketch import Sketch, nice_pitch
+        if self._sk is not None:
+            self.sketch_cancel()
+        span = 200.0
+        if self.mesh is not None:
+            lo, hi = self.mesh.bounds()
+            span = max(float(np.max(hi - lo)) * 2, 10.0)
+        pitch = nice_pitch(span)
+        plane = "XY"
+        offset = 0.0
+        if ftype in ("plate", "sheet", "disk") and self.project.geometry.get("analysis_2d"):
+            plane, offset = "XY", 0.0
+        self._sk = Sketch(ftype, plane, offset, pitch)
+        self._sk_span = span
+        for w, v in ((self.sk_plane, plane),):
+            w.blockSignals(True)
+            w.setCurrentText(v)
+            w.blockSignals(False)
+        self.sk_offset.blockSignals(True)
+        self.sk_offset.setValue(offset)
+        self.sk_offset.blockSignals(False)
+        self.sk_pitch.blockSignals(True)
+        self.sk_pitch.setValue(pitch)
+        self.sk_pitch.blockSignals(False)
+        self.sk_bar.show()
+        for sc in self._sk_shortcuts:
+            sc.setEnabled(True)
+        self.plotter.interactor.setFocus()
+        self.sk_close_btn.setVisible(ftype in ("sheet", "extrude"))
+        self._sketch_update()
+        self.log(f"{FEATURES[ftype][0]}: 画面上をクリックして指定します（数値はバーに入力して Enter。Esc / 右クリックで中止）")
+
+    def sketch_cancel(self):
+        if self._sk is None:
+            return
+        self._sk = None
+        self.sk_bar.hide()
+        for sc in self._sk_shortcuts:
+            sc.setEnabled(False)
+        for name in ("sk_grid", "sk_lines", "sk_cursor", "sk_pts", "sk_label"):
+            try:
+                self.plotter.remove_actor(name, render=False)
+            except Exception:
+                pass
+        self.plotter.render()
+
+    def _sketch_ray(self, x, y):
+        ren = self.plotter.renderer
+
+        def d2w(z):
+            ren.SetDisplayPoint(x, y, z)
+            ren.DisplayToWorld()
+            w = ren.GetWorldPoint()
+            return np.array(w[:3]) / (w[3] if w[3] else 1.0)
+        o, f = d2w(0.0), d2w(1.0)
+        return o, f - o
+
+    def _sketch_face_plane(self, x, y):
+        """1点目の前: 既存ボディの軸に垂直な平らな面の上なら、その面を作業平面にする"""
+        sk = self._sk
+        if sk.step != 0 or sk.points or sk.poly or self._main_actor is None or self.mesh is None:
+            return
+        from vtkmodules.vtkRenderingCore import vtkCellPicker
+        picker = vtkCellPicker()
+        picker.SetTolerance(0.0005)
+        picker.PickFromListOn()
+        picker.AddPickList(self._main_actor)
+        if not picker.Pick(x, y, 0, self.plotter.renderer):
+            return
+        n = np.array(picker.GetPickNormal())
+        k = int(np.argmax(np.abs(n)))
+        if abs(n[k]) < 0.999:
+            return
+        plane = {0: "YZ", 1: "ZX", 2: "XY"}[k]
+        off = float(picker.GetPickPosition()[k])
+        if plane != sk.plane or abs(off - sk.offset) > 1e-9:
+            sk.set_plane(plane, off)
+            self.sk_plane.blockSignals(True)
+            self.sk_plane.setCurrentText(plane)
+            self.sk_plane.blockSignals(False)
+            self.sk_offset.blockSignals(True)
+            self.sk_offset.setValue(off)
+            self.sk_offset.blockSignals(False)
+
+    def _sketch_plane_changed(self):
+        if self._sk is None:
+            return
+        self._sk.set_plane(self.sk_plane.currentText(), self.sk_offset.value())
+        self._sketch_update()
+
+    def _sketch_pitch(self, v):
+        if self._sk is not None:
+            self._sk.pitch = float(v)
+
+    def _sketch_move(self, x, y):
+        sk = self._sk
+        self._sketch_face_plane(x, y)
+        o, d = self._sketch_ray(x, y)
+        before = (None if sk.cursor is None else tuple(sk.cursor), sk.cursor_h)
+        sk.move(o, d)
+        if (None if sk.cursor is None else tuple(sk.cursor), sk.cursor_h) != before:
+            self._sketch_update()
+
+    def _sketch_click(self, x, y):
+        sk = self._sk
+        if sk is None:
+            return
+        self._sketch_face_plane(x, y)
+        o, d = self._sketch_ray(x, y)
+        if sk.click(o, d):
+            self._sketch_finish()
+        else:
+            self._sketch_update()
+
+    def _sketch_enter(self):
+        if self._sk is not None and self._sk.close_poly():
+            self._sketch_finish()
+        else:
+            self._sketch_update()
+
+    def _sketch_back(self):
+        if self._sk is not None:
+            self._sk.undo_point()
+            self._sketch_update()
+
+    def _sketch_typed(self):
+        """バーに打った数値で今の段階を確定（X,Y,Z / 平面上の u,v / @ で前の点からの相対 / 長さ）"""
+        sk = self._sk
+        if sk is None:
+            return
+        txt = self.sk_value.text().strip().replace("、", ",").replace(" ", ",")
+        rel = txt.startswith("@")
+        try:
+            nums = [float(t) for t in txt.lstrip("@").split(",") if t != ""]
+        except ValueError:
+            self.log("数値を「X, Y, Z」または「u, v」（@ を付けると前の点からの相対）で入力してください")
+            return
+        if sk.kind == "h":
+            if len(nums) != 1:
+                return
+            done = sk.click(value=nums[0])
+        else:
+            if len(nums) == 2:
+                base = (sk.poly[-1] if sk.poly else sk.points[-1]) if rel and (sk.poly or sk.points) else None
+                if base is not None:
+                    u0, v0 = sk.uv(base)
+                    p = sk.to3(u0 + nums[0], v0 + nums[1], base[sk.axes[2]])
+                else:
+                    p = sk.to3(nums[0], nums[1])
+            elif len(nums) == 3:
+                p = np.array(nums)
+                if rel and (sk.poly or sk.points):
+                    p = p + (sk.poly[-1] if sk.poly else sk.points[-1])
+                p[sk.axes[2]] = sk.offset if not (sk.points or sk.poly) else (sk.poly or sk.points)[0][sk.axes[2]]
+            else:
+                return
+            done = sk.click(value=p)
+        self.sk_value.clear()
+        self.plotter.interactor.setFocus()
+        if done:
+            self._sketch_finish()
+        else:
+            self._sketch_update()
+
+    def _sketch_update(self):
+        sk = self._sk
+        if sk is None:
+            return
+        name = FEATURES[sk.ftype][0]
+        total = len(sk.steps)
+        self.sk_title.setText(f"{name}（{min(sk.step + 1, total)}/{total}）: {sk.prompt} をクリック")
+        if sk.kind == "h":
+            self.sk_value.setPlaceholderText("長さ [mm] を入力して Enter")
+            if not self.sk_value.hasFocus():
+                self.sk_value.setText("" if sk.cursor_h is None else f"{sk.cursor_h:g}")
+        else:
+            self.sk_value.setPlaceholderText("X, Y, Z（または u, v / @ で相対）を入力して Enter")
+            if not self.sk_value.hasFocus():
+                c = sk.cursor
+                self.sk_value.setText("" if c is None else f"{c[0]:g}, {c[1]:g}, {c[2]:g}")
+        pl = self.plotter
+        # 作業平面の格子
+        a = sk.axes
+        center = sk.points[0] if sk.points else (sk.poly[0] if sk.poly else (sk.cursor if sk.cursor is not None
+                                                                             else sk.to3(0, 0)))
+        span = self._sk_span
+        step = max(sk.pitch * max(1, round(span / 20 / max(sk.pitch, 1e-9))), 1e-9)
+        cu, cv = sk.uv(center)
+        cu, cv = round(cu / step) * step, round(cv / step) * step
+        n = 10
+        segs = []
+        for i in range(-n, n + 1):
+            segs.append((sk.to3(cu + i * step, cv - n * step), sk.to3(cu + i * step, cv + n * step)))
+            segs.append((sk.to3(cu - n * step, cv + i * step), sk.to3(cu + n * step, cv + i * step)))
+        grid = pv.PolyData(np.array([p for sgm in segs for p in sgm]))
+        grid.lines = np.hstack([[2, 2 * i, 2 * i + 1] for i in range(len(segs))])
+        pl.add_mesh(grid, color="#e0a000", opacity=0.35, line_width=1, name="sk_grid", pickable=False,
+                    reset_camera=False, render=False)
+        lines, info = sk.preview()
+        if lines:
+            pts, cells, off = [], [], 0
+            for L in lines:
+                L = np.asarray(L, float)
+                pts.append(L)
+                cells += [len(L)] + list(range(off, off + len(L)))
+                off += len(L)
+            pd = pv.PolyData(np.vstack(pts))
+            pd.lines = np.array(cells)
+            pl.add_mesh(pd, color="#d9480f", line_width=3, name="sk_lines", pickable=False,
+                        reset_camera=False, render=False)
+        else:
+            pl.remove_actor("sk_lines", render=False)
+        marks = list(sk.points) + list(sk.poly)
+        if sk.cursor is not None and sk.kind in ("pt", "poly"):
+            marks.append(sk.cursor)
+        if marks:
+            pl.add_points(np.array(marks, float), color="#d9480f", point_size=10, render_points_as_spheres=True,
+                          name="sk_pts", pickable=False, reset_camera=False, render=False)
+        c = sk.cursor
+        txt = f"{name}: {sk.prompt}"
+        if c is not None and sk.kind in ("pt", "poly"):
+            txt += f"\nX {c[0]:g}  Y {c[1]:g}  Z {c[2]:g}"
+        if sk.kind == "h" and sk.cursor_h is not None:
+            txt += f"\n長さ {sk.cursor_h:g} mm"
+        if info:
+            txt += f"\n{info}"
+        pl.add_text(txt, position="upper_right", font_size=10, color="#d9480f", name="sk_label", render=False)
+        pl.render()
+
+    def _sketch_finish(self, dialog_only=False):
+        sk = self._sk
+        if sk is None:
+            return
+        ftype = sk.ftype
+        f = new_feature(ftype, "new")
+        if not dialog_only:
+            try:
+                f.update(sk.feature_values())
+            except Exception as e:
+                self.log(f"作図の値を作れませんでした: {e}")
+        self.sketch_cancel()
+        dlg = FeatureDialog(ftype, f, "の作成（クリックした寸法。必要なら修正して OK）", self)
+        if not dlg.exec():
+            return
+        f.update(dlg.values())
+        self._features().append(f)
+        self.selected_faces, self.selected_bodies = [], []
+        self.current = ("feature", len(self._features()) - 1)
+        self.remesh(reset_camera=len(self._features()) == 1)
+
+    def create_body(self, ftype, dialog=False):
+        """［作成］→ 画面上をクリックして基準点・寸法を指定（Femtet と同じ）→ 確認ダイアログ → 新しいボディ"""
         if not self._ensure_model():
+            return
+        from .sketch import supported
+        if not dialog and supported(ftype):
+            self.sketch_start(ftype)
             return
         f = new_feature(ftype, "new")
         if self.mesh is not None:
@@ -2890,6 +3201,21 @@ class MainWindow(QMainWindow):
         class ClickFilter(QObject):
             def eventFilter(self, obj, ev):
                 t = ev.type()
+                if win._sk is not None:
+                    dpr = obj.devicePixelRatioF() if hasattr(obj, "devicePixelRatioF") else 1.0
+                    if t == QEvent.MouseMove and not ev.buttons():
+                        p = ev.position().toPoint()
+                        win._sketch_move(int(p.x() * dpr), int((obj.height() - p.y() - 1) * dpr))
+                    elif t == QEvent.MouseButtonPress and ev.button() == Qt.RightButton:
+                        win._press_r = ev.position().toPoint()
+                    elif t == QEvent.MouseButtonRelease and ev.button() == Qt.RightButton:
+                        p0 = getattr(win, "_press_r", None)
+                        p = ev.position().toPoint()
+                        if p0 is not None and abs(p.x() - p0.x()) + abs(p.y() - p0.y()) <= 4:
+                            QTimer.singleShot(0, win.sketch_cancel)
+                    elif t == QEvent.MouseButtonDblClick and ev.button() == Qt.LeftButton:
+                        QTimer.singleShot(0, win._sketch_enter)
+                        return True
                 if t == QEvent.MouseButtonPress and ev.button() == Qt.LeftButton:
                     win._press = ev.position().toPoint()
                 elif t == QEvent.MouseButtonRelease and ev.button() == Qt.LeftButton and win._press is not None:
@@ -2900,11 +3226,15 @@ class MainWindow(QMainWindow):
                         dpr = obj.devicePixelRatioF() if hasattr(obj, "devicePixelRatioF") else 1.0
                         x = int(p.x() * dpr)
                         y = int((obj.height() - p.y() - 1) * dpr)
-                        QTimer.singleShot(0, lambda: win._pick((x, y)))
+                        if win._sk is not None:
+                            QTimer.singleShot(0, lambda: win._sketch_click(x, y))
+                        else:
+                            QTimer.singleShot(0, lambda: win._pick((x, y)))
                 return False
 
         self._click_filter = ClickFilter(self)
         self.plotter.interactor.installEventFilter(self._click_filter)
+        self.plotter.interactor.setMouseTracking(True)
 
     def _pick(self, pos):
         if self.mesh is None or self._main_actor is None:
