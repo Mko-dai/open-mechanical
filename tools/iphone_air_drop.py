@@ -156,11 +156,11 @@ feats.append(rbox(47, 13, Z_MS, 62, 21, Z_BAT, op="add", target=kb))
 names.append(None)
 mat_of.append(None)
 add(rbox(6, 22, Z_BAT, W - 6, 122, Z_ADH), "電池の接着層", "接着剤（電気剥離型・推測）", 5.0)
-add(rbox(8, 4, Z_MS, 28, 12.5, Z_BAT), "Taptic Engine", "Taptic Engine（鋼＋磁石・等価）")
+add(rbox(8, 4, Z_BG, 28, 12.5, Z_ADH), "Taptic Engine", "Taptic Engine（鋼＋磁石・等価）")   # 背面ガラスとミッドプレートの間に挟まる
 # USB-C（3D プリントのチタン外殻＋樹脂の舌片）
 ku = add(rbox(30.35, 0, 1.4, 44.35, 7, Z_BAT), "USB-C 外殻（チタン 3D プリント）", TI)
 cut(rbox(33.0, 0, 1.95, 41.7, 6.0, 3.15), ku)
-add(rbox(34.0, 0.8, 2.3, 40.7, 5.5, 2.8), "USB-C 舌片（LCP）", "液晶ポリマー LCP（ガラス入り）")
+add(rbox(34.0, 0.8, 2.3, 40.7, 6.0, 2.8), "USB-C 舌片（LCP）", "液晶ポリマー LCP（ガラス入り）")   # 奥の壁に付く
 # ボタン（左: アクション・音量 / 右: サイド・Camera Control）
 for nm, x0, x1, y0, y1, mat in [("アクションボタン", -0.5, 0.8, 112, 118, TI), ("音量＋", -0.5, 0.8, 99, 106, TI),
                                 ("音量−", -0.5, 0.8, 89, 96, TI), ("サイドボタン", W - 0.8, W + 0.5, 100, 116, TI),
@@ -223,6 +223,18 @@ t0 = time.time()
 mesh = p.mesh(log=lambda *a: P("  ", *a))
 P(f"メッシュ: 節点 {mesh.n_nodes:,} / 要素 {mesh.n_elems:,} / ボディ {len(mesh.body_ids())}（{time.time() - t0:.1f} s）")
 
+# 浮いた部品（どこにもつながっていないボディ）がないか: 節点を共有するボディのつながり
+import scipy.sparse as _sp  # noqa: E402
+_nb = int(mesh.elem_body.max()) + 1
+_nn = mesh.elems.shape[1]
+_B = _sp.csr_matrix((np.ones(mesh.n_elems * _nn), (np.repeat(mesh.elem_body, _nn), mesh.elems.ravel())),
+                    shape=(_nb, mesh.n_nodes))
+_ncomp, _lab = _sp.csgraph.connected_components((_B @ _B.T) > 0)
+if _ncomp > 1:
+    _main = np.bincount(_lab[mesh.body_ids()]).argmax()
+    for b in mesh.body_ids():
+        if _lab[b] != _main:
+            P(f"⚠ 浮いている部品: {body_name.get(int(b), b)}")
 # 品質の悪い要素の場所（どの部品のどこか）
 from openmech.geometry import mesh_quality  # noqa: E402
 q = mesh_quality(mesh)["_quality"]
