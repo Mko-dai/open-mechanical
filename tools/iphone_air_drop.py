@@ -175,11 +175,13 @@ add(rbox(WALL, WALL, Z_FOAM, W - WALL, L - WALL, Z_DISP), "表示パネル（OLE
     R - WALL)
 # プラトー（チタンの枠。中は空洞）
 kp = add(rbox(1.0, PY0, PZ, W - 1.0, PY1, 0), "カメラプラトー（チタン）", TI, R - 1.0)
-kc = add(rbox(WALL, PY0 + 0.6, PZ, W - WALL, PY1 - 0.6, 0), None, None, R - WALL)
+kc = add(rbox(WALL, PY0 + 0.6, PC, W - WALL, PY1 - 0.6, 0), None, None, R - WALL)   # カバーガラスの層は残す（重なりはガラスが持つ）
 bool_cut(kp, kc)
 # フレーム（チタン。内側をくり抜き、プラトーの下は開口）
 kf = add(rbox(0, 0, 0, W, L, T), "チタンフレーム", TI, R)
-k1 = add(rbox(WALL, WALL, Z_BG, W - WALL, L - WALL, Z_DISP), None, None, R - WALL)
+# 空洞は電池の層だけくり抜く（ミッドプレート・クッション材・表示パネルは先に作ったので重なりはそちらが持つ。
+# 同じ丸みの面を 2 つ重ねると細い隙間要素ができるため）
+k1 = add(rbox(WALL, WALL, Z_BG, W - WALL, L - WALL, Z_ADH), None, None, R - WALL)
 bool_cut(kf, k1)
 k2 = add(rbox(WALL, PY0 + 0.6, 0, W - WALL, PY1 - 0.6, Z_BG + 0.01), None, None, R - WALL)
 bool_cut(kf, k2)
