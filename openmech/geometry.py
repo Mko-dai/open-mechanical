@@ -1196,42 +1196,54 @@ def _proximity_points(gmsh, h, cells, pmin):
     tri_r = np.max(np.linalg.norm(np.stack([A, B, C], 1) - cen[:, None], axis=2), axis=1)
     R = cells * h                        # これより広いすき間はサイズが h 以上になるので見なくてよい
     tree = cKDTree(cen)
-    rad = R + 2 * float(tri_r.max())
+    rmax = 2 * float(tri_r.max())
     thick = np.full(len(T), np.inf)
-    chunk = 4000
-    for c0 in range(0, len(T), chunk):
-        q = np.arange(c0, min(c0 + chunk, len(T)))
-        lists = tree.query_ball_point(cen[q], rad)
-        lens = np.fromiter((len(x) for x in lists), dtype=np.int64, count=len(q))
-        if lens.sum() == 0:
-            continue
-        i = np.repeat(q, lens)
-        j = np.fromiter((v for x in lists for v in x), dtype=np.int64, count=int(lens.sum()))
-        # 頂点を共有する三角形（隣どうし・自分自身）は除く
-        share = np.zeros(len(i), bool)
-        for a in range(3):
-            for b in range(3):
-                share |= T[i, a] == T[j, b]
-        i, j = i[~share], j[~share]
-        if not len(i):
-            continue
-        # 光線 o + t·d（d = 三角形 i の法線、両向き）と三角形 j の交差（Möller–Trumbore）
-        o, d = cen[i], nrm[i]
-        e1, e2 = B[j] - A[j], C[j] - A[j]
-        pv = np.cross(d, e2)
-        det = np.einsum("ij,ij->i", e1, pv)
-        good = np.abs(det) > 1e-14
-        inv = np.where(good, 1.0 / np.where(good, det, 1.0), 0.0)
-        tv = o - A[j]
-        u = np.einsum("ij,ij->i", tv, pv) * inv
-        qv = np.cross(tv, e1)
-        v = np.einsum("ij,ij->i", d, qv) * inv
-        t = np.abs(np.einsum("ij,ij->i", e2, qv) * inv)
-        hit = good & (u >= -1e-9) & (v >= -1e-9) & (u + v <= 1 + 1e-9) & (t > 1e-6 * h) & (t < R)
-        # 向かい合う面だけ（法線がほぼ平行）: 斜めに当たる面（角の近く）は板厚ではない
-        hit &= np.abs(np.einsum("ij,ij->i", nrm[i], nrm[j])) > 0.7
-        if hit.any():
-            np.minimum.at(thick, i[hit], t[hit])
+    # 近い距離から順に探し、まだ相手の面が見つからない三角形だけ探す半径を広げる（薄い所はすぐ見つかる）
+    stages = [r for r in (0.5 * h, 1.5 * h, R) if r < R] + [R]
+    todo = np.arange(len(T))
+    for r_s in stages:
+        if not len(todo):
+            break
+        found = np.zeros(len(T), bool)
+        chunk = 4000
+        for c0 in range(0, len(todo), chunk):
+            q = todo[c0:c0 + chunk]
+            # 近い順に最大 K 個（半径内）。リストではなく配列で返るので速い
+            K = min(len(T), 160)
+            dd, jj = tree.query(cen[q], k=K, distance_upper_bound=r_s + rmax)
+            ok = np.isfinite(dd)
+            if not ok.any():
+                continue
+            i = np.broadcast_to(q[:, None], jj.shape)[ok]
+            j = jj[ok]
+            # 頂点を共有する三角形（隣どうし・自分自身）は除く
+            share = np.zeros(len(i), bool)
+            for a in range(3):
+                for b in range(3):
+                    share |= T[i, a] == T[j, b]
+            i, j = i[~share], j[~share]
+            if not len(i):
+                continue
+            # 向かい合う面だけ（法線がほぼ平行）: 斜めに当たる面（角の近く）は板厚ではない
+            par = np.abs(np.einsum("ij,ij->i", nrm[i], nrm[j])) > 0.7
+            i, j = i[par], j[par]
+            # 光線 o + t·d（d = 三角形 i の法線、両向き）と三角形 j の交差（Möller–Trumbore）
+            o, d = cen[i], nrm[i]
+            e1, e2 = B[j] - A[j], C[j] - A[j]
+            pv = np.cross(d, e2)
+            det = np.einsum("ij,ij->i", e1, pv)
+            good = np.abs(det) > 1e-14
+            inv = np.where(good, 1.0 / np.where(good, det, 1.0), 0.0)
+            tv = o - A[j]
+            u = np.einsum("ij,ij->i", tv, pv) * inv
+            qv = np.cross(tv, e1)
+            v = np.einsum("ij,ij->i", d, qv) * inv
+            t = np.abs(np.einsum("ij,ij->i", e2, qv) * inv)
+            hit = good & (u >= -1e-9) & (v >= -1e-9) & (u + v <= 1 + 1e-9) & (t > 1e-6 * h) & (t < r_s)
+            if hit.any():
+                np.minimum.at(thick, i[hit], t[hit])
+                found[i[hit]] = True
+        todo = todo[~found[todo]]
     sel = np.isfinite(thick)
     size = np.clip(thick[sel] / cells, pmin, None)
     keep = size < 0.99 * h
