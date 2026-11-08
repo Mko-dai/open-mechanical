@@ -45,6 +45,18 @@ def faces_at(m, axis, value, tol=1e-6):
             and abs(abs(f["normal"][axis]) - 1) < 1e-6]
 
 
+def snap(name, r, fields, t=None):
+    """コンター図用に 1 フレームを保存（logs/lsdyna/<name>.npz）。fields: {表示名: (節点の値, 単位)}"""
+    np.savez_compressed(os.path.join(OUT, name + ".npz"), nodes=r.mesh.nodes, u=r.u, tris=r.mesh.boundary_tris_full,
+                        names=np.array(list(fields)), units=np.array([v[1] for v in fields.values()]),
+                        vals=np.stack([np.asarray(v[0], float) for v in fields.values()]),
+                        t=float(getattr(r, "time", 0.0) if t is None else t))
+
+
+def nearest(fr, t):
+    return min(fr, key=lambda r: abs(r.time - t))
+
+
 def rel(a, b):
     return (a - b) / b * 100.0
 
@@ -71,12 +83,14 @@ def case1():
     def mon(t, u, vv):
         sig = np.einsum("ij,ej->ei", Dm, np.einsum("eij,ej->ei", B, u.reshape(-1, 3)[m.elems[pe]].reshape(len(pe), -1)))
         return {"sx": float(sig[:, 0].mean())}
-    s = DynamicSettings(method="explicit", end_time=4.5e-4, n_frames=1)
+    s = DynamicSettings(method="explicit", end_time=4.5e-4, n_frames=18)
     t0 = time.time()
     fr = solve_dynamic(m, steel, [], s, log=QUIET, v0=v0, monitor=mon)
     h = fr[-1].history
     t = np.array(h["時間 [s]"]) * 1e3
     sx = -np.array(h["sx"])                               # 圧縮を正に
+    r = nearest(fr, 2.5e-4)
+    snap("case1", r, {"方向応力 X（σx）": (r.stress[:, 0], "MPa"), "速度 X": (r.extra["速度 X [mm/s]"], "mm/s")})
     smax = sx.max()
     half = sx > 0.5 * smax
     i0, i1 = np.nonzero(half)[0][[0, -1]]
@@ -113,12 +127,14 @@ def case2():
     def mon(t, u, v):
         U, V = u.reshape(-1, 3), v.reshape(-1, 3)
         return {"zb": float(U[top, 2].mean()), "vb": float(V[top, 2].mean()), "zbot": float(U[bot, 2].mean())}
-    s = DynamicSettings(method="explicit", end_time=0.11, n_frames=1, wall={"normal": [0, 0, 1], "point": [0, 0, -h]})
+    s = DynamicSettings(method="explicit", end_time=0.11, n_frames=22, wall={"normal": [0, 0, 1], "point": [0, 0, -h]})
     t0 = time.time()
     fr = solve_dynamic(m, ball, [BC("gravity", [], [0, 0, -g])], s, elem_materials=em, log=QUIET, monitor=mon)
     hh = fr[-1].history
     t = np.array(hh["時間 [s]"])
     zb, vb, zbot = np.array(hh["zb"]), np.array(hh["vb"]), np.array(hh["zbot"])
+    r = nearest(fr, 0.1)
+    snap("case2", r, {"方向応力 Z（σz）": (r.stress[:, 2], "psi"), "方向変形 Z（UZ）": (r.u[:, 2], "in")})
     i = int(np.nonzero(zbot <= -h)[0][0])
     w = (-h - zbot[i - 1]) / (zbot[i] - zbot[i - 1])
     t_imp = t[i - 1] + w * (t[i] - t[i - 1])
@@ -158,12 +174,14 @@ def case3():
     I = b ** 4 / 12
     f_th = math.pi / 2 * math.sqrt(E * I / (rho * b * b * L ** 4))
     T = 1 / f_th
-    s = DynamicSettings(method="implicit", end_time=4 * T, dt=T / 100, n_frames=1)
+    s = DynamicSettings(method="implicit", end_time=4 * T, dt=T / 100, n_frames=16)
     t0 = time.time()
     fr = solve_dynamic(m, beam, bcs, s, log=QUIET, v0=v0,
                        monitor=lambda t, u, v: {"w": float(u.reshape(-1, 3)[mid, 2])})
     h = fr[-1].history
     t, w = np.array(h["時間 [s]"]), np.array(h["w"])
+    r = nearest(fr, T / 4)
+    snap("case3", r, {"方向変形 Z（UZ）": (r.u[:, 2], "in"), "方向応力 X（σx）": (r.stress[:, 0], "psi")})
     z = [t[i] - w[i] * (t[i + 1] - t[i]) / (w[i + 1] - w[i]) for i in range(len(w) - 1) if w[i] > 0 >= w[i + 1]]
     f = 1 / float(np.mean(np.diff(z)))
     return {"id": "VM-LSDYNA-SOLVE-032", "名前": "単純支持はりの固有振動数", "解析": "陰解法（自由振動の周期から）",
@@ -185,6 +203,8 @@ def case4():
                        monitor=lambda t, u, v: {"w": float(u.reshape(-1, 3)[tip, 2].mean())})
     h = fr[-1].history
     t, w = np.array(h["時間 [s]"]), np.array(h["w"])
+    r = fr[-1]
+    snap("case4", r, {"方向変形 Z（UZ）": (r.u[:, 2], "in"), "方向応力 X（σx）": (r.stress[:, 0], "psi")})
     I = b ** 4 / 12
     return {"id": "VM-LSDYNA-BENCHMARK-001", "名前": "片持ちはりのたわみ（微小変形）", "解析": "陽解法＋減衰（準静的）",
             "要素": f"Tet10 {m.n_elems:,} 要素（LS-DYNA: 六面体）", "計算時間 [s]": round(time.time() - t0, 1),
@@ -196,20 +216,40 @@ def case4():
 # ---------------------------------------------------------------------------- 5. 弾完全塑性はり・大変形
 def case5():
     L, b, hgt, E, nu, sy, M = 50.0, 3.0, 5.0, 200000.0, 0.3, 1300.0, 22000.0
-    m = structured_box(L, b, hgt, 50, 3, 5).to_quadratic()
+    # 先端に長さ 2 mm の弾性の「荷重ブロック」を付けてモーメントを入れる（LS-DYNA の剛体端と同じ役割）。
+    # 面に直接モーメント（線形分布の節点力）を入れると、M > My では面の縁が局所的に塑性崩壊してしまうため
+    cap = 2.0
+    m = structured_box(L + cap, b, hgt, 26, 2, 4).to_quadratic()
     beam = Material("鋼（弾完全塑性）", E, nu, 7850, sy, plasticity="bilinear_iso", tangent_modulus=0.0)
+    blk = Material("荷重ブロック（弾性）", E, nu, 7850, 0.0)
+    xc = m.nodes[m.elems[:, :4]].mean(1)[:, 0]
+    emat = (np.zeros(m.n_elems, int) + (xc > L)).astype(int)
     tip = np.nonzero(np.abs(m.nodes[:, 0] - L) < 1e-9)[0]
-    bcs = [BC("fixed", faces_at(m, 0, 0.0)), BC("moment", faces_at(m, 0, L), [0, M, 0])]
-    s = DynamicSettings(method="explicit", end_time=0.3, ramp_time=0.2, n_frames=1, large_deflection=True,
-                        mass_scaling_dt=1e-5, alpha_damping=200.0)
+    bcs = [BC("fixed", faces_at(m, 0, 0.0)), BC("moment", faces_at(m, 0, L + cap), [0, M, 0])]
+    # 準静的にするための質量スケーリング（LS-DYNA の例題と同じく 0.2 s で荷重を上げ、0.1 s 保持）:
+    # 1 次の固有角振動数を 60 rad/s 程度まで下げ（荷重時間の約 12 倍の周期の余裕）、ほぼ臨界減衰にする
+    from openmech.dynamics import element_dt
+    rho = 7.85e-9
+    w1 = 1.875104 ** 2 * math.sqrt(E * b * hgt ** 3 / 12 / (rho * b * hgt * L ** 4))
+    dt_real = float(element_dt(m, material_D(beam.state())[None], np.zeros(m.n_elems, int),
+                               np.full(m.n_elems, rho)).min()) * 0.9
+    w_target = 60.0
+    s = DynamicSettings(method="explicit", end_time=float(os.environ.get("T5", "0.4")), ramp_time=0.2, n_frames=1,
+                        large_deflection=True, mass_scaling_dt=dt_real * w1 / w_target,
+                        alpha_damping=float(os.environ.get("A5", "30")))
 
     def mon(t, u, v):
         U = u.reshape(-1, 3)[tip]
         return {"ux": float(U[:, 0].mean()), "uz": float(U[:, 2].mean())}
     t0 = time.time()
-    fr = solve_dynamic(m, beam, bcs, s, log=QUIET, monitor=mon)
+    fr = solve_dynamic(m, beam, bcs, s, elem_materials=([beam, blk], emat), log=QUIET, monitor=mon)
     h = fr[-1].history
     t, ux, uz = np.array(h["時間 [s]"]), np.array(h["ux"]), np.array(h["uz"])
+    r = fr[-1]
+    flds = {"方向応力 X（σx）": (r.stress[:, 0], "MPa"), "相当応力（ミーゼス）": (r.von_mises, "MPa")}
+    if "相当塑性ひずみ" in r.extra:
+        flds["相当塑性ひずみ"] = (r.extra["相当塑性ひずみ"], "-")
+    snap("case5", r, flds)
     # 理論（純曲げ・弾完全塑性の矩形断面）
     My = sy * b * hgt ** 2 / 6
     kap = (2 * sy / (E * hgt)) / math.sqrt(2 * (1.5 - M / My))
