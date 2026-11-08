@@ -3687,6 +3687,7 @@ class MainWindow(QMainWindow):
                 pl.add_mesh(fe0, color="#555555", line_width=1, opacity=0.5, pickable=False)
         imax = used[np.argmax(vals[used])]
         imin = used[np.argmin(vals[used])]
+        xmax, xmin = mesh.nodes[imax], mesh.nodes[imin]          # 変形前の座標
         _labels(pl, pts[[imax]], [f"Max {vals[imax]:.4g}"], 12, "black", point_color="red", bg="#ffffff")
         _labels(pl, pts[[imin]], [f"Min {vals[imin]:.4g}"], 12, "black", point_color="blue", bg="#ffffff")
         if self.probe_text and getattr(self, "_probe_pt", None) is not None:
@@ -3698,7 +3699,10 @@ class MainWindow(QMainWindow):
             + (f"単位: {unit}<br>" if unit else "")
             + f"時間: {getattr(r, 'time', 1.0):g} s<br>{datetime.datetime.now():%Y/%m/%d %H:%M}<br>"
             f"変形倍率: {'変形なし' if scale == 0 else f'{scale:g} 倍'}<br><br>"
-            f"<span style='color:#c00'>最大 {real[1]:.5g}</span><br><span style='color:#00c'>最小 {real[0]:.5g}</span>"
+            f"<span style='color:#c00'>最大 {real[1]:.5g}</span>"
+            f"<br><span style='color:#c00;font-size:11px'>　位置 ({xmax[0]:.4g}, {xmax[1]:.4g}, {xmax[2]:.4g}) mm</span>"
+            f"<br><span style='color:#00c'>最小 {real[0]:.5g}</span>"
+            f"<br><span style='color:#00c;font-size:11px'>　位置 ({xmin[0]:.4g}, {xmin[1]:.4g}, {xmin[2]:.4g}) mm</span>"
             + ("<br><br>0: 遠い　1: 近い<br>2: すべり　3: 固着" if key == "接触:接触状態" else ""))
 
     def _probe(self, pos, tri):
