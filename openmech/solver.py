@@ -610,15 +610,19 @@ def _cg(A, b, M, tol=1e-10, maxiter=5000):
         return spla.cg(A, b, M=M, tol=tol, maxiter=maxiter)
 
 
-def _pcg(A, b, M, tol=1e-10, maxiter=3000):
+def _pcg(A, b, M, tol=1e-10, maxiter=3000, x0=None):
     """前処理付き共役勾配法（行列×ベクトル積を使用コア数で並列化）"""
     from .parallel import ParallelMatvec
     mv = ParallelMatvec(A)
     nb = np.linalg.norm(b)
     if nb == 0:
         return np.zeros_like(b), 0, 0
-    x = np.zeros_like(b)
-    r = b.copy()
+    if x0 is None:
+        x = np.zeros_like(b)
+        r = b.copy()
+    else:
+        x = x0.copy()
+        r = b - mv(x)
     z = M(r)
     p = z.copy()
     rz = r @ z
@@ -715,11 +719,20 @@ def _linear_solve(A: sp.csc_matrix, b: np.ndarray, log=print, coords=None,
             t0 = time.time()
             M = build_amg(A, B, comps=coords[:, 3].astype(int) if coords is not None else None)
             t1 = time.time()
-            xsol, info, it = _pcg(A.tocsr(), b, M, tol=1e-10)
+            xsol, info, it = _pcg(A.tocsr(), b, M, tol=1e-10, maxiter=400)
             t2 = time.time()
             if info == 0 and _rel_res(A, xsol, b) < 1e-8:
                 log(f"  反復回数 {it}（AMG 準備 {t1 - t0:.1f} s / 反復 {t2 - t1:.1f} s / 階層 "
                     + " → ".join(f"{L.A.shape[0]:,}" for L in M.levels) + f" → {M.coarse_n:,}）")
+                return xsol
+            # 収束が遅い（剛性差の大きい材料・薄い層など）→ 頑健な AMG に作り直して続きから解く
+            log(f"  {it} 回で収束しないため、頑健な AMG（平滑化集約）に切り替えます")
+            del M
+            M = build_amg(A, B, comps=coords[:, 3].astype(int) if coords is not None else None, robust=True)
+            t3 = time.time()
+            xsol, info, it2 = _pcg(A.tocsr(), b, M, tol=1e-10, maxiter=3000, x0=xsol)
+            if info == 0 and _rel_res(A, xsol, b) < 1e-8:
+                log(f"  反復回数 {it} + {it2}（頑健 AMG 準備 {t3 - t2:.1f} s / 反復 {time.time() - t3:.1f} s）")
                 return xsol
             log("反復法が収束しなかったため直接法に切り替えます")
         except ImportError:

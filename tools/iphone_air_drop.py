@@ -101,7 +101,7 @@ p = Project()
 p.title = "iPhone Air 落下（等価静解析）"
 p.geometry = {"kind": "model", "features": feats}
 p.share_topology = "all"
-p.mesh_size = float(os.environ.get("MESH", "1.6"))
+p.mesh_size = float(os.environ.get("MESH", "2.0"))
 p.mesh_order = 2
 p.materials = {k: v for k, v in MATS.items()}
 for b, m in body_mat.items():
@@ -174,7 +174,7 @@ for name, c in CASES.items():
     d = np.array(c["dir"], float)
     p.bcs = [BC("fixed", c["faces"]), BC("gravity", [], list(G0 * d))]
     t1 = time.time()
-    r = p.run(mesh, log=lambda *a: None)
+    r = p.run(mesh, log=lambda *a: P("     ", *a) if a and ("反復" in str(a[0]) or "ソルバー" in str(a[0]) or "AMG" in str(a[0])) else None)
     ud = r.u @ d
     delta1 = float((node_mass * ud).sum() / node_mass.sum())       # 1 G での質量重み平均変位 [mm]
     Gpk = math.sqrt(2 * H / delta1)
@@ -187,9 +187,15 @@ for name, c in CASES.items():
         nodes = np.unique(mesh.elems[mesh.elem_body == b])
         nm = body_name.get(int(b), f"B{b}")
         mat = p.materials[body_mat[int(b)]]
+        brittle = ("ガラス" in mat.name) or ("シリコン" in mat.name)
+        smax = float(s1[nodes].max()) if brittle else float(vm[nodes].max())
+        lim = (mat.tensile_strength or mat.yield_strength) if brittle else mat.yield_strength
         per[nm] = {"最大相当応力 [MPa]": float(vm[nodes].max()), "最大主応力 [MPa]": float(s1[nodes].max()),
                    "強度 [MPa]": mat.tensile_strength or mat.yield_strength,
-                   "降伏 [MPa]": mat.yield_strength}
+                   "降伏 [MPa]": mat.yield_strength,
+                   "判定に使う応力": "最大主応力（脆性）" if brittle else "相当応力（降伏）",
+                   "1000G あたり [MPa]": smax / Gpk * 1000,
+                   "破損・降伏が始まる加速度 [G]": lim / (smax / Gpk) if smax > 0 else float("inf")}
     case = {"床に当たる面": c["faces"], "1G 平均変位 [mm]": delta1, "ピーク加速度 [G]": Gpk,
             "衝撃時間 [ms]": Tdur * 1e3, "最大変位 [mm]": float(r.disp_mag.max() * Gpk), "部品": per,
             "計算時間 [s]": time.time() - t1}
@@ -197,10 +203,8 @@ for name, c in CASES.items():
     P(f"\n=== {name}（{H / 1000:g} m）: ピーク {Gpk:,.0f} G / 衝撃時間 {Tdur * 1e3:.2f} ms / "
       f"最大変位 {case['最大変位 [mm]']:.3f} mm（{case['計算時間 [s]']:.1f} s）")
     for nm, v in per.items():
-        ref = v["降伏 [MPa]"]
-        flag = "  ← 超過" if v["最大相当応力 [MPa]"] > ref or v["最大主応力 [MPa]"] > v["強度 [MPa]"] else ""
         P(f"   {nm:<14} ミーゼス {v['最大相当応力 [MPa]']:>8.0f}  主応力 {v['最大主応力 [MPa]']:>8.0f}  "
-          f"（降伏/強度 {ref:g}/{v['強度 [MPa]']:g}）{flag}")
+          f"1000G あたり {v['1000G あたり [MPa]']:>7.1f}  限界 {v['破損・降伏が始まる加速度 [G]']:>9,.0f} G")
     tag = ["face", "back", "bottom", "corner"][list(CASES).index(name)]
     for title, vals, unit, fn in (("相当応力（ミーゼス）", vm, "MPa", "vm"), ("最大主応力", s1, "MPa", "s1")):
         render(mesh, vals, f"{name} {title}", unit, os.path.join(OUT, f"{tag}_{fn}.png"),

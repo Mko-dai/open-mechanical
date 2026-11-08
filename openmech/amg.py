@@ -88,7 +88,7 @@ class ChebyshevAMG:
         return self._vcycle(0, np.asarray(r, float))
 
 
-def build(A, B=None, max_coarse=3000, degree=3, comps=None):
+def build(A, B=None, max_coarse=3000, degree=3, comps=None, robust=False):
     """comps: 自由度ごとの成分番号（0,1,2）。節点ごとに3成分そろっていればブロック（BSR）で集約する"""
     import pyamg
     A = sp.csr_matrix(A)
@@ -97,8 +97,13 @@ def build(A, B=None, max_coarse=3000, degree=3, comps=None):
         A_setup = A.tobsr(blocksize=(3, 3))
     else:
         A_setup = A
-    ml = pyamg.smoothed_aggregation_solver(A_setup, B=B, symmetry="hermitian", strength="symmetric",
-                                           max_coarse=max_coarse, improve_candidates=None,
-                                           smooth=None)   # 平滑化なし集約: 準備が速く、総時間も最短（実測）
+    if robust:
+        # 材料の剛性差が大きい・薄い層が多いモデル向け: 平滑化集約（準備は重いが収束が安定）
+        ml = pyamg.smoothed_aggregation_solver(A_setup, B=B, symmetry="hermitian", strength="symmetric",
+                                               max_coarse=max_coarse, smooth="jacobi")
+    else:
+        ml = pyamg.smoothed_aggregation_solver(A_setup, B=B, symmetry="hermitian", strength="symmetric",
+                                               max_coarse=max_coarse, improve_candidates=None,
+                                               smooth=None)   # 平滑化なし集約: 準備が速く、総時間も最短（実測）
     del A_setup
     return ChebyshevAMG(ml, degree, A0=A)
