@@ -140,8 +140,11 @@ add(rbox(50, 134, 1.8, 58, 142, 2.6), "電源 IC（PMIC）", IC)
 for i, (x, y) in enumerate([(29.5, 130.5), (65.5, 130.5), (29.5, 145.0), (65.5, 145.0)]):
     add(cyl(x, y, 1.8, Z_ADH, 1.2), f"基板の固定柱 {i + 1}", TI)
 # 背面・プラトー
-add(rbox(WALL, PY0 + 0.6, PZ, W - WALL, PY1 - 0.6, PC), "プラトー カバーガラス", GLASS, R - WALL)
-add(rbox(LIP, LIP, 0, W - LIP, PY0 - 0.5, Z_BG), "背面ガラス（Ceramic Shield）", GLASS, R - LIP)
+# プラトーは外形から 0.6 内側（上の角は外形と同心の丸み）。壁 0.6 の内側がカバーガラス
+PW = 0.6
+add(rbox(LIP + PW, PY0 + PW, PZ, W - LIP - PW, L - LIP - PW, PC), "プラトー カバーガラス", GLASS, R - LIP - PW)
+kg = add(rbox(LIP, LIP, 0, W - LIP, L - LIP, Z_BG), "背面ガラス（Ceramic Shield）", GLASS, R - LIP)
+cut(rbox(0, PY0 - 0.5, 0, W, L, Z_BG), kg)        # 上端はまっすぐ（その上はプラトー）
 MSX, MSY = W / 2, 70.0
 add(new_feature("pipe", x=MSX, y=MSY, z=Z_BG, axis="Z", ro=27.5, ri=23.5, h=Z_MS - Z_BG), "MagSafe 磁石リング",
     "ネオジム磁石 NdFeB")
@@ -174,8 +177,8 @@ add(rbox(WALL, WALL, Z_MID, W - WALL, L - WALL, Z_FOAM), "クッション材", "
 add(rbox(WALL, WALL, Z_FOAM, W - WALL, L - WALL, Z_DISP), "表示パネル（OLED）", "表示パネル（OLED＋偏光板＋SUS 支持板・等価）",
     R - WALL)
 # プラトー（チタンの枠。中は空洞）
-kp = add(rbox(1.0, PY0, PZ, W - 1.0, PY1, 0), "カメラプラトー（チタン）", TI, R - 1.0)
-kc = add(rbox(WALL, PY0 + 0.6, PC, W - WALL, PY1 - 0.6, 0), None, None, R - WALL)   # カバーガラスの層は残す（重なりはガラスが持つ）
+kp = add(rbox(LIP, PY0, PZ, W - LIP, L - LIP, 0), "カメラプラトー（チタン）", TI, R - LIP)
+kc = add(rbox(LIP + PW, PY0 + PW, PC, W - LIP - PW, L - LIP - PW, 0), None, None, R - LIP - PW)  # カバーガラスの層は残す
 bool_cut(kp, kc)
 # フレーム（チタン。内側をくり抜き、プラトーの下は開口）
 kf = add(rbox(0, 0, 0, W, L, T), "チタンフレーム", TI, R)
@@ -183,7 +186,9 @@ kf = add(rbox(0, 0, 0, W, L, T), "チタンフレーム", TI, R)
 # 同じ丸みの面を 2 つ重ねると細い隙間要素ができるため）
 k1 = add(rbox(WALL, WALL, Z_BG, W - WALL, L - WALL, Z_ADH), None, None, R - WALL)
 bool_cut(kf, k1)
-k2 = add(rbox(WALL, PY0 + 0.6, 0, W - WALL, PY1 - 0.6, Z_BG + 0.01), None, None, R - WALL)
+# プラトーの下の開口: 空洞と同じ丸みの形を、プラトーより下（Y < PY0+0.6）で切った形（丸みの面が一致するように）
+k2 = add(rbox(WALL, WALL, 0, W - WALL, L - WALL, Z_BG), None, None, R - WALL)
+cut(rbox(0, 0, 0, W, PY0 + PW, Z_BG), k2)
 bool_cut(kf, k2)
 
 keys = feature_body_keys(feats)
