@@ -1439,6 +1439,8 @@ def tet10_jacobian_ratio(mesh) -> np.ndarray:
     """2次四面体の曲がり具合: 角と積分点でのヤコビアン ÷ 直線要素のヤコビアン の最小値（要素ごと）。
     0 以下は要素が裏返っている（解析できない）、1 は直線の要素と同じ。"""
     from .solver import shape_dN_dxi
+    if mesh.elems.shape[1] == 15 and getattr(mesh, "is_wedge", False):
+        return _wedge15_jacobian_ratio(mesh)
     if mesh.elems.shape[1] != 10:
         return np.ones(mesh.n_elems)
     X = mesh.nodes[mesh.elems]
@@ -1454,10 +1456,30 @@ def tet10_jacobian_ratio(mesh) -> np.ndarray:
     return r
 
 
+def _wedge15_jacobian_ratio(mesh) -> np.ndarray:
+    """2 次三角柱の曲がり具合: 節点・積分点でのヤコビアン ÷ 頂点だけ（直線の辺）の要素のヤコビアン の最小値"""
+    from .elements import wedge_dN, wedge_node_points, wedge_quadrature
+    X = mesh.nodes[mesh.elems]
+    pts = np.vstack([wedge_node_points(15), wedge_quadrature(15)[0]])
+    r = np.full(mesh.n_elems, np.inf)
+    X6 = X[:, :6]
+    for p in pts:
+        J = np.linalg.det(np.einsum("eai,ak->eik", X, wedge_dN(p, 15)))
+        J0 = np.linalg.det(np.einsum("eai,ak->eik", X6, wedge_dN(p, 6)))
+        r = np.minimum(r, J / np.where(np.abs(J0) > 1e-300, J0, 1e-300))
+    return r
+
+
 def straighten_bad_tet10(mesh, limit=0.2, log=print, rounds=4) -> int:
-    """曲がりすぎた 2 次要素（ヤコビアン比 < limit）の中間節点を辺の中点に戻す。直した要素数を返す"""
+    """曲がりすぎた 2 次要素（ヤコビアン比 < limit）の中間節点を辺の中点に戻す。直した要素数を返す（三角柱も）"""
     from .solver import _EDGES10
-    if mesh.elems.shape[1] != 10:
+    nn = mesh.elems.shape[1]
+    if nn == 15 and getattr(mesh, "is_wedge", False):
+        from .elements import WEDGE15_EDGES
+        edges, off = WEDGE15_EDGES, 6
+    elif nn == 10:
+        edges, off = _EDGES10, 4
+    else:
         return 0
     fixed = 0
     for _ in range(rounds):
@@ -1465,8 +1487,8 @@ def straighten_bad_tet10(mesh, limit=0.2, log=print, rounds=4) -> int:
         if len(bad) == 0:
             break
         el = mesh.elems[bad]
-        for k, (i, j) in enumerate(_EDGES10):
-            mesh.nodes[el[:, 4 + k]] = 0.5 * (mesh.nodes[el[:, i]] + mesh.nodes[el[:, j]])
+        for k, (i, j) in enumerate(edges):
+            mesh.nodes[el[:, off + k]] = 0.5 * (mesh.nodes[el[:, i]] + mesh.nodes[el[:, j]])
         fixed += len(bad)
     return fixed
 
@@ -1756,8 +1778,17 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
         if fix_msgs:
             log("メッシュ自動修正: " + " / ".join(fix_msgs))
         mesh.fix_log = fix_msgs
-        if np.any(mesh.element_volumes() <= 0):
-            raise GeometryError("不正な要素ができました。要素サイズを小さくして再試行してください。")
+        vols_ = mesh.element_volumes()
+        if np.any(vols_ <= 0):
+            bad = np.nonzero(vols_ <= 0)[0]
+            where = ""
+            if mesh.elem_body is not None:
+                bb = np.unique(mesh.elem_body[bad])
+                where = "（ボディ " + ", ".join(f"B{b}" for b in bb[:10]) + (" …" if len(bb) > 10 else "") + "）"
+            c = mesh.nodes[mesh.elems[bad[0]]].mean(0)
+            raise GeometryError(f"不正な要素（体積 0 以下）が {len(bad):,} 個できました{where}。"
+                                f"例: 座標 ({c[0]:.3g}, {c[1]:.3g}, {c[2]:.3g}) 付近。\n"
+                                "要素サイズを小さくするか、別の手法（四面体／スイープ）で試してください。")
         log(f"メッシュ完了: 節点 {mesh.n_nodes:,} / 要素 {mesh.n_elems:,} / 面 {mesh.n_faces}")
         return mesh
     finally:
