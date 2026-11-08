@@ -40,6 +40,9 @@ class Project:
     env_temp: float = 22.0      # 環境温度 [°C]（Ansys の「静的構造」の環境温度）
     share_topology: str = "none"
     parts: list = field(default_factory=list)           # [{"name": 名, "bodies": [ボディ番号...]}]
+    # 解析の種類: "static"（静的構造）/ "transient"（過渡構造。陰解法・陽解法は dynamic.method）
+    analysis_type: str = "static"
+    dynamic: dict = field(default_factory=dict)         # dynamics.DynamicSettings の内容
 
     def share_map(self) -> dict:
         """{ボディ番号: パート番号}（節点を共有するボディのグループ）"""
@@ -145,7 +148,8 @@ class Project:
                 "body_attrs": self.body_attrs, "body_assign": self.body_assign,
                 "contacts": [c.to_dict() for c in self.contacts], "contact_tolerance": self.contact_tolerance,
                 "settings": self.settings.to_dict(),
-                "share_topology": self.share_topology, "parts": self.parts, "env_temp": self.env_temp}
+                "share_topology": self.share_topology, "parts": self.parts, "env_temp": self.env_temp,
+                "analysis_type": self.analysis_type, "dynamic": self.dynamic}
 
     @staticmethod
     def from_dict(d) -> "Project":
@@ -166,7 +170,8 @@ class Project:
                        contact_tolerance=d.get("contact_tolerance", 0.0),
                        settings=AnalysisSettings.from_dict(d.get("settings", {})),
                        share_topology=d.get("share_topology", "none"), parts=d.get("parts", []),
-                       env_temp=d.get("env_temp", 22.0))
+                       env_temp=d.get("env_temp", 22.0),
+                       analysis_type=d.get("analysis_type", "static"), dynamic=d.get("dynamic", {}))
 
     def save(self, path):
         with open(path, "w", encoding="utf-8") as f:
@@ -204,6 +209,10 @@ class Project:
     def run_all(self, mesh=None, log=print, progress=None):
         mesh = mesh if mesh is not None else self.mesh(log=log)
         em = self.elem_materials(mesh)
+        if self.analysis_type == "transient":
+            from .dynamics import DynamicSettings, solve_dynamic
+            return solve_dynamic(mesh, self.material, self.bcs, DynamicSettings.from_dict(self.dynamic),
+                                 elem_materials=em, log=log, progress=progress)
         if getattr(mesh, "is_2d", False):
             from .plane import solve_2d
             self.check_shell_supported()

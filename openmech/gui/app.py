@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import datetime
+import math
 import os
 import sys
 import tempfile
@@ -71,6 +72,8 @@ RESULT_GROUPS = {
            ("せん断応力 τxy [MPa]", "せん断応力 XY"), ("せん断応力 τyz [MPa]", "せん断応力 YZ"),
            ("せん断応力 τzx [MPa]", "せん断応力 ZX")],
     "ツール": [("安全率（降伏基準）", "安全率（応力ツール）")],
+    "速度（過渡）": [("速度 [mm/s]", "速度"), ("速度 X [mm/s]", "方向速度 X"), ("速度 Y [mm/s]", "方向速度 Y"),
+                ("速度 Z [mm/s]", "方向速度 Z")],
     "ひずみ・シェル": [("相当塑性ひずみ", "相当塑性ひずみ"), ("相当応力（上面） [MPa]", "相当応力（シェル上面）"),
                  ("相当応力（下面） [MPa]", "相当応力（シェル下面）")],
     "接触ツール": [("接触:接触状態", "接触状態"), ("接触:接触圧 [MPa]", "接触圧"), ("接触:貫通量 [mm]", "貫通量"),
@@ -877,7 +880,7 @@ class MainWindow(QMainWindow):
 
     def _update_title(self):
         name = os.path.basename(self.project_path) if self.project_path else "無題"
-        self.setWindowTitle(f"{name} — 静的構造 — open-mechanical {__version__}")
+        self.setWindowTitle(f"{name} — {self._analysis_label()} — open-mechanical {__version__}")
 
     def invalidate(self, mesh=False):
         """設定が変わったら結果を無効にする（Ansys の黄色い ⚡ 状態）"""
@@ -1153,7 +1156,8 @@ class MainWindow(QMainWindow):
         for i, ls in enumerate(self.project.local_sizes):
             add(mesh, self._control_label(i, ls), ("sizing", i), "#3a8fa8" if not ls.get("suppressed") else "#aaaaaa",
                 {"sweep": "掃", "refinement": "再", "sphere": "球"}.get(ls.get("type", "sizing"), "細"))
-        an = add(model, "静的構造 (A5)", ("analysis",), "#2e6db4", "S")
+        an = add(model, self._analysis_label() + " (A5)", ("analysis",), "#2e6db4",
+                 "T" if self.project.analysis_type == "transient" else "S")
         add(an, "解析設定", ("settings",), "#6c7a89", "設")
         for i, bc in enumerate(self.project.bcs):
             add(an, bc.name or BC_JP[bc.kind], ("bc", i), BC_COLORS[bc.kind], BC_JP[bc.kind][0])
@@ -2629,9 +2633,35 @@ class MainWindow(QMainWindow):
         self._row(sec, "スコープ方法", "ジオメトリの選択")
         self._row(sec, "ジオメトリ", w)
 
+    def _analysis_label(self):
+        if self.project.analysis_type != "transient":
+            return "静的構造"
+        return "過渡構造（陽解法）" if (self.project.dynamic or {}).get("method") == "explicit" else "過渡構造（陰解法）"
+
+    def _set_analysis_type(self, key):
+        p = self.project
+        if key == "static":
+            p.analysis_type = "static"
+        else:
+            p.analysis_type = "transient"
+            d = dict(p.dynamic or {})
+            d["method"] = key
+            if key == "explicit" and not d.get("end_time"):
+                d["end_time"] = 1e-3
+            p.dynamic = d
+        self.invalidate()
+        self.rebuild_tree()
+        self._later(self.build_details)
+
     def _details_analysis(self):
         s = self._section("定義")
-        self._row(s, "解析タイプ", "静的構造（線形）")
+        cur = "static" if self.project.analysis_type != "transient" else (self.project.dynamic or {}).get("method", "implicit")
+        self._row(s, "解析タイプ", self._combo(
+            [("静的構造", "static"), ("過渡構造（陰解法・Newmark / HHT）", "implicit"),
+             ("過渡構造（陽解法・LS-DYNA 方式）", "explicit")], cur, self._set_analysis_type))
+        if self.project.analysis_type == "transient":
+            self._row(s, "", "時間・初速度・剛体壁などは「解析設定」で設定します。荷重（力・圧力・重力）は t=0 から"
+                      "（またはランプ時間で）かかります。")
         self._row(s, "物理タイプ", "構造")
         self._row(s, "支持", "あり" if self._has_support() else "なし（固定支持を追加してください）")
         self._row(s, "荷重・支持の数", len(self.project.bcs))
@@ -2658,8 +2688,175 @@ class MainWindow(QMainWindow):
         if rebuild:
             self._later(self.build_details)
 
+    def _dyn(self):
+        from ..dynamics import DynamicSettings
+        return DynamicSettings.from_dict(self.project.dynamic)
+
+    def _dyn_set(self, key, value, rebuild=False):
+        d = self._dyn().to_dict()
+        d[key] = value
+        self.project.dynamic = d
+        self.invalidate()
+        if rebuild:
+            self._later(self.build_details)
+
+    def _details_dynamic(self):
+        """過渡構造（陰解法 / 陽解法）の解析設定"""
+        ds = self._dyn()
+        ex = ds.method == "explicit"
+        s = self._section("時間")
+        et = dspin(ds.end_time, 1e-12, 1e6, 9, 1e-4, "s")
+        et.valueChanged.connect(lambda v: self._dyn_set("end_time", v))
+        self._row(s, "終了時間", et)
+        dt = dspin(ds.dt, 0, 1e3, 12, 1e-7, "s")
+        dt.setToolTip("0 = 自動（陽解法は安定限界×安全係数、陰解法は終了時間÷(出力数×5)）")
+        dt.valueChanged.connect(lambda v: self._dyn_set("dt", v))
+        self._row(s, "時間増分（0 = 自動）", dt)
+        nf = dspin(ds.n_frames, 1, 1000, 0, 1)
+        nf.valueChanged.connect(lambda v: self._dyn_set("n_frames", int(v)))
+        self._row(s, "結果を保存する時刻の数", nf)
+        if ex:
+            sf = dspin(ds.dt_safety, 0.1, 1.0, 2, 0.05)
+            sf.valueChanged.connect(lambda v: self._dyn_set("dt_safety", v))
+            self._row(s, "時間増分の安全係数（TSSFAC）", sf)
+            ms = dspin(ds.mass_scaling_dt, 0, 1, 12, 1e-8, "s")
+            ms.setToolTip("この時間増分より小さい要素だけ質量を増やして計算を速くします（LS-DYNA の DT2MS）。0 = なし")
+            ms.valueChanged.connect(lambda v: self._dyn_set("mass_scaling_dt", v))
+            self._row(s, "質量スケーリングの目標時間増分", ms)
+        else:
+            ha = dspin(ds.hht_alpha, -1 / 3, 0, 3, 0.05)
+            ha.setToolTip("0 = Newmark 平均加速度法（エネルギー保存）。負にすると高い周波数の振動を減衰")
+            ha.valueChanged.connect(lambda v: self._dyn_set("hht_alpha", v))
+            self._row(s, "HHT-α（数値減衰）", ha)
+        s2 = self._section("初期条件・荷重")
+        for i, ax in enumerate("XYZ"):
+            w = dspin(float(ds.init_velocity[i]), -1e9, 1e9, 3, 100.0, "mm/s")
+            w.valueChanged.connect(lambda v, i=i: self._dyn_set("init_velocity",
+                                                                [v if j == i else float(self._dyn().init_velocity[j])
+                                                                 for j in range(3)]))
+            self._row(s2, f"初速度 {ax}", w)
+        rt = dspin(ds.ramp_time, 0, 1e6, 9, 1e-4, "s")
+        rt.setToolTip("荷重を 0 からこの時間で直線的に増やします。0 = t=0 から一定（ステップ荷重）")
+        rt.valueChanged.connect(lambda v: self._dyn_set("ramp_time", v))
+        self._row(s2, "荷重のランプ時間", rt)
+        s3 = self._section("減衰（レイリー）")
+        a = dspin(ds.alpha_damping, 0, 1e9, 4, 10.0, "1/s")
+        a.valueChanged.connect(lambda v: self._dyn_set("alpha_damping", v))
+        self._row(s3, "質量比例 α", a)
+        b = dspin(ds.beta_damping, 0, 1, 10, 1e-7, "s")
+        b.valueChanged.connect(lambda v: self._dyn_set("beta_damping", v))
+        self._row(s3, "剛性比例 β", b)
+        s4 = self._section("剛体壁（床）")
+        w = dict(ds.wall or {})
+        on = bool(w.get("normal"))
+        dirs = [("なし", ""), ("床が −Z 側（物体は +Z 側）", "+Z"), ("床が +Z 側", "-Z"), ("床が −Y 側", "+Y"),
+                ("床が +Y 側", "-Y"), ("床が −X 側", "+X"), ("床が +X 側", "-X")]
+        cur = ""
+        if on:
+            n = np.asarray(w["normal"], float)
+            k = int(np.argmax(np.abs(n)))
+            cur = ("+" if n[k] > 0 else "-") + "XYZ"[k] if abs(abs(n[k]) - 1) < 1e-9 else "custom"
+            if cur == "custom":
+                dirs.append((f"斜め ({n[0]:.3g}, {n[1]:.3g}, {n[2]:.3g})", "custom"))
+
+        def set_dir(v):
+            if not v:
+                self._dyn_set("wall", {}, rebuild=True)
+                return
+            if v == "custom":
+                return
+            n = [0.0, 0.0, 0.0]
+            n["XYZ".index(v[1])] = 1.0 if v[0] == "+" else -1.0
+            ww = dict(self._dyn().wall or {})
+            ww["normal"] = n
+            ww.setdefault("point", [0.0, 0.0, 0.0])
+            if self.mesh is not None:
+                k = "XYZ".index(v[1])
+                lo, hi = self.mesh.bounds()
+                p = [0.0, 0.0, 0.0]
+                p[k] = float(lo[k] if v[0] == "+" else hi[k])
+                ww["point"] = p
+            self._dyn_set("wall", ww, rebuild=True)
+        self._row(s4, "剛体壁", self._combo(dirs, cur, set_dir))
+        if on:
+            for i, ax in enumerate("XYZ"):
+                pw = dspin(float(w.get("point", [0, 0, 0])[i]), -1e9, 1e9, 4, 1.0, "mm")
+
+                def set_p(v, i=i):
+                    ww = dict(self._dyn().wall)
+                    pp = list(ww.get("point", [0, 0, 0]))
+                    pp[i] = v
+                    ww["point"] = pp
+                    self._dyn_set("wall", ww)
+                pw.valueChanged.connect(set_p)
+                self._row(s4, f"壁の通る点 {ax}", pw)
+            fr = dspin(float(w.get("friction", 0.0)), 0, 10, 3, 0.05)
+
+            def set_mu(v):
+                ww = dict(self._dyn().wall)
+                ww["friction"] = v
+                self._dyn_set("wall", ww)
+            fr.valueChanged.connect(set_mu)
+            self._row(s4, "摩擦係数", fr)
+        s5 = self._section("落下試験（かんたん設定）")
+        hb = QPushButton("落下の高さと向きから設定…")
+        hb.clicked.connect(lambda: self._later(self.setup_drop))
+        self._row(s5, "", hb)
+        self._row(s5, "", "高さから初速度 √(2gh) を求め、物体がちょうど床に触れる位置に剛体壁を置きます。"
+                  "落ちる向き（斜めも可）を指定できます。")
+
+    def setup_drop(self):
+        """落下試験の設定: 高さ・落ちる向き → 初速度と剛体壁"""
+        if self.mesh is None:
+            QMessageBox.information(self, "落下試験", "先にメッシュを作成してください。")
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("落下試験の設定")
+        lay = QGridLayout(dlg)
+        h = dspin(1000.0, 0.001, 1e6, 1, 100.0, "mm")
+        dx, dy, dz = dspin(0.0, -1, 1, 4, 0.1), dspin(0.0, -1, 1, 4, 0.1), dspin(-1.0, -1, 1, 4, 0.1)
+        mu = dspin(0.2, 0, 10, 2, 0.05)
+        dur = dspin(5e-4, 1e-7, 1, 7, 1e-4, "s")
+        rows = [("落下の高さ", h), ("落ちる向き X", dx), ("落ちる向き Y", dy), ("落ちる向き Z", dz),
+                ("床の摩擦係数", mu), ("解析時間（衝突後）", dur)]
+        for i, (lbl, w) in enumerate(rows):
+            lay.addWidget(QLabel(lbl), i, 0)
+            lay.addWidget(w, i, 1)
+        note = QLabel("例: 角から落とすなら向きを (−1, −1, 0) のように斜めに。床は向きに垂直な面で、"
+                      "物体の一番先の点に接するよう置きます。陽解法（LS-DYNA 方式）をおすすめします。")
+        note.setWordWrap(True)
+        lay.addWidget(note, len(rows), 0, 1, 2)
+        bb = QPushButton("設定する")
+        bb.clicked.connect(dlg.accept)
+        lay.addWidget(bb, len(rows) + 1, 1)
+        if not dlg.exec():
+            return
+        d = np.array([dx.value(), dy.value(), dz.value()], float)
+        if np.linalg.norm(d) < 1e-9:
+            return
+        d /= np.linalg.norm(d)
+        v0 = math.sqrt(2 * 9806.65 * h.value())
+        far = self.mesh.nodes[int(np.argmax(self.mesh.nodes @ d))]
+        p = self.project
+        if p.analysis_type != "transient":
+            p.analysis_type = "transient"
+        dd = self._dyn().to_dict()
+        if not p.dynamic.get("method"):
+            dd["method"] = "explicit"
+        dd.update(init_velocity=list(map(float, v0 * d)), end_time=float(dur.value()),
+                  wall={"normal": list(map(float, -d)), "point": list(map(float, far)), "friction": float(mu.value())})
+        p.dynamic = dd
+        self.log(f"落下試験: 高さ {h.value():g} mm → 衝突速度 {v0:,.0f} mm/s（{v0 / 1000:.2f} m/s）、"
+                 f"向き ({d[0]:.3g}, {d[1]:.3g}, {d[2]:.3g})")
+        self.invalidate()
+        self.rebuild_tree()
+        self._later(self.build_details)
+
     def _details_settings(self):
         """Ansys の「解析設定」と同じ項目"""
+        if self.project.analysis_type == "transient":
+            self._details_dynamic()
+            return
         st = self.project.settings
         # ステップ制御
         s = self._section("ステップ制御")
@@ -2900,6 +3097,55 @@ class MainWindow(QMainWindow):
             for line in self.solver_log[-12:]:
                 self._row(s2, "", line)
 
+    def show_history_plot(self):
+        """過渡解析の時刻歴（エネルギー・接触力・最大変位）のグラフ"""
+        h = getattr(self.results[-1], "history", None) if self.results else None
+        if not h:
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("時刻歴")
+        dlg.resize(820, 560)
+        lay = QVBoxLayout(dlg)
+        t = np.asarray(h["時間 [s]"]) * 1e3
+        keys = [k for k in h if k != "時間 [s]"]
+        try:
+            from PySide6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis
+            tabs = QTabWidget()
+            for k in keys:
+                ch = QChart()
+                ser = QLineSeries()
+                ys = np.asarray(h[k], float)
+                step = max(1, len(t) // 1500)
+                for x, y in zip(t[::step], ys[::step]):
+                    ser.append(float(x), float(y))
+                ch.addSeries(ser)
+                ax, ay = QValueAxis(), QValueAxis()
+                ax.setTitleText("時間 [ms]")
+                ay.setTitleText(k)
+                ax.setRange(float(t.min()), float(t.max()) if t.max() > t.min() else float(t.min()) + 1)
+                lo, hi = float(ys.min()), float(ys.max())
+                ay.setRange(lo, hi if hi > lo else lo + 1)
+                ch.addAxis(ax, Qt.AlignBottom)
+                ch.addAxis(ay, Qt.AlignLeft)
+                ser.attachAxis(ax)
+                ser.attachAxis(ay)
+                ch.legend().hide()
+                ch.setTitle(f"{k}（最大 {hi:.4g}）")
+                v = QChartView(ch)
+                v.setRenderHint(QPainter.Antialiasing)
+                tabs.addTab(v, k.split(" [")[0])
+            lay.addWidget(tabs)
+        except Exception:
+            box = QPlainTextEdit()
+            box.setReadOnly(True)
+            lines = ["時間 [ms]\t" + "\t".join(keys)]
+            step = max(1, len(t) // 200)
+            for i in range(0, len(t), step):
+                lines.append(f"{t[i]:.5g}\t" + "\t".join(f"{h[k][i]:.5g}" for k in keys))
+            box.setPlainText("\n".join(lines))
+            lay.addWidget(box)
+        dlg.show()
+
     def _details_result(self):
         key = self.project.results[self.current[1]]
         s = self._section("スコープ")
@@ -2909,7 +3155,10 @@ class MainWindow(QMainWindow):
             st = self._section("時間")
             c = QComboBox()
             for j, r in enumerate(self.results):
-                c.addItem(f"ステップ {r.info.get('ステップ', j + 1)}（{getattr(r, 'time', j + 1):g} s）", j)
+                if getattr(r, "history", None) is not None:
+                    c.addItem(f"時刻 {getattr(r, 'time', 0):.4g} s", j)
+                else:
+                    c.addItem(f"ステップ {r.info.get('ステップ', j + 1)}（{getattr(r, 'time', j + 1):g} s）", j)
             c.setCurrentIndex(self.result_index if self.result_index >= 0 else len(self.results) - 1)
 
             def pick(_):
@@ -2918,6 +3167,10 @@ class MainWindow(QMainWindow):
                 self._later(lambda: (self.build_details(), self.refresh_view()))
             c.currentIndexChanged.connect(pick)
             self._row(st, "表示時間", c)
+            if getattr(self.results[-1], "history", None) is not None:
+                hb = QPushButton("時刻歴グラフ（エネルギー・接触力）…")
+                hb.clicked.connect(lambda: self._later(self.show_history_plot))
+                self._row(st, "", hb)
         s2 = self._section("定義")
         self._row(s2, "タイプ", RESULT_TYPE_JP.get(key, RESULT_NAME.get(key, key)))
         self._row(s2, "単位", key.split("[")[-1].rstrip("]") if "[" in key else "なし")
@@ -3129,7 +3382,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "解析", "面が割り当てられていない荷重・支持があります（? マーク）。\n"
                                 "面を選択して詳細の「適用」を押してください。")
             return
-        if not self._has_support():
+        transient = self.project.analysis_type == "transient"
+        if not self._has_support() and not transient:
             QMessageBox.warning(self, "解析", "支持がありません。「固定支持」などを追加してください。")
             return
         if self.mesh is None or self.mesh_dirty:
@@ -3151,6 +3405,19 @@ class MainWindow(QMainWindow):
         bad_c = [c.name for c in p.contacts if not c.suppressed and not (c.contact_faces and c.target_faces)]
         if bad_c:
             QMessageBox.warning(self, "接触", "面が割り当てられていない接触領域があります: " + ", ".join(bad_c))
+            return
+        if transient:
+            from ..dynamics import DynamicSettings, solve_dynamic
+            ds = DynamicSettings.from_dict(p.dynamic)
+            if not self._has_support() and not (ds.wall or {}).get("normal") and not any(ds.init_velocity):
+                QMessageBox.warning(self, "過渡構造", "支持・剛体壁・初速度のどれもありません。")
+                return
+            self._busy(True, "過渡解析を実行しています…")
+            self.worker = Worker(solve_dynamic, self.mesh, p.material, list(p.bcs), ds, elem_materials=em)
+            self.worker.log.connect(lambda m: (self.solver_log.append(m), self.log(m)))
+            self.worker.done.connect(self._on_solved)
+            self.worker.failed.connect(self._on_solve_failed)
+            self.worker.start()
             return
         if self._surface_mesh():
             try:
@@ -3562,7 +3829,7 @@ class MainWindow(QMainWindow):
         if k in ("analysis", "bc", "settings", "solution", "info") and self.project.bcs:
             if pts:
                 _labels(pl, pts, labs, 14, "white", bg="#333333")
-            head = "<b>静的構造</b><br>" + datetime.datetime.now().strftime("%Y/%m/%d %H:%M") + "<br>"
+            head = f"<b>{self._analysis_label()}</b><br>" + datetime.datetime.now().strftime("%Y/%m/%d %H:%M") + "<br>"
             self._set_overlay(head + "<br>".join(overlay))
         elif k in ("connections", "contacts", "contact"):
             self._set_overlay("<br>".join(overlay))
@@ -3639,7 +3906,8 @@ class MainWindow(QMainWindow):
         key = self.project.results[self.current[1]]
         fields = self._fields(r)
         if key not in fields:
-            why = "接触の結果がありません" if key.startswith("接触:") else "降伏応力が未設定のため表示できません"
+            why = ("接触の結果がありません" if key.startswith("接触:") else
+                   "過渡構造の結果だけにあります" if key.startswith("速度") else "降伏応力が未設定のため表示できません")
             self._set_overlay(f"<b>{RESULT_NAME.get(key, key)}</b><br>（{why}）")
             self._draw_model()
             return
@@ -3700,7 +3968,7 @@ class MainWindow(QMainWindow):
             _labels(pl, [pts[self._probe_pt]], [self._probe_val], 12, "black", point_color="magenta", bg="#ffffcc")
         unit = key.split("[")[-1].rstrip("]") if "[" in key else ""
         self._set_overlay(
-            f"<b>B: 静的構造</b><br>{RESULT_NAME.get(key, key)}<br>"
+            f"<b>B: {self._analysis_label()}</b><br>{RESULT_NAME.get(key, key)}<br>"
             f"タイプ: {RESULT_TYPE_JP.get(key, RESULT_NAME.get(key, key))}<br>"
             + (f"単位: {unit}<br>" if unit else "")
             + f"時間: {getattr(r, 'time', 1.0):g} s<br>{datetime.datetime.now():%Y/%m/%d %H:%M}<br>"

@@ -130,6 +130,35 @@ try:
     w.grab().save(os.path.join(out, "gui_2d.png"))
 except Exception:
     P("NG 2D 解析\n" + traceback.format_exc())
+# 過渡構造（陽解法）: 直方体を床に落とす
+try:
+    w.project.geometry = {"kind": "model", "features": []}
+    w.project.bcs = []
+    w.remesh()
+    w.create_body("box", dialog=True)
+    w._set_analysis_type("explicit")
+    app.processEvents()
+    lo, hi = w.mesh.bounds()
+    w.project.dynamic.update(end_time=2e-5, n_frames=10, init_velocity=[0, 0, -4429.0],
+                             wall={"normal": [0, 0, 1], "point": [0, 0, float(lo[2])], "friction": 0.2})
+    w.select_node(("settings",))
+    app.processEvents()
+    fr = w.project.run_all(w.mesh, log=lambda *a: None)
+    w._on_solved(fr)
+    app.processEvents()
+    w.show_history_plot()
+    app.processEvents()
+    P(f"過渡（陽解法）OK: {len(fr)} 時刻 / 最大接触力 {fr[-1].info['最大接触力 [N]']:.1f} N / "
+      f"時間増分 {fr[-1].info['時間増分 [s]']:.2e} s / 木の表示 {w._analysis_label()}")
+    w.grab().save(os.path.join(out, "gui_transient.png"))
+    w._set_analysis_type("implicit")
+    w.project.dynamic.update(dt=1e-6)
+    fr = w.project.run_all(w.mesh, log=lambda *a: None)
+    w._on_solved(fr)
+    app.processEvents()
+    P(f"過渡（陰解法）OK: {len(fr)} 時刻 / 最大接触力 {fr[-1].info['最大接触力 [N]']:.1f} N")
+except Exception:
+    P("NG 過渡\n" + traceback.format_exc())
 P("完了")
 logf.close()
 w.close()
