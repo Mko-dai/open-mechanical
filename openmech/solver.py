@@ -775,7 +775,9 @@ def _linear_solve(A: sp.csc_matrix, b: np.ndarray, log=print, coords=None,
             B = _rigid_modes(coords, n) if coords is not None else None
             t0 = time.time()
             import os as _os
-            robust0 = _os.environ.get("OPENMECH_AMG", "") == "robust"
+            # 三角柱の積層メッシュ（線平滑化あり）は最初から平滑化集約: 積層板の実測で反復 1984 → 94 回、時間 1/7
+            robust0 = _os.environ.get("OPENMECH_AMG", "") == "robust" or (
+                lines is not None and _os.environ.get("OPENMECH_AMG", "") != "fast")
             M = build_amg(A, B, comps=coords[:, 3].astype(int) if coords is not None else None, lines=lines,
                           robust=robust0)
             t1 = time.time()

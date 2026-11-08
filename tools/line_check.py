@@ -68,6 +68,8 @@ def run(m, em, use_lines, robust=False):
 
 
 CASES = [(80, 40, False, False), (80, 40, True, False), (80, 40, False, True), (80, 40, True, True)]
+if "--iphone-only" in sys.argv:
+    CASES = []
 if "--big" in sys.argv:
     CASES = [(156, 75, a, b) for a, b in ((False, False), (True, False), (True, True))]
 for lx, ly, use, rob in CASES:
@@ -76,7 +78,7 @@ for lx, ly, use, rob in CASES:
       f"AMG {'平滑化集約（頑健）' if rob else '平滑化なし集約（既定）'}")
     dt, d = run(m, em, use, rob)
     P(f"  → {dt:.1f} s / 最大変位 {d:.6e} mm")
-if "--iphone" not in sys.argv:
+if "--iphone" not in sys.argv and "--iphone-only" not in sys.argv:
     P("完了")
     sys.exit(0)
 
@@ -91,7 +93,7 @@ info = m.face_info()
 hi = m.nodes[:, 2].max()
 f0 = [f["id"] for f in info if f["flat"] and abs(f["centroid"][2] - hi) < 0.05 and f["normal"][2] > 0.99]
 p.bcs = [BC("fixed", f0), BC("gravity", [], [0, 0, 9810.0])]
-os.environ["OPENMECH_AMG"] = "robust" if "--robust" in sys.argv else ""
+os.environ["OPENMECH_AMG"] = ""
 t = time.time()
 r = p.run(m, log=lambda s: P("    " + str(s)))
 P(f"  → {time.time() - t:.1f} s / 最大変位 {r.disp_mag.max():.4g} mm / 最大ミーゼス {r.von_mises.max():.4g} MPa")
