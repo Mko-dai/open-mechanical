@@ -1191,7 +1191,7 @@ def _gmsh_quality_fix(gmsh, qmin, log):
 
 def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 12,
                log=print, local_sizes: list | None = None, share: dict | None = None,
-               settings: dict | None = None) -> Mesh:
+               settings: dict | None = None, step_out: str | None = None) -> Mesh:
     """形状 spec からメッシュを作る。
 
     spec 例: {"kind": "box", "lx": 100, "ly": 20, "lz": 10}
@@ -1235,6 +1235,9 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
         else:
             raise GeometryError(f"未知の形状指定: {spec}")
 
+        if step_out:      # 作った形状を STEP で書き出す（Ansys などで同じ形状をメッシュして比べる用）
+            gmsh.model.occ.synchronize()
+            gmsh.write(step_out)
         ms = dict(MESH_DEFAULTS)
         ms.update(settings or {})
         diag = _bbox_diag(gmsh)
