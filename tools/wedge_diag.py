@@ -50,9 +50,10 @@ for name, ctrl in configs:
       f"剛性行列の非ゼロ {nnz / 1e6:.0f} 百万（約 {nnz * 12 / 1e9:.1f} GB）/ 解法 {choose_method(3 * m.n_nodes)}")
     p = ip.p
     info = m.face_info()
-    lo = m.nodes[:, 2].min()
-    f0 = [f["id"] for f in info if abs(f["centroid"][2] - lo) < 1e-3 and f["normal"][2] < -0.99]
-    p.bcs = [BC("fixed", f0), BC("gravity", [], [0, 0, -9.81e6])]
+    hi = m.nodes[:, 2].max()
+    # 落下解析（iphone_air_drop.py の「画面から落下」）と同じ: 前面ガラスの面を固定して 1 G
+    f0 = [f["id"] for f in info if f["flat"] and abs(f["centroid"][2] - hi) < 0.05 and f["normal"][2] > 0.99]
+    p.bcs = [BC("fixed", f0), BC("gravity", [], [0, 0, 9810.0])]
     P(f"固定する面 {len(f0)} / 非線形ソルバーが必要か {p.needs_nonlinear_solver(m)}")
     t1 = time.time()
     try:
