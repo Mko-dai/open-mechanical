@@ -126,3 +126,50 @@ def test_multi_step_loads():
                       **quiet)
     assert len(rs) == 2
     assert rs[1].u[:, 2].min() == pytest.approx(2 * rs[0].u[:, 2].min(), rel=1e-9)
+
+
+# ---- 高度な設定（Ansys の詳細と同じ項目）
+def test_detect_default_type_and_mu():
+    m = stack(structured_box(40, 40, 10, 4, 4, 2), structured_box(40, 40, 10, 4, 4, 2, origin=(0, 0, 10)))
+    cs = detect_contacts(m, 0.0, "frictional", 0.35)
+    assert cs[0].type == "frictional" and cs[0].mu == 0.35
+
+
+@pytest.mark.parametrize("kw", [dict(stiffness_mode="absolute", stiffness_value=2e5),
+                                dict(stiffness_mode="factor", stiffness_factor=5.0),
+                                dict(pen_tol_mode="value", pen_tol=1e-4),
+                                dict(update_stiffness="each_iteration", formulation="penalty"),
+                                dict(detection="nodal_contact"),
+                                dict(pinball_mode="radius", pinball=2.0),
+                                dict(stabilization=0.01)])
+def test_frictionless_advanced_settings(kw):
+    m, cs = blocks()
+    for c in cs:
+        c.type = "frictionless"
+        for k, v in kw.items():
+            setattr(c, k, v)
+    r = solve_static(m, S, _press_bcs(m), cs, **quiet)[-1]
+    assert np.nanmedian(r.contact["接触圧 [MPa]"]) == pytest.approx(10.0, rel=0.02)
+    if "pen_tol" in kw:
+        assert np.nanmax(r.contact["貫通量 [mm]"]) <= 1e-4 * 1.01
+
+
+def test_frictional_elastic_slip_tolerance():
+    m, cs = blocks()
+    for c in cs:
+        c.type, c.mu, c.slip_tol_mode, c.slip_tol = "frictional", 0.3, "value", 1e-3
+    ys = [f["id"] for f in m.face_info() if abs(f["centroid"][1]) < 1e-6]
+    side = [f["id"] for f in m.face_info() if abs(f["centroid"][0] - 40) < 1e-6 and f["centroid"][2] > 10]
+    base = [BC("fixed", [face(m, 2, 0, -1)]), BC("displacement", ys, [None, 0.0, None]),
+            BC("pressure", [face(m, 2, 20, 1)], [10.0])]
+    r = solve_static(m, S, base + [BC("displacement", side, [-0.2, None, None])], cs,
+                     settings=AnalysisSettings(initial_substeps=5), **quiet)[-1]
+    assert -r.reactions[3][0] == pytest.approx(0.3 * 16000, rel=0.01)
+
+
+def test_contact_roundtrip_old_file():
+    from openmech.contact import ContactRegion
+    c = ContactRegion.from_dict({"type": "frictional", "stiffness_factor": 3.0, "pinball": 1.5})
+    assert c.stiffness_mode == "factor" and c.pinball_mode == "radius"
+    c2 = ContactRegion.from_dict(c.to_dict())
+    assert c2 == c

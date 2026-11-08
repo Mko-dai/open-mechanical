@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 import scipy.sparse as sp
 
-from .contact import (ContactRegion, build_pairs, commit_states, contact_results, contact_system,
+from .contact import (ContactRegion, build_pairs, commit_states, penetration_ok, contact_results, contact_system,
                       update_states)
 from .materials import Material
 from .mesh import Mesh
@@ -184,7 +184,7 @@ def _step_factor(bc: BC, t: float, ends: list[float]) -> float:
 
 def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[ContactRegion] | None = None,
                  settings: AnalysisSettings | None = None, elem_materials=None, log=print,
-                 progress=None) -> list[Result]:
+                 progress=None, contact_tolerance: float = 0.0) -> list[Result]:
     """静的構造解析（接触・大変形・複数ステップ対応）。各ステップ終了時の Result のリストを返す。"""
     t_start = time.time()
     settings = settings or AnalysisSettings()
@@ -245,7 +245,7 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
     E_node = np.zeros(mesh.n_nodes)
     Ee = np.array([m.E for m in mats])[elem_mat]
     np.maximum.at(E_node, mesh.elems.ravel(), np.repeat(Ee, mesh.elems.shape[1]))
-    pairs = build_pairs(mesh, contacts, E_node) if contacts else []
+    pairs = build_pairs(mesh, contacts, E_node, contact_tolerance) if contacts else []
     if contacts:
         log(f"接触: {len(contacts)} 領域 / 接触節点 {sum(len(p.slave) for p in pairs):,}")
     nonlinear_contact = any(c.nonlinear for c in contacts)
@@ -367,7 +367,7 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
             ok_disp = settings.displacement_convergence <= 0 or dcrit <= settings.displacement_convergence
             # 接触状態は数節点が行き来しても、力が釣り合っていれば収束とみなす（Ansys と同様）
             n_cn = sum(len(p.slave) for p in pairs)
-            ok_contact = changed <= max(0, int(0.01 * n_cn)) and (not al or pen <= pen_tol)
+            ok_contact = changed <= max(0, int(0.01 * n_cn)) and (not al or penetration_ok(pairs, pen_tol))
             if not nonlinear:
                 return u, F
             if it > 1 or not (LD or ps is not None):

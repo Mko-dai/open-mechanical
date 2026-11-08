@@ -35,6 +35,8 @@ class Project:
     body_assign: dict = field(default_factory=dict)     # "ボディ番号" → {"attr": 名, "mat": 名}
     contacts: list = field(default_factory=list)        # ContactRegion（接続 → 接触）
     contact_tolerance: float = 0.0                      # 自動検出の許容距離（0 = 自動）
+    contact_default_type: str = "bonded"                # 自動検出で作る接触のタイプ
+    contact_default_mu: float = 0.2                     # 自動検出で「摩擦あり」のときの摩擦係数
     settings: AnalysisSettings = field(default_factory=AnalysisSettings)
     # 節点共有（Ansys のトポロジ共有）: "none" = しない / "all" = 接するボディすべて / "parts" = パートごと
     env_temp: float = 22.0      # 環境温度 [°C]（Ansys の「静的構造」の環境温度）
@@ -151,6 +153,7 @@ class Project:
                 "materials": {k: m.to_dict() for k, m in self.materials.items()},
                 "body_attrs": self.body_attrs, "body_assign": self.body_assign,
                 "contacts": [c.to_dict() for c in self.contacts], "contact_tolerance": self.contact_tolerance,
+                "contact_default_type": self.contact_default_type, "contact_default_mu": self.contact_default_mu,
                 "settings": self.settings.to_dict(),
                 "share_topology": self.share_topology, "parts": self.parts, "env_temp": self.env_temp,
                 "analysis_type": self.analysis_type, "dynamic": self.dynamic,
@@ -173,6 +176,8 @@ class Project:
                        body_assign=d.get("body_assign", {}),
                        contacts=[ContactRegion.from_dict(c) for c in d.get("contacts", [])],
                        contact_tolerance=d.get("contact_tolerance", 0.0),
+                       contact_default_type=d.get("contact_default_type", "bonded"),
+                       contact_default_mu=d.get("contact_default_mu", 0.2),
                        settings=AnalysisSettings.from_dict(d.get("settings", {})),
                        share_topology=d.get("share_topology", "none"), parts=d.get("parts", []),
                        env_temp=d.get("env_temp", 22.0),
@@ -270,6 +275,7 @@ class Project:
                           method=self.settings.solver_type, n_cores=self.settings.n_cores)]
         if not self.contacts and mesh.elem_body is not None and len(mesh.body_ids()) > 1:
             from .contact import detect_contacts
-            self.contacts = detect_contacts(mesh, self.contact_tolerance)
+            self.contacts = detect_contacts(mesh, self.contact_tolerance, self.contact_default_type,
+                                            self.contact_default_mu)
         return solve_static(mesh, self.material, self.bcs, self.contacts, self.settings, elem_materials=em,
-                            log=log, progress=progress)
+                            log=log, progress=progress, contact_tolerance=self.contact_tolerance)

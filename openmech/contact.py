@@ -28,6 +28,12 @@ FORMULATIONS = {"auto": "プログラム制御", "augmented_lagrange": "拡張�
                 "penalty": "ペナルティ法", "mpc": "MPC"}
 BEHAVIORS = {"auto": "プログラム制御", "asymmetric": "非対称", "symmetric": "対称"}
 INTERFACE = {"adjust": "接触するよう調整", "offset": "オフセットを追加（ランプなし）", "none": "なし（実際の隙間）"}
+DETECTIONS = {"auto": "プログラム制御", "nodal_target": "節点（ターゲット面の法線方向）",
+              "nodal_contact": "節点（接触面の法線方向）"}
+STIFFNESS_MODES = {"auto": "プログラム制御", "factor": "係数", "absolute": "絶対値"}
+UPDATE_STIFFNESS = {"auto": "プログラム制御", "never": "しない", "each_iteration": "各反復"}
+TOL_MODES = {"auto": "プログラム制御", "factor": "係数", "value": "値"}
+PINBALL_MODES = {"auto": "プログラム制御", "radius": "半径", "detection": "自動検出値"}
 LINEAR_TYPES = ("bonded", "no_separation")
 CORNER_WEIGHT = 0.005
 
@@ -51,6 +57,17 @@ class ContactRegion:
     pinball: float = 0.0                # 0 = プログラム制御
     interface: str = "adjust"
     offset: float = 0.0
+    # 高度な設定（Ansys の「詳細 → 高度な設定」と同じ項目）
+    detection: str = "auto"             # 検出方法
+    stiffness_mode: str = "auto"        # 法線剛性: プログラム制御 / 係数（stiffness_factor）/ 絶対値（stiffness_value）
+    stiffness_value: float = 0.0        # 法線剛性の絶対値 [N/mm³]
+    update_stiffness: str = "auto"      # 剛性の更新
+    pen_tol_mode: str = "auto"          # 貫通許容値: プログラム制御 / 係数（× 要素サイズ）/ 値 [mm]
+    pen_tol: float = 0.0
+    slip_tol_mode: str = "auto"         # 弾性すべり許容値（摩擦あり）: プログラム制御 / 係数 / 値 [mm]
+    slip_tol: float = 0.0
+    pinball_mode: str = "auto"          # ピンボール領域: プログラム制御 / 半径（pinball）/ 自動検出値
+    stabilization: float = 0.0          # 安定化減衰係数（0 = なし）: 開いている接触にも弱いばねを入れて浮きを防ぐ
     auto: bool = True                   # 自動検出で作られたか
     suppressed: bool = False
 
@@ -63,7 +80,13 @@ class ContactRegion:
         for k, v in d.items():
             if hasattr(c, k):
                 setattr(c, k, v)
+        # 古いファイル: 法線剛性係数・ピンボール半径が入っていれば、そのモードにする
+        if "stiffness_mode" not in d and c.stiffness_factor > 0:
+            c.stiffness_mode = "factor"
+        if "pinball_mode" not in d and c.pinball > 0:
+            c.pinball_mode = "radius"
         return c
+
 
     @property
     def nonlinear(self):
@@ -82,7 +105,8 @@ class ContactRegion:
 
 # ---------------------------------------------------------------------------- 自動検出
 
-def detect_contacts(mesh, tolerance: float = 0.0) -> list[ContactRegion]:
+def detect_contacts(mesh, tolerance: float = 0.0, default_type: str = "bonded",
+                    default_mu: float = 0.2) -> list[ContactRegion]:
     """ボディ同士で向かい合っている面を探して接触領域を作る（Ansys の「接続の自動作成」）。
 
     tolerance: この距離以内の面を接触とみなす [mm]（0 = モデル寸法から自動）
@@ -121,7 +145,9 @@ def detect_contacts(mesh, tolerance: float = 0.0) -> list[ContactRegion]:
             fa = sorted(set(fid[ta[good]].tolist()))
             fb = sorted(set(fid[jb[good]].tolist()))
             out.append(ContactRegion(name=f"接触領域（B{a} - B{b}）", contact_faces=fa, target_faces=fb,
-                                     contact_body=int(a), target_body=int(b), auto=True))
+                                     contact_body=int(a), target_body=int(b), auto=True,
+                                     type=default_type if default_type in CONTACT_TYPES else "bonded",
+                                     mu=float(default_mu)))
     return out
 
 
@@ -152,6 +178,11 @@ class Pairs:
     tau_c: np.ndarray = None    # (M,3) 前の収束状態の摩擦応力
     dt_c: np.ndarray = None     # (M,3) 前の収束状態の接線相対変位
     tau_now: np.ndarray = None  # (M,3) 現在の摩擦応力
+    pen_tol: float = 0.0        # 貫通許容値 [mm]
+    slip_tol: float = 0.0       # 弾性すべり許容値 [mm]（0 = 接線剛性は固定）
+    kn0: np.ndarray = None      # 最初の法線剛性（剛性の更新の上限・下限に使う）
+    stab: float = 0.0           # 安定化（開いている節点にも入れる弱いばねの係数）
+    max_pen: float = 0.0        # 最後の更新での最大貫通量
     Ktan: np.ndarray = None     # (M,3,3) 接線方向の剛性（摩擦: 固着 kt·P、すべり 整合接線）
 
 
@@ -175,7 +206,7 @@ def _closest_on_tri(p, a, b, c):
 
 
 def _region_pairs(mesh, reg: ContactRegion, contact_faces, target_faces, E_of_node, h_char,
-                  ridx, diag):
+                  ridx, diag, det_tol=0.0):
     from scipy.spatial import cKDTree
 
     if not contact_faces or not target_faces:
@@ -184,7 +215,8 @@ def _region_pairs(mesh, reg: ContactRegion, contact_faces, target_faces, E_of_no
     ttris = np.concatenate([mesh.face_tris(f, full=False) for f in target_faces])
     # Contact 側の節点と受け持ち面積（全節点に均等配分）
     p = mesh.nodes[ctris[:, :3]]
-    A = 0.5 * np.linalg.norm(np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]), axis=1)
+    cr = np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0])
+    A = 0.5 * np.linalg.norm(cr, axis=1)
     k = ctris.shape[1]
     slave_all = ctris.ravel()
     if k == 6:
@@ -196,6 +228,11 @@ def _region_pairs(mesh, reg: ContactRegion, contact_faces, target_faces, E_of_no
         w_all = np.repeat(A / k, k)
     slave, inv = np.unique(slave_all, return_inverse=True)
     area = np.bincount(inv, weights=w_all)
+    # 接触面の節点法線（面積重みの平均、ボディの外向き）
+    cn_node = np.zeros((len(slave), 3))
+    for c in range(3):
+        cn_node[:, c] = np.bincount(inv, weights=np.repeat(cr[:, c], k), minlength=len(slave))
+    cn_node /= np.maximum(np.linalg.norm(cn_node, axis=1, keepdims=True), 1e-300)
     # Target 側
     tp = mesh.nodes[ttris]
     tn = np.cross(tp[:, 1] - tp[:, 0], tp[:, 2] - tp[:, 0])
@@ -218,6 +255,9 @@ def _region_pairs(mesh, reg: ContactRegion, contact_faces, target_faces, E_of_no
         best_d[better], best_bc[better], best_t[better] = d[better], bc[better], t[better]
     masters = ttris[best_t]
     n = tn[best_t]
+    if reg.detection == "nodal_contact":
+        # 検出方法「節点（接触面の法線方向）」: 法線は接触面の外向き法線の逆（ターゲットから接触側へ）
+        n = -cn_node
     # 2次要素の中間節点と一致する場合は節点どうしで結ぶ（ぴったり合ったメッシュで正確）
     tnodes = np.unique(np.concatenate([mesh.face_tris(f) for f in target_faces]).ravel())
     ttree = cKDTree(mesh.nodes[tnodes])
@@ -227,14 +267,11 @@ def _region_pairs(mesh, reg: ContactRegion, contact_faces, target_faces, E_of_no
         m = tnodes[jn[coincide]]
         masters[coincide] = m[:, None]
         best_bc[coincide] = np.array([1.0, 0.0, 0.0])
-        # 法線は節点まわりの Target 三角形の平均
     q = np.einsum("ij,ijk->ik", best_bc, mesh.nodes[masters])
     g0 = np.einsum("ij,ij->i", xs - q, n)
     # ピンボール: これより離れた節点は接触の対象外
-    pin = reg.pinball if reg.pinball > 0 else (max(4.0 * h_char, 1e-9) if reg.nonlinear else 1e30)
+    pin = pinball_radius(reg, h_char, diag, det_tol)
     keep = best_d <= pin
-    if reg.type in LINEAR_TYPES and reg.pinball <= 0:
-        keep = best_d <= max(4.0 * h_char, 0.02 * diag)
     if not keep.any():
         return None
     slave, masters, best_bc, n, g0, area = slave[keep], masters[keep], best_bc[keep], n[keep], g0[keep], area[keep]
@@ -242,13 +279,18 @@ def _region_pairs(mesh, reg: ContactRegion, contact_faces, target_faces, E_of_no
         g0 = np.zeros_like(g0)          # 接触するよう調整（初期の隙間・食い込みを無視）
     elif reg.interface == "offset":
         g0 = g0 + reg.offset
-    # 剛性: Ansys と同じく 係数 × E / 要素サイズ（面積あたり）
+    # 法線剛性: Ansys と同じく 係数 × E / 要素サイズ（面積あたり）、または絶対値
     form = reg.resolved_formulation()
-    fkn = reg.stiffness_factor if reg.stiffness_factor > 0 else (10.0 if reg.type in LINEAR_TYPES else 1.0)
-    if form == "mpc":
-        fkn *= 1e3
     Eloc = E_of_node[slave]
-    kn = fkn * Eloc / h_char
+    if reg.stiffness_mode == "absolute" and reg.stiffness_value > 0:
+        kn = np.full(len(slave), float(reg.stiffness_value))
+    else:
+        use_f = reg.stiffness_mode == "factor" or (reg.stiffness_mode == "auto" and reg.stiffness_factor > 0)
+        fkn = reg.stiffness_factor if (use_f and reg.stiffness_factor > 0) else \
+            (10.0 if reg.type in LINEAR_TYPES else 1.0)
+        if form == "mpc":
+            fkn *= 1e3
+        kn = fkn * Eloc / h_char
     kt = kn.copy() if reg.type in ("bonded", "rough", "frictional") else np.zeros_like(kn)
     if reg.type == "frictional":
         kt = 0.5 * kn
@@ -262,10 +304,33 @@ def _region_pairs(mesh, reg: ContactRegion, contact_faces, target_faces, E_of_no
     pr.tau_c = np.zeros((M, 3))
     pr.dt_c = np.zeros((M, 3))
     pr.tau_now = np.zeros((M, 3))
+    pr.kn0 = kn.copy()
+    # 貫通許容値（0 = プログラム制御: 解析設定の値 × 要素サイズ）
+    if reg.pen_tol_mode == "value" and reg.pen_tol > 0:
+        pr.pen_tol = float(reg.pen_tol)
+    elif reg.pen_tol_mode == "factor" and reg.pen_tol > 0:
+        pr.pen_tol = float(reg.pen_tol) * h_char
+    # 弾性すべり許容値（摩擦あり）: 設定すると接線剛性を μ·p / 許容値 で毎回更新（Ansys と同じ）
+    if reg.type == "frictional" and reg.slip_tol_mode != "auto" and reg.slip_tol > 0:
+        pr.slip_tol = reg.slip_tol if reg.slip_tol_mode == "value" else reg.slip_tol * h_char
+    pr.stab = max(float(reg.stabilization), 0.0) if reg.nonlinear else 0.0
     return pr
 
 
-def build_pairs(mesh, regions: list[ContactRegion], E_of_node: np.ndarray) -> list[Pairs]:
+def pinball_radius(reg: ContactRegion, h_char: float, diag: float, det_tol: float = 0.0) -> float:
+    """ピンボール領域の半径 [mm]"""
+    if reg.pinball_mode == "radius" and reg.pinball > 0:
+        return float(reg.pinball)
+    if reg.pinball_mode == "auto" and reg.pinball > 0:      # 古いファイル
+        return float(reg.pinball)
+    if reg.pinball_mode == "detection":
+        return float(det_tol if det_tol > 0 else 0.005 * diag + 1e-9)
+    if reg.type in LINEAR_TYPES:
+        return max(4.0 * h_char, 0.02 * diag)
+    return max(4.0 * h_char, 1e-9)
+
+
+def build_pairs(mesh, regions: list[ContactRegion], E_of_node: np.ndarray, det_tol: float = 0.0) -> list[Pairs]:
     lo, hi = mesh.bounds()
     diag = float(np.linalg.norm(hi - lo))
     vol = np.abs(mesh.element_volumes())
@@ -278,7 +343,7 @@ def build_pairs(mesh, regions: list[ContactRegion], E_of_node: np.ndarray) -> li
         if reg.resolved_behavior() == "symmetric":
             sides.append((reg.target_faces, reg.contact_faces))
         for cf, tf in sides:
-            pr = _region_pairs(mesh, reg, cf, tf, E_of_node, h_char, i, diag)
+            pr = _region_pairs(mesh, reg, cf, tf, E_of_node, h_char, i, diag, det_tol)
             if pr is not None:
                 if len(sides) == 2:
                     pr.area = pr.area * 0.5
@@ -314,6 +379,9 @@ def contact_system(pairs: list[Pairs], regions: list[ContactRegion], ndof: int, 
         Bn = sp.diags(n[:, 0]) @ B[0] + sp.diags(n[:, 1]) @ B[1] + sp.diags(n[:, 2]) @ B[2]
         act = pr.active.astype(float)
         a_kn = pr.area * pr.kn * act
+        if pr.stab > 0:
+            # 安定化: 開いている節点にも 係数 × 法線剛性 の弱いばね（力は入れない）。浮いた部品の剛体移動を防ぐ
+            a_kn = a_kn + pr.area * pr.kn * pr.stab * (1.0 - act)
         Kc = Kc + Bn.T @ sp.diags(a_kn) @ Bn
         # 拡張ラグランジュの乗数と初期隙間による力:  A (λ - kn g0) n
         fc += Bn.T @ (pr.area * act * (pr.lam_n - pr.kn * pr.g0))
@@ -343,6 +411,7 @@ def update_states(pairs: list[Pairs], regions: list[ContactRegion], u: np.ndarra
     max_pen = 0.0
     for pr in pairs:
         reg = regions[pr.region]
+        tol = pr.pen_tol if pr.pen_tol > 0 else pen_tol
         d = U[pr.slave] - np.einsum("ij,ijk->ik", pr.w, U[pr.masters])
         dn = np.einsum("ij,ij->i", d, pr.n)
         g = pr.g0 + dn
@@ -361,21 +430,31 @@ def update_states(pairs: list[Pairs], regions: list[ContactRegion], u: np.ndarra
         pr.active = new_active
         if use_al:
             # Ansys と同じく、貫通が許容値を超えた節点だけ乗数を更新する
-            over = (np.abs(g) > pen_tol) if reg.type in LINEAR_TYPES else (-g > pen_tol)
+            over = (np.abs(g) > tol) if reg.type in LINEAR_TYPES else (-g > tol)
             pr.lam_n = np.where(new_active, np.where(over, p, pr.lam_n), 0.0)
         pen = np.where(new_active, np.maximum(-g, 0.0), 0.0)
         if reg.type in LINEAR_TYPES:
             pen = np.abs(g)
-        max_pen = max(max_pen, float(pen.max()) if len(pen) else 0.0)
+        pr.max_pen = float(pen.max()) if len(pen) else 0.0
+        max_pen = max(max_pen, pr.max_pen)
+        if reg.update_stiffness == "each_iteration" and pr.kn0 is not None:
+            # 剛性の更新（各反復）: 貫通が許容値を超えた節点は剛性を 2 倍（最初の 100 倍まで）、
+            # 接触圧が出ていない節点は最初の値に戻す
+            big = new_active & (pen > tol)
+            pr.kn = np.where(big, np.minimum(pr.kn * 2.0, 100.0 * pr.kn0), np.where(new_active, pr.kn, pr.kn0))
         # 接線
         if reg.type in ("bonded", "rough"):
             tt = pr.lam_t - pr.kt[:, None] * dt
             if use_al:
-                over_t = np.linalg.norm(dt, axis=1) > pen_tol
+                over_t = np.linalg.norm(dt, axis=1) > tol
                 pr.lam_t = np.where(new_active[:, None], np.where(over_t[:, None], tt, pr.lam_t), 0.0)
             pr.stick = np.ones(len(g), bool)
             tau = np.linalg.norm(np.where(new_active[:, None], tt, 0.0), axis=1)
         elif reg.type == "frictional":
+            if pr.slip_tol > 0:
+                # 弾性すべり許容値: 固着中のずれが許容値で摩擦限界に達する接線剛性 kt = μ·p / 許容値
+                kt_new = reg.mu * p / pr.slip_tol
+                pr.kt = np.where(p > 0, np.clip(kt_new, 1e-3 * pr.kn0, pr.kn0), pr.kt)
             # 増分形のリターンマッピング（前の収束状態からの弾性試行）
             tt = pr.tau_c - pr.kt[:, None] * (dt - pr.dt_c)
             tn = np.linalg.norm(tt, axis=1)
@@ -405,6 +484,11 @@ def update_states(pairs: list[Pairs], regions: list[ContactRegion], u: np.ndarra
         pr.slide = np.linalg.norm(dt, axis=1)
         pr.tau = tau
     return changed, max_pen
+
+
+def penetration_ok(pairs: list[Pairs], pen_tol: float) -> bool:
+    """すべての接触ペアの貫通が、それぞれの許容値以内か"""
+    return all(pr.max_pen <= (pr.pen_tol if pr.pen_tol > 0 else pen_tol) for pr in pairs)
 
 
 def commit_states(pairs: list[Pairs], regions, u: np.ndarray):

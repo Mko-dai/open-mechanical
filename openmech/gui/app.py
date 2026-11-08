@@ -37,8 +37,8 @@ import pyvista as pv
 from pyvistaqt import QtInteractor
 
 from .. import __version__
-from ..contact import (BEHAVIORS, CONTACT_TYPES, FORMULATIONS, INTERFACE, STATUS_JP, ContactRegion,
-                       detect_contacts)
+from ..contact import (BEHAVIORS, CONTACT_TYPES, DETECTIONS, FORMULATIONS, INTERFACE, PINBALL_MODES, STATUS_JP,
+                       STIFFNESS_MODES, TOL_MODES, UPDATE_STIFFNESS, ContactRegion, detect_contacts)
 from ..export import write_csv, write_report, write_vtu
 from ..params import ParamError, evaluate, field_text, is_number, set_field
 from .expr import ExprEdit
@@ -1325,7 +1325,7 @@ class MainWindow(QMainWindow):
             cn = add(model, "接続", ("connections",), "#e8590c", "接")
             ct = add(cn, "接触", ("contacts",), "#e8590c", "接")
             for i, c in enumerate(self.project.contacts):
-                label = f"{c.name}　[{CONTACT_TYPES[c.type]}]" + ("（抑制）" if c.suppressed else "")
+                label = self._contact_label(c) + ("（抑制）" if c.suppressed else "")
                 add(ct, label, ("contact", i), "#e8590c" if not c.suppressed else "#aaaaaa",
                     CONTACT_TYPES[c.type][0])
         add(model, "座標系", ("coords",), "#6c7a89", "XY")
@@ -2389,71 +2389,145 @@ class MainWindow(QMainWindow):
             self._row(self._section("使用しているボディ"), "", ", ".join(used) or "なし")
 
     # ---------------------------------------------------------------- 接続（接触）
+    def _body_label(self, b):
+        if b is None or int(b) < 0:
+            return "-"
+        return self.project.assignment(int(b)).get("attr") or f"B{int(b)}"
+
+    def _contact_bodies(self, faces):
+        if self.mesh is None or not faces:
+            return []
+        tb = self.mesh.tri_body()
+        return sorted({int(tb[self.mesh.face_ids == f][0]) for f in faces if np.any(self.mesh.face_ids == f)})
+
+    def _contact_label(self, c):
+        """Ansys と同じく「タイプ - 接触ボディ と ターゲットボディ」（名前を変えたときはその名前）"""
+        if c.name and not c.name.startswith("接触領域"):
+            return f"{c.name}　[{CONTACT_TYPES[c.type]}]"
+        cb = self._contact_bodies(c.contact_faces) or ([c.contact_body] if c.contact_body >= 0 else [])
+        tb = self._contact_bodies(c.target_faces) or ([c.target_body] if c.target_body >= 0 else [])
+        names = lambda bs: "・".join(self._body_label(b) for b in bs) or "未選択"  # noqa: E731
+        mu = f"（μ={c.mu:g}）" if c.type == "frictional" else ""
+        return f"{CONTACT_TYPES[c.type]}{mu} - {names(cb)} と {names(tb)}"
+
     def _details_connections(self):
-        s = self._section("接触の自動検出")
-        tol = dspin(self.project.contact_tolerance, 0.0, 1e6, 4, 0.1, "mm")
+        p = self.project
+        s = self._section("自動検出")
+        tol = dspin(p.contact_tolerance, 0.0, 1e6, 4, 0.1, "mm")
         tol.setSpecialValueText("プログラム制御")
-        tol.valueChanged.connect(lambda v: setattr(self.project, "contact_tolerance", v))
+        tol.valueChanged.connect(lambda v: setattr(p, "contact_tolerance", v))
         self._row(s, "許容値", tol)
+        self._row(s, "面/面", "はい")
+        self._row(s, "面/辺・辺/辺", "いいえ（未対応）")
+        self._row(s, "グループ化", "ボディ（ボディの組ごとに 1 つの接触領域）")
+        self._row(s, "作成する接触のタイプ", self._combo(list((v, k) for k, v in CONTACT_TYPES.items()),
+                                                 p.contact_default_type, lambda v: (
+                                                     setattr(p, "contact_default_type", v),
+                                                     self._later(self.build_details))))
+        if p.contact_default_type == "frictional":
+            mu = dspin(p.contact_default_mu, 0.0, 10.0, 4, 0.05)
+            mu.valueChanged.connect(lambda v: setattr(p, "contact_default_mu", v))
+            self._row(s, "摩擦係数", mu)
         b = QPushButton("接続を作成（自動検出）")
         b.clicked.connect(lambda: self._later(self.auto_contacts))
         self._row(s, "", b)
+        s = self._section("すべての接触領域を一括変更")
+        self._row(s, "タイプ", self._combo([("（選んでください）", "")] + list((v, k) for k, v in CONTACT_TYPES.items()),
+                                         "", lambda v: v and self.set_contact_type(v)))
         s2 = self._section("情報")
-        self._row(s2, "接触領域の数", len(self.project.contacts))
+        self._row(s2, "接触領域の数", len(p.contacts))
         if self.mesh is not None:
             self._row(s2, "ボディ数", len(self.mesh.body_ids()))
-        self._row(s2, "", "ボディ同士は接触でつながります（既定は「結合」）")
+        if p.share_topology != "none":
+            self._row(s2, "", "節点共有がオンなので、共有したボディ同士には接触は作られません。"
+                              "接触でつなぐときは「モデル → 節点共有しない」にしてください")
+        else:
+            self._row(s2, "", "ボディ同士は接触でつながります。接触領域ごとにタイプ・摩擦係数を変えられます")
 
     _details_contacts = _details_connections
 
     def _details_contact(self):
         i = self.current[1]
         c = self.project.contacts[i]
+        st = lambda key, rebuild=False: (lambda v: self._contact_set(i, key, v, rebuild=rebuild))  # noqa: E731
+        combo = lambda d, cur, key, rebuild=True: self._combo(list((v, k) for k, v in d.items()), cur,  # noqa: E731
+                                                              st(key, rebuild))
         s = self._section("スコープ")
         self._row(s, "スコープ方法", "ジオメトリの選択")
         self._scope_row_named(s, "接触", c.contact_faces, lambda f: self._contact_set(i, "contact_faces", f))
         self._scope_row_named(s, "ターゲット", c.target_faces, lambda f: self._contact_set(i, "target_faces", f))
-        bodies = lambda faces: ", ".join(sorted({f"B{int(b)}" for f in faces for b in  # noqa: E731
-                                                 ([self.mesh.tri_body()[self.mesh.face_ids == f][0]]
-                                                  if self.mesh is not None and np.any(self.mesh.face_ids == f) else [])}))
-        self._row(s, "接触ボディ", bodies(c.contact_faces) or "-")
-        self._row(s, "ターゲットボディ", bodies(c.target_faces) or "-")
+        self._row(s, "接触ボディ", "・".join(self._body_label(b) for b in self._contact_bodies(c.contact_faces)) or "-")
+        self._row(s, "ターゲットボディ", "・".join(self._body_label(b) for b in self._contact_bodies(c.target_faces)) or "-")
         s = self._section("定義")
-        self._row(s, "タイプ", self._combo(list((v, k) for k, v in CONTACT_TYPES.items()), c.type,
-                                         lambda v: self._contact_set(i, "type", v, rebuild=True)))
+        self._row(s, "タイプ", combo(CONTACT_TYPES, c.type, "type"))
         if c.type == "frictional":
             mu = dspin(c.mu, 0.0, 10.0, 4, 0.05)
-            mu.valueChanged.connect(lambda v: self._contact_set(i, "mu", v))
+            mu.valueChanged.connect(st("mu", True))
             self._row(s, "摩擦係数", mu)
         self._row(s, "スコープモード", "自動" if c.auto else "手動")
-        self._row(s, "動作", self._combo(list((v, k) for k, v in BEHAVIORS.items()), c.behavior,
-                                       lambda v: self._contact_set(i, "behavior", v)))
+        self._row(s, "動作", combo(BEHAVIORS, c.behavior, "behavior", False))
+        self._row(s, "トリム接触", "プログラム制御")
         sup = QCheckBox("抑制")
         sup.setChecked(c.suppressed)
-        sup.toggled.connect(lambda on: self._contact_set(i, "suppressed", on, rebuild=True))
+        sup.toggled.connect(st("suppressed", True))
         self._row(s, "抑制", sup)
         name = QLineEdit(c.name)
         name.editingFinished.connect(lambda: self._contact_set(i, "name", name.text().strip() or c.name))
         self._row(s, "名前", name)
+
         s = self._section("高度な設定")
-        self._row(s, "定式化", self._combo(list((v, k) for k, v in FORMULATIONS.items()), c.formulation,
-                                        lambda v: self._contact_set(i, "formulation", v)))
-        self._row(s, "検出方法", "節点（ターゲット面の法線方向）")
-        kf = dspin(c.stiffness_factor, 0.0, 1e6, 3, 0.1)
-        kf.setSpecialValueText("プログラム制御")
-        kf.valueChanged.connect(lambda v: self._contact_set(i, "stiffness_factor", v))
-        self._row(s, "法線剛性係数", kf)
-        pb = dspin(c.pinball, 0.0, 1e6, 3, 0.5, "mm")
-        pb.setSpecialValueText("プログラム制御")
-        pb.valueChanged.connect(lambda v: self._contact_set(i, "pinball", v))
-        self._row(s, "ピンボール領域（半径）", pb)
+        self._row(s, "定式化", combo(FORMULATIONS, c.formulation, "formulation"))
+        self._row(s, "微小すべり", "オン（接触相手は変形前の位置で決める）")
+        self._row(s, "検出方法", combo(DETECTIONS, c.detection, "detection", False))
+        if c.resolved_formulation() == "augmented_lagrange" or c.formulation == "penalty":
+            self._row(s, "貫通許容値", combo(TOL_MODES, c.pen_tol_mode, "pen_tol_mode"))
+            if c.pen_tol_mode == "factor":
+                w = dspin(c.pen_tol or 0.1, 0.0, 1e3, 4, 0.05)
+                w.valueChanged.connect(st("pen_tol"))
+                self._row(s, "貫通許容係数（× 要素サイズ）", w)
+            elif c.pen_tol_mode == "value":
+                w = dspin(c.pen_tol, 0.0, 1e6, 5, 0.001, "mm")
+                w.valueChanged.connect(st("pen_tol"))
+                self._row(s, "貫通許容値", w)
+        if c.type == "frictional":
+            self._row(s, "弾性すべり許容値", combo(TOL_MODES, c.slip_tol_mode, "slip_tol_mode"))
+            if c.slip_tol_mode == "factor":
+                w = dspin(c.slip_tol or 0.01, 0.0, 1e3, 4, 0.01)
+                w.valueChanged.connect(st("slip_tol"))
+                self._row(s, "弾性すべり許容係数（× 要素サイズ）", w)
+            elif c.slip_tol_mode == "value":
+                w = dspin(c.slip_tol, 0.0, 1e6, 5, 0.001, "mm")
+                w.valueChanged.connect(st("slip_tol"))
+                self._row(s, "弾性すべり許容値", w)
+        self._row(s, "法線剛性", combo(STIFFNESS_MODES, c.stiffness_mode, "stiffness_mode"))
+        if c.stiffness_mode == "factor":
+            kf = dspin(c.stiffness_factor or 1.0, 0.0, 1e6, 4, 0.1)
+            kf.valueChanged.connect(st("stiffness_factor"))
+            self._row(s, "法線剛性係数", kf)
+        elif c.stiffness_mode == "absolute":
+            kv = dspin(c.stiffness_value, 0.0, 1e12, 3, 100.0, "N/mm³")
+            kv.valueChanged.connect(st("stiffness_value"))
+            self._row(s, "法線剛性", kv)
+        self._row(s, "剛性の更新", combo(UPDATE_STIFFNESS, c.update_stiffness, "update_stiffness", False))
+        if c.nonlinear:
+            sd = dspin(c.stabilization, 0.0, 1.0, 4, 0.01)
+            sd.setSpecialValueText("0（なし）")
+            sd.valueChanged.connect(st("stabilization"))
+            self._row(s, "安定化減衰係数", sd)
+        self._row(s, "ピンボール領域", combo(PINBALL_MODES, c.pinball_mode, "pinball_mode"))
+        if c.pinball_mode == "radius":
+            pb = dspin(c.pinball, 0.0, 1e6, 3, 0.5, "mm")
+            pb.valueChanged.connect(st("pinball"))
+            self._row(s, "ピンボール半径", pb)
+
         s = self._section("ジオメトリ修正")
-        self._row(s, "インターフェース処理", self._combo(list((v, k) for k, v in INTERFACE.items()), c.interface,
-                                                 lambda v: self._contact_set(i, "interface", v, rebuild=True)))
+        self._row(s, "インターフェース処理", combo(INTERFACE, c.interface, "interface"))
         if c.interface == "offset":
             off = dspin(c.offset, -1e6, 1e6, 4, 0.01, "mm")
-            off.valueChanged.connect(lambda v: self._contact_set(i, "offset", v))
+            off.valueChanged.connect(st("offset"))
             self._row(s, "オフセット", off)
+        self._row(s, "接触ジオメトリ修正", "なし")
+        self._row(s, "ターゲットジオメトリ修正", "なし")
 
     def _scope_row_named(self, sec, label, faces, apply_fn):
         w = QWidget()
@@ -2482,8 +2556,8 @@ class MainWindow(QMainWindow):
         if key in ("contact_faces", "target_faces"):
             c.auto = False
         self.invalidate()
-        if rebuild or key in ("type", "name"):
-            self._later(lambda: (self.rebuild_tree(), self.refresh_view()))
+        if rebuild or key in ("type", "name", "mu"):
+            self._later(lambda: (self.rebuild_tree(), self.build_details(), self.refresh_view()))
         else:
             self.refresh_view()
 
@@ -2493,12 +2567,14 @@ class MainWindow(QMainWindow):
             return
         old_auto = {(c.contact_body, c.target_body): c for c in self.project.contacts if c.auto}
         manual = [c for c in self.project.contacts if not c.auto]
-        found = detect_contacts(self.mesh, self.project.contact_tolerance)
+        found = detect_contacts(self.mesh, self.project.contact_tolerance, self.project.contact_default_type,
+                                self.project.contact_default_mu)
+        keep = [k for k in ContactRegion.__dataclass_fields__
+                if k not in ("contact_faces", "target_faces", "contact_body", "target_body", "auto")]
         for c in found:
             o = old_auto.get((c.contact_body, c.target_body))
-            if o is not None:   # 以前の設定（タイプ・摩擦係数など）を引き継ぐ
-                for k in ("type", "mu", "behavior", "formulation", "stiffness_factor", "pinball", "interface",
-                          "offset", "suppressed", "name"):
+            if o is not None:   # 以前の設定（タイプ・摩擦係数・高度な設定など）を引き継ぐ
+                for k in keep:
                     setattr(c, k, getattr(o, k))
         self.project.contacts = found + manual
         if not quiet:
@@ -2529,6 +2605,7 @@ class MainWindow(QMainWindow):
             self.project.contacts[i].type = kind
         self.invalidate()
         self.rebuild_tree()
+        self._later(self.build_details)
 
     def flip_contact(self):
         if self.current[0] != "contact":
@@ -3736,7 +3813,9 @@ class MainWindow(QMainWindow):
                         dpr = obj.devicePixelRatioF() if hasattr(obj, "devicePixelRatioF") else 1.0
                         x = int(p.x() * dpr)
                         y = int((obj.height() - p.y() - 1) * dpr)
-                        if win._sk is not None:
+                        if win._triad_hit(x, y) is not None:
+                            QTimer.singleShot(0, lambda: win._triad_click(x, y))
+                        elif win._sk is not None:
                             QTimer.singleShot(0, lambda: win._sketch_click(x, y))
                         else:
                             QTimer.singleShot(0, lambda: win._pick((x, y)))
@@ -3745,6 +3824,75 @@ class MainWindow(QMainWindow):
         self._click_filter = ClickFilter(self)
         self.plotter.interactor.installEventFilter(self._click_filter)
         self.plotter.interactor.setMouseTracking(True)
+
+    # ---------------------------------------------------------------- 座標軸（トライアド）のクリック
+    TRIAD_VIEWPORT = 0.2        # pyvista add_axes の既定（画面左下 20% の正方形）
+
+    def _triad_geometry(self):
+        """トライアドの中心・半径（画面ピクセル、VTK の座標＝左下原点）と、各軸の先端の位置"""
+        ren = self.plotter.renderer
+        w, h = ren.GetSize()
+        vp = self.TRIAD_VIEWPORT
+        cx, cy = 0.5 * vp * w, 0.5 * vp * h
+        rad = 0.5 * vp * min(w, h)
+        cam = ren.GetActiveCamera()
+        d = np.array(cam.GetFocalPoint()) - np.array(cam.GetPosition())
+        d /= max(np.linalg.norm(d), 1e-300)
+        up = np.array(cam.GetViewUp(), float)
+        up -= d * (up @ d)
+        up /= max(np.linalg.norm(up), 1e-300)
+        right = np.cross(d, up)
+        tips = {}
+        for i, ax in enumerate("XYZ"):
+            for s in (1, -1):
+                a = s * np.eye(3)[i]
+                tips[("+" if s > 0 else "-") + ax] = (cx + 0.75 * rad * (a @ right), cy + 0.75 * rad * (a @ up),
+                                                    float(a @ -d))      # 手前ほど大きい
+        return cx, cy, rad, tips
+
+    def _triad_hit(self, x, y):
+        """クリック位置がトライアドの上なら "iso" / "+X" などを返す（それ以外は None）"""
+        if self.mesh is None:
+            return None
+        try:
+            cx, cy, rad, tips = self._triad_geometry()
+        except Exception:
+            return None
+        if np.hypot(x - cx, y - cy) > 1.05 * rad:
+            return None
+        if np.hypot(x - cx, y - cy) < 0.18 * rad:
+            return "iso"
+        best, bd = None, 0.4 * rad
+        for k, (tx, ty, depth) in sorted(tips.items(), key=lambda kv: -kv[1][2]):
+            dd = np.hypot(x - tx, y - ty)
+            if dd < bd - 1e-9:
+                best, bd = k, dd
+        return best or "none"
+
+    def _triad_click(self, x, y):
+        """Ansys と同じく、トライアドの軸をクリックするとその軸の方向から見る（中心は等角表示）。
+        すでにその向きから見ているときは反対側から見る"""
+        k = self._triad_hit(x, y)
+        if k in (None, "none"):
+            return
+        pl = self.plotter
+        if k == "iso":
+            pl.view_isometric()
+            self.log("視点: 等角")
+            pl.render()
+            return
+        i = "XYZ".index(k[1])
+        v = (1.0 if k[0] == "+" else -1.0) * np.eye(3)[i]
+        cam = pl.renderer.GetActiveCamera()
+        cur = np.array(cam.GetPosition()) - np.array(cam.GetFocalPoint())
+        cur /= max(np.linalg.norm(cur), 1e-300)
+        if cur @ v > 0.999:
+            v = -v
+        up = (0.0, 1.0, 0.0) if i == 2 else (0.0, 0.0, 1.0)
+        pl.view_vector(v, viewup=up)
+        pl.reset_camera()
+        pl.render()
+        self.log(f"視点: {'+' if v[i] > 0 else '-'}{k[1]} 方向から")
 
     def _pick(self, pos):
         if self.mesh is None or self._main_actor is None:
