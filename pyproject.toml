@@ -3,6 +3,7 @@ name = "open-mechanical"
 version = "0.1.0"
 description = "無料の静的構造解析ソフト（Ansys Mechanical 代替）"
 requires-python = ">=3.10"
+license = {text = "MIT"}
 dependencies = ["numpy>=1.24", "scipy>=1.10", "gmsh>=4.11", "PySide6>=6.5",
                 "pyvista>=0.42", "pyvistaqt>=0.11", "pyamg>=5.0"]
 
