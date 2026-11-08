@@ -9,7 +9,8 @@ if git remote get-url origin >/dev/null 2>&1; then
     if git diff --quiet origin/main 2>/dev/null; then
       git reset -q origin/main                 # ファイルは既に最新
     elif git diff --quiet HEAD 2>/dev/null; then
-      git merge -q --ff-only origin/main       # 手元に変更なし → 最新版に更新
+      # 手元に変更なし → 最新版に更新（GitHub 側の履歴が書き換わっていてもそろえる）
+      git merge -q --ff-only origin/main 2>/dev/null || git reset -q --keep origin/main
     else
       echo "（手元で変更されたファイルがあるため自動更新はスキップしました）"
     fi
