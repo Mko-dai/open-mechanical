@@ -99,3 +99,19 @@ def test_contact_impulse_equals_momentum_change():
     mn = lumped_mass(m, np.full(m.n_elems, 7.85e-9))
     p1 = float((mn * fr[-1].extra["速度 Z [mm/s]"]).sum())
     assert abs(imp - (p1 + mn.sum() * 1000.0)) / imp < 0.01
+
+
+def test_explicit_plastic_bar_yields_at_yield_stress():
+    """陽解法＋塑性: ゆっくり引っ張った棒の応力は降伏応力（完全塑性）で頭打ちになる"""
+    m = structured_box(20, 4, 4, 4, 1, 1).to_quadratic()
+    info = m.face_info()
+    f0 = [f["id"] for f in info if f["centroid"][0] < 1e-6]
+    f1 = [f["id"] for f in info if f["centroid"][0] > 20 - 1e-6]
+    mat = Material("鋼", 200000, 0.0, 7850, 250, plasticity="bilinear_iso", tangent_modulus=0.0)
+    s = DynamicSettings(method="explicit", end_time=2e-3, n_frames=4, mass_scaling_dt=2e-7, alpha_damping=3000,
+                        ramp_time=1.5e-3)
+    fr = solve_dynamic(m, mat, [BC("symmetry", f0), BC("displacement", f1, [0.1, None, None])]
+                       + [], s, log=lambda *a: None)
+    sx = fr[-1].stress[:, 0]
+    assert abs(np.median(sx) / 250 - 1) < 0.03
+    assert fr[-1].extra["相当塑性ひずみ"].max() > 0.001

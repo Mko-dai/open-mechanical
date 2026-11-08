@@ -4,8 +4,9 @@
       振動・衝撃応答・ゆっくりした動的荷重向き。剛体壁との接触はペナルティ法（座標軸に垂直な壁）。
   陽解法（LS-DYNA と同じ）: 中心差分法。集中質量（HRZ）。時間増分は安定限界から自動決定。
       落下・衝突など短時間の現象向き。質量スケーリング（LS-DYNA の DT2MS 相当）、剛体壁（任意の向き・摩擦）。
+      塑性（ミーゼス・等方/移動硬化）と大変形（Total Lagrangian）に対応。
 
-単位: mm, t, s, N, MPa（速度 mm/s、加速度 mm/s²）。いずれも線形弾性・微小変形（剛体壁の接触は非線形）。
+単位: mm, t, s, N, MPa（速度 mm/s、加速度 mm/s²）。陰解法は線形弾性・微小変形（剛体壁の接触は非線形）。
 荷重（力・圧力・重力）は「ステップ（t=0 から一定）」または「ランプ（ramp_time までに直線で増加）」。
 """
 from __future__ import annotations
@@ -37,6 +38,7 @@ class DynamicSettings:
     hht_alpha: float = 0.0             # HHT-α（0 = Newmark 平均加速度法、-0.1 程度で高周波を減衰）
     mass_scaling_dt: float = 0.0       # 陽解法の目標時間増分 [s]（0 = 質量スケーリングなし）
     dt_safety: float = 0.9             # 陽解法の安定限界に掛ける係数（LS-DYNA の TSSFAC）
+    large_deflection: bool = False     # 大変形（陽解法: Total Lagrangian。塑性と組み合わせ可）
     wall: dict = field(default_factory=dict)  # 剛体壁 {"normal": [nx,ny,nz]（壁から物体側）, "point": [x,y,z], "friction": μ}
 
     def to_dict(self):
@@ -139,6 +141,7 @@ def _prepare(mesh, material, bcs, elem_materials):
         elem_mat = np.asarray(elem_mat, dtype=np.int64)
     else:
         mats, elem_mat = [material], np.zeros(mesh.n_elems, dtype=np.int64)
+    mats = [m if hasattr(m, "Dm") else m.state() for m in mats]      # 計算用の材料（塑性の判定・硬化）
     D = np.stack([material_D(m) for m in mats])
     rho_e = element_rho(mesh, mats, elem_mat)
     F, fixed = build_load_and_constraints(mesh, mats[0], bcs, rho_e=rho_e)
@@ -160,14 +163,20 @@ def _wall(s, mesh):
     return {"n": n, "p": p, "mu": float(w.get("friction", 0.0)), "nodes": cand}
 
 
-def _frame_result(mesh, mats, elem_mat, D, u, v, t, info, base_material):
-    stress, strain = nodal_stress(mesh, u, D, elem_mat=elem_mat)
+def _frame_result(mesh, mats, elem_mat, D, u, v, t, info, base_material, inner=None):
+    if inner is not None:
+        stress, peeq = inner.nodal()
+        strain = np.zeros_like(stress)
+    else:
+        stress, strain = nodal_stress(mesh, u, D, elem_mat=elem_mat)
     r = Result(mesh, base_material, u.reshape(-1, 3).copy(), stress, strain.astype(np.float32), {}, dict(info),
                mats, elem_mat)
     r.time = float(t)
     vv = v.reshape(-1, 3)
     r.extra = {"速度 [mm/s]": np.linalg.norm(vv, axis=1), "速度 X [mm/s]": vv[:, 0].copy(),
                "速度 Y [mm/s]": vv[:, 1].copy(), "速度 Z [mm/s]": vv[:, 2].copy()}
+    if inner is not None and inner.models:
+        r.extra["相当塑性ひずみ"] = peeq
     return r
 
 
@@ -176,17 +185,112 @@ def _frame_times(s):
     return np.linspace(s.end_time / n, s.end_time, n)
 
 
+# ---------------------------------------------------------------------------- 陽解法: 塑性・大変形の内力
+
+class ExplicitInternal:
+    """陽解法用の内力（積分点ごとに応力を計算。塑性はリターンマッピング、大変形は Total Lagrangian）。
+    接線剛性は作らない（陽解法では不要）ので、静解析用の PlasticSolid より軽い。"""
+
+    def __init__(self, mesh, mats, elem_mat, D, large=False):
+        from .plasticity import PlasticModel
+        from .solver import _dN_dx
+        self.mesh, self.large = mesh, large
+        self.elem_mat = np.asarray(elem_mat)
+        nn = mesh.elems.shape[1]
+        pts, wts = _quadrature(nn)
+        X = mesh.nodes[mesh.elems]
+        self.dNdX, self.wd = [], []
+        for L, w in zip(pts, wts):
+            dNdx, detJ = _dN_dx(X, shape_dN_dxi(L, nn))
+            self.dNdX.append(dNdx)
+            self.wd.append(w * detJ)
+        self.D = D[self.elem_mat]
+        self.models = {i: (PlasticModel(m), np.nonzero(self.elem_mat == i)[0]) for i, m in enumerate(mats)
+                       if getattr(m, "plastic", False)}
+        ng, E = len(wts), mesh.n_elems
+        self.ep = np.zeros((ng, E, 6))
+        self.alpha = np.zeros((ng, E, 6))
+        self.pbar = np.zeros((ng, E))
+        self.sig = np.zeros((ng, E, 6))      # 表示用（大変形はコーシー応力）
+        self.idx = mesh.elems
+
+    def force(self, u):
+        from .plasticity import W_EPS, W_SIG
+        Ue = u.reshape(-1, 3)[self.idx]
+        fe = np.zeros_like(Ue)
+        I3 = np.eye(3)
+        for g, (dNdX, wd) in enumerate(zip(self.dNdX, self.wd)):
+            H = np.einsum("eak,eal->ekl", Ue, dNdX)              # 変位勾配
+            if self.large:
+                F = I3 + H
+                C = np.einsum("eki,ekj->eij", F, F)
+                Em = 0.5 * (C - I3)
+            else:
+                F = None
+                Em = 0.5 * (H + H.transpose(0, 2, 1))
+            eps = np.stack([Em[:, 0, 0], Em[:, 1, 1], Em[:, 2, 2], 2 * Em[:, 0, 1], 2 * Em[:, 1, 2],
+                            2 * Em[:, 0, 2]], axis=1)
+            S = np.einsum("eij,ej->ei", self.D, eps)
+            for model, sel in self.models.values():
+                s_M, e_M, a_M, pb, _ = model.update(eps[sel] * W_EPS, self.ep[g, sel], self.alpha[g, sel],
+                                                    self.pbar[g, sel])
+                S[sel] = s_M / W_SIG
+                self.ep[g, sel], self.alpha[g, sel], self.pbar[g, sel] = e_M, a_M, pb
+            Sm = np.stack([S[:, [0, 3, 5]], S[:, [3, 1, 4]], S[:, [5, 4, 2]]], axis=1)
+            if self.large:
+                P = np.einsum("eik,ekj->eij", F, Sm)                 # 第1ピオラ・キルヒホッフ応力
+                J = np.linalg.det(F)
+                sg = np.einsum("eik,ejk->eij", P, F) / J[:, None, None]
+                self.sig[g] = np.stack([sg[:, 0, 0], sg[:, 1, 1], sg[:, 2, 2], sg[:, 0, 1], sg[:, 1, 2],
+                                        sg[:, 0, 2]], 1)
+            else:
+                P = Sm
+                self.sig[g] = S
+            fe += np.einsum("e,ekl,eal->eak", wd, P, dNdX)
+        f = np.zeros(u.size)
+        for k in range(3):
+            f[k::3] = np.bincount(self.idx.ravel(), fe[:, :, k].ravel(), self.mesh.n_nodes)
+        return f
+
+    def nodal(self):
+        """節点の応力（要素平均を節点で平均）と相当塑性ひずみ"""
+        mesh = self.mesh
+        nn = mesh.elems.shape[1]
+        se = self.sig.mean(axis=0)
+        pe = self.pbar.max(axis=0)
+        idx = mesh.elems.ravel()
+        cnt = np.maximum(np.bincount(idx, minlength=mesh.n_nodes), 1)
+        S = np.column_stack([np.bincount(idx, np.repeat(se[:, k], nn), mesh.n_nodes) for k in range(6)]) / cnt[:, None]
+        pb = np.zeros(mesh.n_nodes)
+        np.maximum.at(pb, idx, np.repeat(pe, nn))
+        return S, pb
+
+
 # ---------------------------------------------------------------------------- 陽解法
 
-def solve_explicit(mesh, material, bcs, settings: DynamicSettings, elem_materials=None, log=print, progress=None):
-    """中心差分法（LS-DYNA と同じ陽解法）。集中質量・自動時間増分・質量スケーリング・剛体壁"""
+def solve_explicit(mesh, material, bcs, settings: DynamicSettings, elem_materials=None, log=print, progress=None,
+                   v0=None, monitor=None):
+    """中心差分法（LS-DYNA と同じ陽解法）。集中質量・自動時間増分・質量スケーリング・剛体壁・塑性・大変形
+
+    v0: 節点ごとの初速度 (N,3)（指定すると settings.init_velocity より優先）
+    monitor(t, u, v): 時刻歴を記録するたびに呼ぶ（値の辞書を返すと history に加える）
+    """
     from .parallel import ParallelMatvec
     t0 = time.time()
     s = settings
     mats, elem_mat, D, rho_e, F0, fixed = _prepare(mesh, material, bcs, elem_materials)
-    log("陽解法: 剛性マトリクスを組み立て中…")
-    K = assemble_stiffness(mesh, D, elem_mat=elem_mat)
-    Kmv = ParallelMatvec(K)
+    plastic = any(getattr(m, "plastic", False) for m in mats)
+    inner = None
+    if plastic or s.large_deflection:
+        log("陽解法: " + "・".join(x for x, on in (("塑性", plastic), ("大変形", s.large_deflection)) if on)
+            + " を考慮して積分点で内力を計算します")
+        inner = ExplicitInternal(mesh, mats, elem_mat, D, large=s.large_deflection)
+        Kmv = None
+        K = None
+    else:
+        log("陽解法: 剛性マトリクスを組み立て中…")
+        K = assemble_stiffness(mesh, D, elem_mat=elem_mat)
+        Kmv = ParallelMatvec(K)
     nn = mesh.elems.shape[1]
     d = np.diag(_tet_mass_ref(nn))
     wloc = d / d.sum()
@@ -217,7 +321,8 @@ def solve_explicit(mesh, material, bcs, settings: DynamicSettings, elem_material
     dt = s.end_time / nsteps
     log(f"  時間増分 {dt:.3e} s × {nsteps:,} ステップ（終了時間 {s.end_time:g} s、自由度 {ndof:,}）")
     u = np.zeros(ndof)
-    v = np.tile(np.asarray(s.init_velocity, float), mesh.n_nodes)
+    v = (np.asarray(v0, float).ravel().copy() if v0 is not None
+         else np.tile(np.asarray(s.init_velocity, float), mesh.n_nodes))
     v[cd] = 0.0
     u[cd] = cv * _ramp(0.0, s.ramp_time)
     wall = _wall(s, mesh)
@@ -227,13 +332,40 @@ def solve_explicit(mesh, material, bcs, settings: DynamicSettings, elem_material
         wdofs = (3 * wall["nodes"][:, None] + np.arange(3)).ravel()
         mw = m[wall["nodes"]]
     aR, bR = s.alpha_damping, s.beta_damping
+    # 大変形ではモーメントは面と一緒に回る（フォロワー荷重）: 面の剛体回転を毎ステップ求めて力を回す
+    followers = []
+    if s.large_deflection:
+        for bc in bcs:
+            if bc.kind == "moment":
+                Fm, _ = build_load_and_constraints(mesh, mats[0], [bc])
+                F0 = F0 - Fm
+                fm = Fm.reshape(-1, 3)
+                idx = np.nonzero(np.abs(fm).sum(1) > 0)[0]
+                fn = mesh.face_nodes(bc.faces) if bc.faces else idx
+                followers.append((idx, fm[idx], np.asarray(fn)))
+
+    def follow(u):
+        out = np.zeros(ndof)
+        U = u.reshape(-1, 3)
+        for idx, fv, fn in followers:
+            P0 = mesh.nodes[fn] - mesh.nodes[fn].mean(0)
+            P1 = P0 + U[fn] - U[fn].mean(0)
+            Hm = P0.T @ P1
+            Uu, _, Vt = np.linalg.svd(Hm)
+            dd = np.sign(np.linalg.det(Vt.T @ Uu.T))
+            Rm = Vt.T @ np.diag([1, 1, dd]) @ Uu.T
+            o = out.reshape(-1, 3)
+            o[idx] += fv @ Rm.T
+        return out
 
     def accel(u, v, t):
-        ku = Kmv(u)
+        ku = inner.force(u) if inner is not None else Kmv(u)
         f = F0 * _ramp(t, s.ramp_time) - ku
+        if followers:
+            f += follow(u) * _ramp(t, s.ramp_time)
         if aR:
             f -= aR * m3 * v
-        if bR:
+        if bR and Kmv is not None:
             f -= bR * Kmv(v)
         a = f * minv
         a[cd] = 0.0
@@ -278,12 +410,15 @@ def solve_explicit(mesh, material, bcs, settings: DynamicSettings, elem_material
         if k % every == 0 or k == nsteps:
             hist["時間 [s]"].append(t)
             hist["運動エネルギー [mJ]"].append(0.5 * float((m3 * v * v).sum()))
-            hist["ひずみエネルギー [mJ]"].append(0.5 * float(u @ ku))
+            hist["ひずみエネルギー [mJ]"].append(0.5 * float(u @ ku))   # 塑性・大変形では目安
             hist["接触力 [N]"].append(imp / max(t - t_rec, dt))
             imp, t_rec = 0.0, t
             hist["最大変位 [mm]"].append(float(np.abs(u).max()))
+            if monitor is not None:
+                for kk, vv in (monitor(t, u, v) or {}).items():
+                    hist.setdefault(kk, []).append(vv)
         while ft and t >= ft[0] - 0.5 * dt:
-            frames.append(_frame_result(mesh, mats, elem_mat, D, u, v, ft.pop(0), info, material))
+            frames.append(_frame_result(mesh, mats, elem_mat, D, u, v, ft.pop(0), info, material, inner))
         if progress and k % max(1, nsteps // 200) == 0:
             progress(k / nsteps, f"陽解法 {k:,}/{nsteps:,} ステップ（t = {t:.3e} s）")
         if time.time() - t_last > 10:
@@ -300,7 +435,8 @@ def solve_explicit(mesh, material, bcs, settings: DynamicSettings, elem_material
 
 # ---------------------------------------------------------------------------- 陰解法
 
-def solve_implicit(mesh, material, bcs, settings: DynamicSettings, elem_materials=None, log=print, progress=None):
+def solve_implicit(mesh, material, bcs, settings: DynamicSettings, elem_materials=None, log=print, progress=None,
+                   v0=None, monitor=None):
     """HHT-α 法（α=0 で Newmark 平均加速度法）。整合質量・レイリー減衰・剛体壁（ペナルティ）"""
     t0 = time.time()
     s = settings
@@ -367,8 +503,11 @@ def solve_implicit(mesh, material, bcs, settings: DynamicSettings, elem_material
         coords = np.column_stack([mesh.nodes[fidx // 3], fidx % 3])
         return _linear_solve(A, rhs, lambda *a: None, coords=coords, method="amg")
 
+    if any(getattr(m, "plastic", False) for m in mats) or s.large_deflection:
+        raise ValueError("塑性・大変形の過渡解析は陽解法で行ってください（陰解法は線形弾性）")
     u = np.zeros(ndof)
-    v = np.tile(np.asarray(s.init_velocity, float), mesh.n_nodes)
+    v = (np.asarray(v0, float).ravel().copy() if v0 is not None
+         else np.tile(np.asarray(s.init_velocity, float), mesh.n_nodes))
     v[cd] = 0.0
     u[cd] = cv * _ramp(0.0, s.ramp_time)
     Fprev = F0 * _ramp(0.0, s.ramp_time)
@@ -425,6 +564,9 @@ def solve_implicit(mesh, material, bcs, settings: DynamicSettings, elem_material
         hist["ひずみエネルギー [mJ]"].append(0.5 * float(u @ (K @ u)))
         hist["接触力 [N]"].append(fc)
         hist["最大変位 [mm]"].append(float(np.abs(u).max()))
+        if monitor is not None:
+            for kk, vv in (monitor(t, u, v) or {}).items():
+                hist.setdefault(kk, []).append(vv)
         while ft and t >= ft[0] - 0.5 * dt:
             frames.append(_frame_result(mesh, mats, elem_mat, D, u, v, ft.pop(0), info, material))
         if progress:
@@ -438,11 +580,12 @@ def solve_implicit(mesh, material, bcs, settings: DynamicSettings, elem_material
     return frames
 
 
-def solve_dynamic(mesh, material, bcs, settings: DynamicSettings, elem_materials=None, log=print, progress=None):
+def solve_dynamic(mesh, material, bcs, settings: DynamicSettings, elem_materials=None, log=print, progress=None,
+                  **kw):
     if getattr(mesh, "is_shell", False) or getattr(mesh, "is_2d", False):
         raise ValueError("過渡解析は現在ソリッド（四面体）要素に対応しています")
     f = solve_explicit if settings.method == "explicit" else solve_implicit
-    return f(mesh, material, bcs, settings, elem_materials=elem_materials, log=log, progress=progress)
+    return f(mesh, material, bcs, settings, elem_materials=elem_materials, log=log, progress=progress, **kw)
 
 
 __all__ = ["DynamicSettings", "METHODS", "solve_dynamic", "solve_explicit", "solve_implicit",
