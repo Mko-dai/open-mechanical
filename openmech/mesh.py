@@ -233,6 +233,23 @@ class Mesh:
         self._bquad_full = qloop
         self._bquad_of = np.concatenate([np.full(len(t_once), -1), np.tile(np.arange(nq), 2)])
 
+    def sweep_lines(self):
+        """三角柱メッシュの節点を、スイープ方向に並ぶ列（柱）ごとに番号付けする（反復法の線平滑化用）。
+
+        返り値: 節点ごとの列番号 (N,)。三角柱でなければ None
+        """
+        if not self.is_wedge:
+            return None
+        e = self.elems
+        d = self.nodes[e[:, 3]] - self.nodes[e[:, 0]]
+        ax = int(np.argmax(np.abs(d).mean(axis=0)))
+        other = [k for k in range(3) if k != ax]
+        lo, hi = self.bounds()
+        tol = 1e-7 * max(1.0, float(np.linalg.norm(hi - lo)))
+        key = np.round(self.nodes[:, other] / tol).astype(np.int64)
+        _, ids = np.unique(key, axis=0, return_inverse=True)
+        return ids.reshape(-1)
+
     @property
     def boundary_quads_full(self) -> np.ndarray:
         """三角柱の側面（境界の四角形）。Quad4 か、周の順の Quad8"""

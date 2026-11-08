@@ -13,25 +13,48 @@ import scipy.sparse.linalg as spla
 from .parallel import ParallelMatvec
 
 
-def _lambda_max(mv, n, dinv, iters=12, seed=0):
-    """D⁻¹A の最大固有値の推定（べき乗法）"""
+def _lambda_max(mv, n, prec, iters=12, seed=0):
+    """M⁻¹A の最大固有値の推定（べき乗法）。prec は M⁻¹ を掛ける関数"""
     rng = np.random.default_rng(seed)
     x = rng.standard_normal(n)
     lam = 1.0
     for _ in range(iters):
-        y = dinv * mv(x)
+        y = prec(mv(x))
         lam = np.linalg.norm(y) / max(np.linalg.norm(x), 1e-300)
         x = y / max(np.linalg.norm(y), 1e-300)
     return lam
 
 
+class LineBlock:
+    """線（柱）ブロック・ヤコビ: 同じ列の自由度どうしの結合だけを残した行列を分解して、その逆で割る。
+
+    薄い層を積んだ三角柱メッシュでは厚さ方向の結合が面内よりずっと強く（強い異方性）、
+    点ごとのヤコビでは厚さ方向の誤差が消えない。列ごとにまとめて解くとこれを一度に消せる
+    （異方性の強い問題の多重格子法で使う線緩和と同じ考え方）。
+    """
+
+    def __init__(self, A, lines):
+        C = sp.coo_matrix(A)
+        keep = lines[C.row] == lines[C.col]
+        Dl = sp.csc_matrix((C.data[keep], (C.row[keep], C.col[keep])), shape=A.shape)
+        del C
+        self.lu = spla.splu(Dl, permc_spec="MMD_AT_PLUS_A", diag_pivot_thresh=0.0,
+                            options=dict(SymmetricMode=True))
+        self.nnz = int(Dl.nnz)
+
+    def __call__(self, v):
+        return self.lu.solve(np.asarray(v, float))
+
+
 class _Level:
-    def __init__(self, A, P=None, R=None, degree=3):
+    def __init__(self, A, P=None, R=None, degree=3, prec=None):
         self.A = sp.csr_matrix(A)
         self.mv = ParallelMatvec(self.A)
         d = self.A.diagonal()
-        self.dinv = 1.0 / np.where(d != 0, d, 1.0)
-        lm = _lambda_max(self.mv, self.A.shape[0], self.dinv) * 1.15
+        dinv = 1.0 / np.where(d != 0, d, 1.0)
+        self.dinv = dinv
+        self.prec = prec if prec is not None else (lambda v: dinv * v)
+        lm = _lambda_max(self.mv, self.A.shape[0], self.prec) * 1.15
         self.a, self.b = lm / 30.0, lm
         self.P = P
         self.R = R
@@ -46,7 +69,7 @@ class _Level:
         theta, delta = 0.5 * (b + a), 0.5 * (b - a)
         sigma = theta / delta
         rho = 1.0 / sigma
-        r = self.dinv * (rhs - self.mv(x)) if x is not None else self.dinv * rhs
+        r = self.prec(rhs - self.mv(x)) if x is not None else self.prec(rhs)
         if x is None:
             x = np.zeros_like(rhs)
         d = r / theta
@@ -54,7 +77,7 @@ class _Level:
             x += d
             if k == self.degree - 1:
                 break
-            r -= self.dinv * self.mv(d)
+            r -= self.prec(self.mv(d))
             rho_new = 1.0 / (2.0 * sigma - rho)
             d = rho_new * rho * d + (2.0 * rho_new / delta) * r
             rho = rho_new
@@ -64,12 +87,17 @@ class _Level:
 class ChebyshevAMG:
     """M(r) ≈ A⁻¹ r（V サイクル1回）"""
 
-    def __init__(self, ml, degree=3, A0=None):
+    def __init__(self, ml, degree=3, A0=None, lines=None):
         lv = ml.levels
         self.levels = []
+        self.line_nnz = 0
         for i in range(len(lv) - 1):
             A = A0 if (i == 0 and A0 is not None) else lv[i].A    # 最上位は元の CSR をそのまま使う（コピーしない）
-            self.levels.append(_Level(A, sp.csr_matrix(lv[i].P), sp.csr_matrix(lv[i].R), degree))
+            prec = None
+            if i == 0 and lines is not None:
+                prec = LineBlock(A, lines)
+                self.line_nnz = prec.nnz
+            self.levels.append(_Level(A, sp.csr_matrix(lv[i].P), sp.csr_matrix(lv[i].R), degree, prec=prec))
         Ac = sp.csc_matrix(lv[-1].A)
         self.coarse_n = Ac.shape[0]
         self.coarse = spla.splu(Ac)
@@ -88,8 +116,9 @@ class ChebyshevAMG:
         return self._vcycle(0, np.asarray(r, float))
 
 
-def build(A, B=None, max_coarse=3000, degree=3, comps=None, robust=False):
-    """comps: 自由度ごとの成分番号（0,1,2）。節点ごとに3成分そろっていればブロック（BSR）で集約する"""
+def build(A, B=None, max_coarse=3000, degree=3, comps=None, robust=False, lines=None):
+    """comps: 自由度ごとの成分番号（0,1,2）。節点ごとに3成分そろっていればブロック（BSR）で集約する
+    lines: 自由度ごとの列（柱）番号。与えると最上位の平滑化を線ブロック・ヤコビにする（三角柱の積層メッシュ向け）"""
     import pyamg
     A = sp.csr_matrix(A)
     n = A.shape[0]
@@ -107,4 +136,4 @@ def build(A, B=None, max_coarse=3000, degree=3, comps=None, robust=False):
                                                max_coarse=max_coarse, improve_candidates=None,
                                                smooth=None)   # 平滑化なし集約: 準備が速く、総時間も最短（実測）
     del A_setup
-    return ChebyshevAMG(ml, degree, A0=A)
+    return ChebyshevAMG(ml, degree, A0=A, lines=lines)

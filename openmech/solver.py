@@ -625,8 +625,10 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
     t1 = time.time()
     dof_ids = np.nonzero(free)[0]
     coords = np.column_stack([mesh.nodes[dof_ids // 3], dof_ids % 3])
+    sl = mesh.sweep_lines() if getattr(mesh, "is_wedge", False) else None
+    lines = sl[dof_ids // 3] if sl is not None else None
     with np.errstate(all="ignore"):
-        uf = _linear_solve(Kff, rhs, log, coords=coords, method=method)
+        uf = _linear_solve(Kff, rhs, log, coords=coords, method=method, lines=lines)
     if not np.all(np.isfinite(uf)):
         raise RuntimeError("解が求まりませんでした。拘束が不足して物体が自由に動ける状態"
                            "（剛体運動）になっていないか確認してください。")
@@ -752,7 +754,7 @@ def choose_method(n: int, method: str = "auto") -> str:
 
 
 def _linear_solve(A: sp.csc_matrix, b: np.ndarray, log=print, coords=None,
-                  method: str = "auto") -> np.ndarray:
+                  method: str = "auto", lines=None) -> np.ndarray:
     """連立方程式 A x = b（A は対称正定値）を解く。
 
     method: "auto"（自由度と利用できるライブラリから自動選択）/ "direct"（直接法）/ "amg"（反復法）
@@ -768,11 +770,14 @@ def _linear_solve(A: sp.csc_matrix, b: np.ndarray, log=print, coords=None,
         try:
             import pyamg  # noqa: F401
             from .amg import build as build_amg
-            log("ソルバー: 反復法（AMG 前処理付き共役勾配法・並列チェビシェフ平滑化）")
+            log("ソルバー: 反復法（AMG 前処理付き共役勾配法・並列チェビシェフ平滑化"
+                + ("・厚さ方向の線平滑化" if lines is not None else "") + "）")
             B = _rigid_modes(coords, n) if coords is not None else None
             t0 = time.time()
-            M = build_amg(A, B, comps=coords[:, 3].astype(int) if coords is not None else None)
+            M = build_amg(A, B, comps=coords[:, 3].astype(int) if coords is not None else None, lines=lines)
             t1 = time.time()
+            log(f"  AMG 準備 {t1 - t0:.1f} s / 階層 " + " → ".join(f"{L.A.shape[0]:,}" for L in M.levels)
+                + f" → {M.coarse_n:,}" + (f" / 線ブロック 非ゼロ {M.line_nnz / 1e6:.0f} 百万" if lines is not None else ""))
             hist = []
             xsol, info, it = _pcg(A.tocsr(), b, M, tol=1e-10, maxiter=400, hist=hist)
             if info != 0 and len(hist) > 150 and hist[-1] < hist[-150]:
@@ -792,7 +797,8 @@ def _linear_solve(A: sp.csc_matrix, b: np.ndarray, log=print, coords=None,
             # 収束が遅い（剛性差の大きい材料・薄い層など）→ 頑健な AMG に作り直して続きから解く
             log(f"  {it} 回で収束しないため、頑健な AMG（平滑化集約）に切り替えます")
             del M
-            M = build_amg(A, B, comps=coords[:, 3].astype(int) if coords is not None else None, robust=True)
+            M = build_amg(A, B, comps=coords[:, 3].astype(int) if coords is not None else None, robust=True,
+                          lines=lines)
             t3 = time.time()
             xsol, info, it2 = _pcg(A.tocsr(), b, M, tol=1e-10, maxiter=3000, x0=xsol)
             rr = _rel_res(A, xsol, b)
