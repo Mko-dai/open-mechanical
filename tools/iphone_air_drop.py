@@ -171,7 +171,7 @@ for name, c in CASES.items():
         em_b = mesh.elem_body == b
         nm = body_name.get(int(b), f"B{b}")
         mat = p.materials[body_mat[int(b)]]
-        brittle = any(w in mat.name for w in ("ガラス", "サファイア", "IC", "磁石", "シリコン"))
+        brittle = any(w in mat.name for w in ("ガラス", "サファイア", "IC", "NdFeB", "シリコン"))
         smax = float(s1_e[em_b].max()) if brittle else float(vm_e[em_b].max())
         lim = (mat.tensile_strength or mat.yield_strength) if brittle else mat.yield_strength
         per[nm] = {"最大相当応力 [MPa]": float(vm_e[em_b].max()), "最大主応力 [MPa]": float(s1_e[em_b].max()),
