@@ -774,7 +774,10 @@ def _linear_solve(A: sp.csc_matrix, b: np.ndarray, log=print, coords=None,
                 + ("・厚さ方向の線平滑化" if lines is not None else "") + "）")
             B = _rigid_modes(coords, n) if coords is not None else None
             t0 = time.time()
-            M = build_amg(A, B, comps=coords[:, 3].astype(int) if coords is not None else None, lines=lines)
+            import os as _os
+            robust0 = _os.environ.get("OPENMECH_AMG", "") == "robust"
+            M = build_amg(A, B, comps=coords[:, 3].astype(int) if coords is not None else None, lines=lines,
+                          robust=robust0)
             t1 = time.time()
             log(f"  AMG 準備 {t1 - t0:.1f} s / 階層 " + " → ".join(f"{L.A.shape[0]:,}" for L in M.levels)
                 + f" → {M.coarse_n:,}" + (f" / 線ブロック 非ゼロ {M.line_nnz / 1e6:.0f} 百万" if lines is not None else ""))

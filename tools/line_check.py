@@ -51,11 +51,12 @@ def laminate(lx, ly, h2=2.0):
     return m, (mats, body)
 
 
-def run(m, em, use_lines):
+def run(m, em, use_lines, robust=False):
     info = m.face_info()
     top = [f["id"] for f in info if f["normal"][2] > 0.99 and abs(f["centroid"][2] - m.nodes[:, 2].max()) < 1e-6]
     bcs = [BC("fixed", top), BC("gravity", [], [0, 0, 9810.0])]
     orig = Mesh.sweep_lines
+    os.environ["OPENMECH_AMG"] = "robust" if robust else ""
     if not use_lines:
         Mesh.sweep_lines = lambda self: None
     try:
@@ -66,13 +67,18 @@ def run(m, em, use_lines):
         Mesh.sweep_lines = orig
 
 
-for lx, ly in ((80, 40), (156, 75)):
+CASES = [(80, 40, False, False), (80, 40, True, False), (80, 40, False, True), (80, 40, True, True)]
+if "--big" in sys.argv:
+    CASES = [(156, 75, a, b) for a, b in ((False, False), (True, False), (True, True))]
+for lx, ly, use, rob in CASES:
     m, em = laminate(lx, ly)
-    P(f"=== 積層板 {lx}×{ly} mm / 自由度 {3 * m.n_nodes:,}")
-    for use in (False, True):
-        P(f"  線平滑化 {'あり' if use else 'なし'}")
-        dt, d = run(m, em, use)
-        P(f"  → {dt:.1f} s / 最大変位 {d:.6e} mm")
+    P(f"=== 積層板 {lx}×{ly} mm / 自由度 {3 * m.n_nodes:,} / 線平滑化 {'あり' if use else 'なし'} / "
+      f"AMG {'平滑化集約（頑健）' if rob else '平滑化なし集約（既定）'}")
+    dt, d = run(m, em, use, rob)
+    P(f"  → {dt:.1f} s / 最大変位 {d:.6e} mm")
+if "--iphone" not in sys.argv:
+    P("完了")
+    sys.exit(0)
 
 os.environ.setdefault("MESH", "2.0")
 import iphone_air_model as ip  # noqa: E402
@@ -85,6 +91,7 @@ info = m.face_info()
 hi = m.nodes[:, 2].max()
 f0 = [f["id"] for f in info if f["flat"] and abs(f["centroid"][2] - hi) < 0.05 and f["normal"][2] > 0.99]
 p.bcs = [BC("fixed", f0), BC("gravity", [], [0, 0, 9810.0])]
+os.environ["OPENMECH_AMG"] = "robust" if "--robust" in sys.argv else ""
 t = time.time()
 r = p.run(m, log=lambda s: P("    " + str(s)))
 P(f"  → {time.time() - t:.1f} s / 最大変位 {r.disp_mag.max():.4g} mm / 最大ミーゼス {r.von_mises.max():.4g} MPa")
