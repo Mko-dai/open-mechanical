@@ -3455,7 +3455,7 @@ class MainWindow(QMainWindow):
         self.result = result
         self.solve_error = ""
         self.log("解析が完了しました（" + ", ".join(f"{k} {v}" for k, v in result.info.items()
-                                               if k in ("自由度数", "合計時間 [s]")) + "）")
+                                               if k in ("自由度数", "合計時間 [s]", "解析", "ステップ数", "計算時間 [s]")) + "）")
         self.rebuild_tree()
         if self.project.results:
             self.select_node(("result", min(1, len(self.project.results) - 1)))
