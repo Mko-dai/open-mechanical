@@ -906,6 +906,7 @@ MESH_DEFAULTS = {
     "capture_proximity": False,
     "proximity_cells": 3,         # すき間（板厚）を横切る要素数（Ansys の Num Cells Across Gap、既定 3）
     "proximity_min_size": 0.0,    # 近接の最小サイズ [mm]（0 = 曲率の最小サイズと同じ）
+    "proximity_max_elements": 3e6,  # 近接の捕捉で見積もった要素数がこれを超えたら中止
 }
 
 CONTROL_TYPES = {"sizing": "サイズ指定", "refinement": "リファインメント", "sweep": "手法：スイープ",
@@ -1511,6 +1512,10 @@ def _proximity_points(gmsh, h, cells, pmin):
     sel = np.isfinite(thick)
     size = np.clip(thick[sel] / cells, pmin, None)
     keep = size < 0.99 * h
+    # 薄い部分にできる要素数の見積もり（両面で数えるので半分。正四面体の体積 ≈ サイズ³ / 8.5）
+    a_t = 0.5 * area2[sel][keep]
+    est = float(0.5 * np.sum(a_t * thick[sel][keep] / (size[keep] ** 3 / 8.5)))
+    _proximity_points.estimate = est
     return cen[sel][keep], size[keep], tri_r[sel][keep]
 
 
@@ -1525,6 +1530,14 @@ def _apply_proximity(gmsh, h, ms, log):
     if not len(pts):
         log("近接の捕捉: 薄い部分・狭いすき間は見つかりませんでした")
         return None
+    est = getattr(_proximity_points, "estimate", 0.0)
+    limit = float(ms.get("proximity_max_elements", 3e6))
+    if est > limit:
+        raise GeometryError(
+            f"近接の捕捉で要素が約 {est / 1e6:.1f} 百万個になる見込みのため中止しました（上限 {limit / 1e6:.0f} 百万）。\n"
+            f"最も薄い所は {float(size.min()) * cells:.3g} mm です。次のどれかを試してください:\n"
+            "・「近接の最小サイズ」を大きくする\n・「すき間を横切る要素数」を 2 に減らす\n"
+            "・積層品なら メッシュ制御 →「手法：スイープ」（多層スイープ）を使う")
     g = max(1.05, float(ms.get("growth_rate", 1.5)))
     tree = cKDTree(pts)
     # 要素サイズを格子に前計算しておき、コールバックでは格子を引くだけにする（gmsh は点ごとに呼ぶので速さが大事）

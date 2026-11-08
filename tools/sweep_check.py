@@ -56,8 +56,7 @@ try:
     feats = laminate()
     spec = {"kind": "model", "features": feats}
     res = {}
-    for name, ctrl in (("四面体（既定）", []), ("四面体（近接の捕捉）", None),
-                       ("多層スイープ", [{"type": "sweep", "axis": "Z", "divs": 0, "layer_size": 0.7}])):
+    for name, ctrl in (("四面体（既定）", []), ("多層スイープ", [{"type": "sweep", "axis": "Z", "divs": 0, "layer_size": 0.7}])):
         t0 = time.time()
         logs = []
         st = {"capture_proximity": True} if ctrl is None else {}
