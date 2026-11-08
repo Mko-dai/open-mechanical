@@ -81,7 +81,8 @@ def run(name, atype, bcs, opts=None, results=None, shot=None):
         w.grab().save(os.path.join(out, (shot or atype) + ".png"))
         r = w.results[-1]
         P(f"OK  {name}: 結果 {len(fr)} 個 / 表示 {[getattr(x, 'label', '') for x in fr][:4]} / "
-          + ", ".join(f"{k} {v:.4g}" for k, v in list(r.summary().items())[:3])
+          + ", ".join(f"{k} {v:.4g}" for k, v in [kv for kv in r.summary().items()
+                                                   if isinstance(kv[1], (int, float))][:3])
           + (f" / メッセージ: {msgs[-1]}" if msgs else ""))
         msgs.clear()
         return fr

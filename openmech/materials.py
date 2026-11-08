@@ -138,6 +138,12 @@ class MaterialState:
     def density_t_mm3(self):
         return self.density * 1e-12
 
+    def __getattr__(self, name):
+        # 熱伝導率・比熱・誘電率・圧電・S-N 曲線など、計算用に変換しない定数は元の材料のものを使う
+        if name.startswith("__") or name == "base":
+            raise AttributeError(name)
+        return getattr(self.base, name)
+
     @property
     def plastic(self):
         return self.plasticity != "none"
