@@ -200,6 +200,28 @@ def _radiation(rad, T, n):
     return F, Kr.tocsr()
 
 
+ITERATIVE_N = 150_000     # これより大きいモデルは AMG 前処理の共役勾配法
+
+
+def _scalar_solver(A, log):
+    """温度（スカラー場）の連立方程式: 小さいモデルは直接法、大きいモデルは pyamg の AMG＋CG"""
+    n = A.shape[0]
+    if n > ITERATIVE_N:
+        try:
+            import pyamg
+            ml = pyamg.smoothed_aggregation_solver(A.tocsr(), symmetry="hermitian", max_coarse=2000)
+            log(f"  ソルバー: AMG 前処理付き共役勾配法（{n:,} 自由度）")
+
+            def sol(b):
+                res = []
+                x = ml.solve(b, tol=1e-10, accel="cg", maxiter=500, residuals=res)
+                return x
+            return sol
+        except ImportError:
+            pass
+    return factorize(A.tocsc(), lambda *a: None)
+
+
 def solve_thermal(mesh: Mesh, material, bcs: list[BC], settings: ThermalSettings | None = None,
                   elem_materials=None, log=print, progress=None) -> list[ThermalResult]:
     """定常または過渡の熱解析。結果（過渡なら各ステップ）のリストを返す"""
@@ -245,7 +267,7 @@ def solve_thermal(mesh: Mesh, material, bcs: list[BC], settings: ThermalSettings
             else:
                 if fac is None:
                     Aff = A_lin[free][:, free]
-                    fac = factorize(Aff.tocsc(), lambda *a: None)
+                    fac = _scalar_solver(Aff, log)
                 rhs = b_lin[free] - A_lin[free][:, cd] @ cv
                 T[free] = fac(rhs)
         return T

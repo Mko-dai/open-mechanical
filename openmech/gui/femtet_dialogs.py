@@ -7,9 +7,10 @@
 """
 from __future__ import annotations
 
+import numpy as np
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
                                QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-                               QPushButton, QRadioButton, QTabWidget, QVBoxLayout, QWidget)
+                               QPushButton, QRadioButton, QTabWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from ..geometry import AXES, FEATURE_CHOICES, FEATURES, PLANES
 from ..materials import LIBRARY, Material
@@ -316,6 +317,43 @@ class MaterialDialog(QDialog):
         v3.addWidget(_table_buttons(self.mtab))
         v3.addWidget(QLabel("塑性を設定すると非線形解析（弾塑性）になります。安全率は降伏応力で評価します。"))
         tabs.addTab(t3, "強度・塑性")
+        # --- 熱伝導（熱解析）
+        t5 = QWidget()
+        f5 = QFormLayout(t5)
+        self.kc = _spin(getattr(m, "conductivity", 0.0), 0.0, 1e5, 4, "W/(m·K)")
+        self.cp = _spin(getattr(m, "specific_heat", 0.0), 0.0, 1e6, 2, "J/(kg·K)")
+        f5.addRow("熱伝導率", self.kc)
+        f5.addRow("比熱", self.cp)
+        f5.addRow(QLabel("熱解析（定常熱は熱伝導率、過渡熱は密度と比熱も）に使います"))
+        tabs.addTab(t5, "熱伝導")
+        # --- 電気（静電場・圧電）
+        t6 = QWidget()
+        f6 = QFormLayout(t6)
+        self.epsr = _spin(getattr(m, "permittivity", 1.0), 1e-3, 1e7, 3)
+        f6.addRow("比誘電率 εr", self.epsr)
+        pz = getattr(m, "piezo", None) or {}
+        e = np.zeros((6, 3)) if not pz else np.asarray(pz.get("e"), float).reshape(6, 3)
+        es = list(pz.get("eps_s", [0, 0, 0])) if pz else [0, 0, 0]
+        self.e31 = _spin(e[0, 2], -1e3, 1e3, 4, "C/m²")
+        self.e33 = _spin(e[2, 2], -1e3, 1e3, 4, "C/m²")
+        self.e15 = _spin(e[4, 1], -1e3, 1e3, 4, "C/m²")
+        self.es11 = _spin(es[0], 0.0, 1e7, 2)
+        self.es33 = _spin(es[2], 0.0, 1e7, 2)
+        f6.addRow("圧電定数 e31", self.e31)
+        f6.addRow("圧電定数 e33", self.e33)
+        f6.addRow("圧電定数 e15", self.e15)
+        f6.addRow("比誘電率 ε11ˢ（ひずみ一定）", self.es11)
+        f6.addRow("比誘電率 ε33ˢ（ひずみ一定）", self.es33)
+        f6.addRow(QLabel("圧電定数がすべて 0 なら圧電材料ではありません。分極は Z 方向（横等方性: e32 = e31、e24 = e15）"))
+        tabs.addTab(t6, "電気・圧電")
+        # --- 疲労（S-N 曲線）
+        t7 = QWidget()
+        v7 = QVBoxLayout(t7)
+        v7.addWidget(QLabel("S-N 曲線: 繰返し数 と 応力振幅（両振り）。両対数で補間します"))
+        self.sntab = _table(["繰返し数 [回]", "応力振幅 [MPa]"], getattr(m, "sn_table", []) or [], 4)
+        v7.addWidget(self.sntab)
+        v7.addWidget(_table_buttons(self.sntab))
+        tabs.addTab(t7, "疲労")
         lay.addWidget(tabs)
         _buttons(self, lay)
 
@@ -329,6 +367,15 @@ class MaterialDialog(QDialog):
         self.sy.setValue(m.yield_strength)
         self.su.setValue(m.tensile_strength)
         self.alpha.setValue(m.alpha * 1e6)
+        self.kc.setValue(getattr(m, "conductivity", 0.0))
+        self.cp.setValue(getattr(m, "specific_heat", 0.0))
+        if getattr(m, "sn_table", None):
+            self.sntab.setRowCount(0)
+            for row in m.sn_table:
+                r = self.sntab.rowCount()
+                self.sntab.insertRow(r)
+                for c, v in enumerate(row):
+                    self.sntab.setItem(r, c, QTableWidgetItem(f"{v:g}"))
         if not self.name.text().strip():
             self.name.setText(m.name)
 
@@ -349,7 +396,23 @@ class MaterialDialog(QDialog):
                         aniso=aniso, alpha=self.alpha.value() * 1e-6,
                         alpha_ortho=[sp.value() * 1e-6 for sp in self.ao] if any(sp.value() for sp in self.ao) else [],
                         ref_temp=self.tref.value(), plasticity=self.plast.currentData(),
-                        tangent_modulus=self.et.value(), ml_table=mt)
+                        tangent_modulus=self.et.value(), ml_table=mt,
+                        conductivity=self.kc.value(), specific_heat=self.cp.value(),
+                        permittivity=self.epsr.value(), piezo=self._piezo(),
+                        sn_table=_table_rows(self.sntab, 2))
+
+    def _piezo(self):
+        e31, e33, e15 = self.e31.value(), self.e33.value(), self.e15.value()
+        if not (e31 or e33 or e15):
+            return {}
+        e = np.zeros((6, 3))
+        e[0, 2] = e[1, 2] = e31          # σx, σy ← Ez
+        e[2, 2] = e33                    # σz ← Ez
+        e[4, 1] = e15                    # τyz ← Ey
+        e[5, 0] = e15                    # τzx ← Ex
+        es = [self.es11.value() or self.epsr.value(), self.es11.value() or self.epsr.value(),
+              self.es33.value() or self.epsr.value()]
+        return {"e": e.tolist(), "eps_s": es}
 
 
 # ---------------------------------------------------------------------------- Body 属性

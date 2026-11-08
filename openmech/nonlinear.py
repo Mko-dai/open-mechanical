@@ -21,7 +21,7 @@ from .contact import (ContactRegion, build_pairs, commit_states, penetration_ok,
                       update_states)
 from .materials import Material
 from .mesh import Mesh
-from .solver import (BC, GAUSS4, GAUSS4_W, NODE_L10, NODE_L4, Result, _B_matrix, _dN_dx, _D_of,
+from .solver import (BC, SUPPORT_KINDS, GAUSS4, GAUSS4_W, NODE_L10, NODE_L4, Result, _B_matrix, _dN_dx, _D_of,
                      _linear_solve, _quadrature, _rel_res, assemble_stiffness, build_load_and_constraints,
                      elasticity_matrix, nodal_stress, shape_dN_dxi)
 
@@ -189,7 +189,7 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
     t_start = time.time()
     settings = settings or AnalysisSettings()
     contacts = [c for c in (contacts or []) if not c.suppressed]
-    if not any(b.kind in ("fixed", "displacement", "symmetry", "frictionless") for b in bcs):
+    if not any(b.kind in SUPPORT_KINDS for b in bcs):
         raise ValueError("拘束（固定支持 または 変位）がありません。少なくとも1つ設定してください。")
 
     # 材料
@@ -207,7 +207,27 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
     ndof = 3 * mesh.n_nodes
 
     # 荷重・拘束（境界条件ごと）
+    from .remote import REMOTE_KINDS
+    NL_OK = ("elastic_support", "cylindrical_support", "bearing_load")
+    bad = sorted({b.kind for b in bcs if b.kind in REMOTE_KINDS and b.kind not in NL_OK
+                  and not (b.kind == "remote_force" and (b.options or {}).get("behavior", "deformable") != "rigid")})
+    if bad:
+        from .solver import BC_EXTRA_JP
+        raise ValueError("接触・大変形・塑性などの非線形解析では、次の条件にまだ対応していません: "
+                         + "、".join(BC_EXTRA_JP.get(k, k) for k in bad)
+                         + "（リモート荷重は「変形可」、支持は弾性支持・円筒支持なら使えます）")
     per_bc = [build_load_and_constraints(mesh, mats[0], [bc], rho_e=rho_e) for bc in bcs]
+    ex_bcs = [i for i, b in enumerate(bcs) if b.kind in REMOTE_KINDS]
+    if ex_bcs:
+        from .remote import extra_terms
+        for i in ex_bcs:
+            exi = extra_terms(mesh, [bcs[i]], 1.0)
+            if exi.F:
+                Fi = np.zeros(ndof)
+                for d, v in exi.F.items():
+                    if d < ndof:
+                        Fi[d] += v
+                per_bc[i] = (Fi, {})
     ends = settings.end_times()
 
     th_bcs = [bc for bc in bcs if bc.kind == "thermal"]
@@ -269,6 +289,23 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
         diagK = (K_lin.diagonal() if K_lin is not None else assemble_stiffness(mesh, D, elem_mat=elem_mat).diagonal())
         k_weak = 1e-8 * float(np.mean(np.abs(diagK)))
     W = sp.identity(ndof, format="csr") * k_weak if k_weak > 0 else None
+    if ex_bcs:
+        # 弾性支持・円筒支持の剛性（線形のばね）を、弱いばねと同じ形で足す（ペナルティの荷重は per_bc 側）
+        from .remote import extra_terms
+        kref = float(np.mean(np.abs((K_lin if K_lin is not None else assemble_stiffness(mesh, D, elem_mat=elem_mat)
+                                     ).diagonal())))
+        exk = extra_terms(mesh, [bcs[i] for i in ex_bcs], kref).K()
+        exk = exk[:ndof][:, :ndof]
+        if any(bcs[i].kind == "cylindrical_support" for i in ex_bcs):
+            # 円筒支持の強制変位（0 以外）の荷重は kref で作り直す
+            for i in ex_bcs:
+                if bcs[i].kind == "cylindrical_support":
+                    exi = extra_terms(mesh, [bcs[i]], kref)
+                    Fi = np.zeros(ndof)
+                    for d, v in exi.F.items():
+                        Fi[d] += v
+                    per_bc[i] = (Fi, {})
+        W = exk if W is None else (W + exk)
     from .parallel import set_threads
     set_threads(settings.n_cores)
     # 接触の剛性で条件が悪くなるため、非線形では既定で直接法

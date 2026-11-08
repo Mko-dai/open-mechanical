@@ -57,10 +57,42 @@ def _free_dofs(mesh, material, bcs, extra_fixed=None):
     return free
 
 
-def _eig(Kff, Mff, n, sigma, log, label="固有値"):
-    """一般化固有値問題 K x = λ M x の、sigma に近い n 個（シフト逆反復＋ランチョス）"""
+ITERATIVE_DOF = 300_000     # これより大きいモデルは AMG 前処理の LOBPCG（直接法の分解はメモリを使いすぎる）
+
+
+def _eig_lobpcg(Kff, Mff, n, sigma, log, coords=None):
+    """大規模モデル向け: (K − σM) の AMG を前処理にした LOBPCG で、小さい方から n 個"""
+    import pyamg  # noqa: F401
+    from .amg import build as build_amg
+    from .solver import _rigid_modes
+    nd = Kff.shape[0]
+    A = (Kff - sigma * Mff).tocsr() if sigma != 0 else Kff.tocsr()
+    t0 = time.time()
+    comps = coords[:, 3].astype(int) if coords is not None else None
+    B = _rigid_modes(coords, nd) if coords is not None else None
+    P = build_amg(A, B, comps=comps)
+    prec = spla.LinearOperator((nd, nd), matvec=lambda r: P(r), dtype=float)
+    k = n + max(4, n // 2)
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((nd, k))
+    lam, vec = spla.lobpcg(A, X, B=Mff, M=prec, largest=False, tol=1e-8, maxiter=400)
+    lam = lam + sigma
+    log(f"  LOBPCG（AMG 前処理）: {n} 個（{time.time() - t0:.1f} s）")
+    o = np.argsort(lam)
+    return lam[o][:n], vec[:, o][:, :n]
+
+
+def _eig(Kff, Mff, n, sigma, log, label="固有値", coords=None):
+    """一般化固有値問題 K x = λ M x の、sigma に近い n 個（シフト逆反復＋ランチョス）。
+    大きなモデルで pyamg があれば AMG 前処理の LOBPCG（小さい方から）"""
     nd = Kff.shape[0]
     n = max(1, min(n, nd - 2))
+    if nd > ITERATIVE_DOF and sigma <= 0:
+        try:
+            return _eig_lobpcg(Kff, Mff, n, sigma if sigma < 0 else -1e-6 * float(
+                Kff.diagonal().mean() / max(Mff.diagonal().mean(), 1e-300)), log, coords)
+        except ImportError:
+            log("  （pyamg がないため直接法で分解します。大きなモデルはメモリを多く使います）")
     A = (Kff - sigma * Mff).tocsc() if sigma != 0 else Kff.tocsc()
     t0 = time.time()
     solve = factorize(A, log)
@@ -178,7 +210,12 @@ def solve_modal(mesh: Mesh, material: Material, bcs: list[BC], n_modes: int = 6,
     t1 = time.time()
     # 重根（剛体モード・対称形状の 2 重根）を取りこぼさないよう、多めに求めてから小さい順に n_modes 個を使う
     extra = 8 if nfree_body else 4
-    lam, vec = _eig(Kff, Mff, n_modes + extra, sigma, log)
+    coords = None
+    if T is None:
+        dof_ids = np.nonzero(free)[0]
+        dn = np.minimum(dof_ids, nb - 1)
+        coords = np.column_stack([mesh.nodes[dn // 3], dn % 3])
+    lam, vec = _eig(Kff, Mff, n_modes + extra, sigma, log, coords=coords)
     lam, vec = lam[:n_modes], vec[:, :n_modes]
     t_sol = time.time() - t1
     lam = np.where(np.abs(lam) < 1e-9 * lam_ref, 0.0, lam)

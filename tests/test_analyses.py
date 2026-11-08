@@ -212,3 +212,15 @@ def test_electrostatic_and_piezo():
     fs = solve_piezo_modal(b, P, bc, n_modes=10, **q)
     fo = solve_piezo_modal(b, P, bc, n_modes=10, open_circuit=True, **q)
     assert np.any(fo > fs * 1.05)                # 縦振動のモード: 開放（反共振）は短絡より高い
+
+
+def test_nonlinear_with_elastic_support_and_refusal():
+    from openmech.nonlinear import AnalysisSettings, solve_static
+    m = bar(nx=40, ny=3, nz=3)
+    r = solve_static(m, S, [BC("elastic_support", [face(m, 2, 0, -1)], [10.0]),
+                            BC("pressure", [face(m, 2, 10, 1)], [1.0])], None,
+                     AnalysisSettings(large_deflection=True), **q)[-1]
+    assert r.u[:, 2].mean() == pytest.approx(-0.1, rel=1e-3)
+    with pytest.raises(ValueError):
+        solve_static(m, S, [BC("fixed", [face(m, 0, 0, -1)]), BC("point_mass", [face(m, 0, 200, 1)], [1, 0, 0, 0])],
+                     None, AnalysisSettings(large_deflection=True), **q)
