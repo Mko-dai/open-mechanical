@@ -150,15 +150,17 @@ CASES = {
     "画面から落下（平面）": dict(
         faces=faces_where(lambda f: f["flat"] and f["normal"][2] > 0.99 and abs(f["centroid"][2] - hi[2]) < eps),
         dir=(0, 0, 1)),
-    "背面から落下（カメラが当たる）": dict(
+    # 背面: カメラの出っ張りと、本体の下端（傾いて着地）の 2 点で床に当たる
+    "背面から落下（カメラと下端が当たる）": dict(
         faces=faces_where(lambda f: f["flat"] and f["normal"][2] < -0.99 and abs(f["centroid"][2] - lo[2]) < eps),
+        zfaces=faces_where(lambda f: f["flat"] and f["normal"][1] < -0.99 and abs(f["centroid"][1] - lo[1]) < eps),
         dir=(0, 0, -1)),
     "下端（USB-C 側）から落下": dict(
         faces=faces_where(lambda f: f["flat"] and f["normal"][1] < -0.99 and abs(f["centroid"][1] - lo[1]) < eps),
         dir=(0, -1, 0)),
     "角から落下（左下の角）": dict(
         faces=faces_where(lambda f: (not f["flat"]) and f["centroid"][0] < R and f["centroid"][1] < R
-                          and np.hypot(*(f["centroid"][:2] - [R, R])) > R - 1.0),
+                          and np.hypot(*(f["centroid"][:2] - [R, R])) > 0.7 * R),
         dir=(-1 / math.sqrt(2), -1 / math.sqrt(2), 0)),
 }
 
@@ -173,6 +175,8 @@ for name, c in CASES.items():
         continue
     d = np.array(c["dir"], float)
     p.bcs = [BC("fixed", c["faces"]), BC("gravity", [], list(G0 * d))]
+    if c.get("zfaces"):
+        p.bcs.append(BC("displacement", c["zfaces"], [None, None, 0.0]))
     t1 = time.time()
     r = p.run(mesh, log=lambda *a: P("     ", *a) if a and ("反復" in str(a[0]) or "ソルバー" in str(a[0]) or "AMG" in str(a[0])) else None)
     ud = r.u @ d
