@@ -244,10 +244,10 @@ def solve_explicit(mesh, material, bcs, settings: DynamicSettings, elem_material
     hist = {"時間 [s]": [], "運動エネルギー [mJ]": [], "ひずみエネルギー [mJ]": [], "接触力 [N]": [],
             "最大変位 [mm]": []}
     every = max(1, nsteps // 400)
-    fc_now = 0.0
     info = {"解析": METHODS["explicit"], "時間増分 [s]": dt, "ステップ数": nsteps, "安定限界 [s]": dt_min,
             "追加質量 [%]": added / mass0 * 100, "質量 [kg]": (mass0 + added) * 1000}
     t_last = time.time()
+    imp, t_rec = 0.0, 0.0       # 記録の間に壁から受けた力積（接触力は「力積 ÷ 時間」の平均で記録）
     for k in range(1, nsteps + 1):
         t = k * dt
         vh = v + 0.5 * dt * a
@@ -255,7 +255,6 @@ def solve_explicit(mesh, material, bcs, settings: DynamicSettings, elem_material
         if len(cd):
             u[cd] = cv * _ramp(t, s.ramp_time)
             vh[cd] = 0.0
-        fc_now = 0.0
         if wall is not None:
             nidx = wall["nodes"]
             U = u.reshape(-1, 3)
@@ -273,14 +272,15 @@ def solve_explicit(mesh, material, bcs, settings: DynamicSettings, elem_material
                     vtn = np.linalg.norm(vt, axis=1)
                     red = np.minimum(1.0, wall["mu"] * (dvn + np.abs(g[hit]) / dt) / np.maximum(vtn, 1e-300))
                     V[hn] -= vt * red[:, None]
-                fc_now = float((mw[hit] * (dvn + np.abs(g[hit]) / dt)).sum() / dt)
+                imp += float((mw[hit] * dvn).sum())          # 壁が止めた運動量 = 力積
         a, ku = accel(u, vh, t)
         v = vh + 0.5 * dt * a
         if k % every == 0 or k == nsteps:
             hist["時間 [s]"].append(t)
             hist["運動エネルギー [mJ]"].append(0.5 * float((m3 * v * v).sum()))
             hist["ひずみエネルギー [mJ]"].append(0.5 * float(u @ ku))
-            hist["接触力 [N]"].append(fc_now)
+            hist["接触力 [N]"].append(imp / max(t - t_rec, dt))
+            imp, t_rec = 0.0, t
             hist["最大変位 [mm]"].append(float(np.abs(u).max()))
         while ft and t >= ft[0] - 0.5 * dt:
             frames.append(_frame_result(mesh, mats, elem_mat, D, u, v, ft.pop(0), info, material))

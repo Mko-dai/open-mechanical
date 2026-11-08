@@ -84,3 +84,18 @@ def test_drop_on_rigid_wall_rebounds():
         assert zmin > -0.002 * 10, (meth, zmin)
         assert vz > 0.3 * v0, (meth, vz)          # 上向きに跳ね返っている
         assert fr[-1].info["最大接触力 [N]"] > 0
+
+
+def test_contact_impulse_equals_momentum_change():
+    """陽解法: 壁から受けた力積の合計 = 運動量の変化（接触力の記録が正しい）"""
+    m = structured_box(20, 20, 10, 2, 2, 2).to_quadratic()
+    s = DynamicSettings(method="explicit", end_time=3e-5, n_frames=30, init_velocity=[0, 0, -1000.0],
+                        wall={"normal": [0, 0, 1], "point": [0, 0, 0]})
+    fr = solve_dynamic(m, STEEL, [], s, log=lambda *a: None)
+    h = fr[-1].history
+    t = np.array(h["時間 [s]"])
+    imp = float(np.sum(np.array(h["接触力 [N]"]) * np.diff(np.r_[0, t])))
+    from openmech.dynamics import lumped_mass
+    mn = lumped_mass(m, np.full(m.n_elems, 7.85e-9))
+    p1 = float((mn * fr[-1].extra["速度 Z [mm/s]"]).sum())
+    assert abs(imp - (p1 + mn.sum() * 1000.0)) / imp < 0.01
