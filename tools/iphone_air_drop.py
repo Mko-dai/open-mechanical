@@ -287,6 +287,36 @@ CASES = {
         dir=(-1 / math.sqrt(2), -1 / math.sqrt(2), 0)),
 }
 
+# 要素ごとの応力（積分点 4 点の最大）: 部品ごとの最大値は「その部品の要素だけ」で評価する
+# （節点平均だと、柔らかい層と硬い部品の境目の節点で値が混ざるため）
+from openmech.solver import _B_matrix, _dN_dx, _quadrature, material_D, shape_dN_dxi  # noqa: E402
+_states, _emat = p.elem_materials(mesh)
+_Ds = np.array([material_D(m) for m in _states])
+_pts, _ = _quadrature(mesh.elems.shape[1])
+_dN = [shape_dN_dxi(Lp, mesh.elems.shape[1]) for Lp in _pts]
+
+
+def element_stress_max(u):
+    """要素ごとの (最大相当応力, 最大主応力)"""
+    vm_e = np.zeros(mesh.n_elems)
+    s1_e = np.full(mesh.n_elems, -np.inf)
+    for a0 in range(0, mesh.n_elems, 20000):
+        el = mesh.elems[a0:a0 + 20000]
+        X = mesh.nodes[el]
+        ue = u[el].reshape(len(el), -1)
+        D = _Ds[_emat[a0:a0 + 20000]]
+        for dN in _dN:
+            dNdx, _ = _dN_dx(X, dN)
+            sig = np.einsum("eij,ej->ei", D, np.einsum("eij,ej->ei", _B_matrix(dNdx), ue))
+            sx, sy, sz, txy, tyz, tzx = sig.T
+            vm = np.sqrt(0.5 * ((sx - sy) ** 2 + (sy - sz) ** 2 + (sz - sx) ** 2) + 3 * (txy ** 2 + tyz ** 2 + tzx ** 2))
+            T3 = np.stack([np.stack([sx, txy, tzx], -1), np.stack([txy, sy, tyz], -1), np.stack([tzx, tyz, sz], -1)], -2)
+            s1 = np.linalg.eigvalsh(T3)[:, -1]
+            vm_e[a0:a0 + 20000] = np.maximum(vm_e[a0:a0 + 20000], vm)
+            s1_e[a0:a0 + 20000] = np.maximum(s1_e[a0:a0 + 20000], s1)
+    return vm_e, s1_e
+
+
 body_of_node = {}
 summary = {"落下高さ [mm]": H, "質量 [g]": mass_t * 1e6, "部品の質量 [g]": mass_by_body,
            "メッシュ": {"節点": mesh.n_nodes, "要素": mesh.n_elems}, "ケース": {}}
@@ -309,15 +339,18 @@ for name, c in CASES.items():
     Tdur = math.pi * math.sqrt(mass_t / k)                         # 半正弦の衝撃時間 [s]
     vm = r.von_mises * Gpk
     s1 = r.principal[:, 0] * Gpk
+    vm_e, s1_e = element_stress_max(r.u)
+    vm_e *= Gpk
+    s1_e *= Gpk
     per = {}
     for b in mesh.body_ids():
-        nodes = np.unique(mesh.elems[mesh.elem_body == b])
+        em_b = mesh.elem_body == b
         nm = body_name.get(int(b), f"B{b}")
         mat = p.materials[body_mat[int(b)]]
         brittle = any(w in mat.name for w in ("ガラス", "サファイア", "IC", "磁石", "シリコン"))
-        smax = float(s1[nodes].max()) if brittle else float(vm[nodes].max())
+        smax = float(s1_e[em_b].max()) if brittle else float(vm_e[em_b].max())
         lim = (mat.tensile_strength or mat.yield_strength) if brittle else mat.yield_strength
-        per[nm] = {"最大相当応力 [MPa]": float(vm[nodes].max()), "最大主応力 [MPa]": float(s1[nodes].max()),
+        per[nm] = {"最大相当応力 [MPa]": float(vm_e[em_b].max()), "最大主応力 [MPa]": float(s1_e[em_b].max()),
                    "強度 [MPa]": mat.tensile_strength or mat.yield_strength,
                    "降伏 [MPa]": mat.yield_strength,
                    "判定に使う応力": "最大主応力（脆性）" if brittle else "相当応力（降伏）",
