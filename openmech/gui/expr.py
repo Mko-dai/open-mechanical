@@ -101,6 +101,10 @@ class ExprEdit(QWidget):
             self.edit.setStyleSheet("background:#ffe3e3")
             self.edit.setToolTip(str(e))
 
+    def showEvent(self, e):
+        self._update()          # 親ウィンドウに入ってから変数を読み直す
+        super().showEvent(e)
+
     def _finished(self):
         if not self.ok():
             return
