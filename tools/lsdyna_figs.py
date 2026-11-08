@@ -117,21 +117,36 @@ def main():
             plt.close(fig)
             made.append(p)
         g = summ[n]["グラフ"]
-        fig, ax = plt.subplots(figsize=(7.5, 3.6), dpi=150)
-        ax.plot(g["x"], g["y"], color="#2a6fdb", lw=1.6, label="open-mechanical")
+        it = summ[n]["項目"]
+        x, y = np.array(g["x"]), np.array(g["y"])
+        fig, ax = plt.subplots(figsize=(7.5, 3.8), dpi=150)
+        ax.plot(x, y, color="#2a6fdb", lw=1.8, label="open-mechanical")
+        LS = dict(color="#d9534f", lw=1.6, ls="--")
+        MK = dict(marker="X", ms=10, mfc="#d9534f", mec="white", mew=1.0, ls="none", zorder=6)
+        if n == "1":      # LS-DYNA の第1圧縮波（大きさ×継続時間）を矩形で重ねる（立ち上がりは open-mechanical の半値に合わせる）
+            mag, dur = it[0]["LS-DYNA"], it[1]["LS-DYNA"]
+            i0 = int(np.nonzero(y > 0.5 * y.max())[0][0])
+            t0 = x[i0 - 1] + (0.5 * y.max() - y[i0 - 1]) * (x[i0] - x[i0 - 1]) / (y[i0] - y[i0 - 1])
+            ax.plot([t0, t0, t0 + dur, t0 + dur], [0, mag, mag, 0], label=f"LS-DYNA（{mag} GPa × {dur} ms）", **LS)
+        elif n == "2":    # LS-DYNA の着地点と最下点
+            ax.plot([it[0]["LS-DYNA"], it[4]["LS-DYNA"]], [it[1]["LS-DYNA"], it[5]["LS-DYNA"]],
+                    label="LS-DYNA（着地・最下点）", **MK)
+            ax.plot([it[0]["open-mechanical"], it[4]["open-mechanical"]],
+                    [it[1]["open-mechanical"], it[5]["open-mechanical"]], marker="o", ms=6, mfc="#2a6fdb",
+                    mec="white", ls="none", zorder=7, label="open-mechanical（着地・最下点）")
+        elif n == "3":    # LS-DYNA の振動数で同じ振幅の正弦波
+            f = it[0]["LS-DYNA"]
+            ax.plot(x, np.abs(y).max() * np.sin(2 * np.pi * f * x), label=f"LS-DYNA の振動数 {f} Hz", **LS)
+        else:             # 最終値
+            ax.axhline(it[0]["LS-DYNA"], label=f"LS-DYNA 最終値 {it[0]['LS-DYNA']}", **LS)
+            ax.plot([x[-1]], [y[-1]], marker="o", ms=6, mfc="#2a6fdb", mec="white", ls="none", zorder=7)
+            ax.annotate(f"{y[-1]:.4g}（差 {(y[-1] - it[0]['LS-DYNA']) / it[0]['LS-DYNA'] * 100:+.2f}%）",
+                        (x[-1], y[-1]), textcoords="offset points", xytext=(-8, 10), ha="right", fontsize=8)
         ax.set_xlabel(g["xl"])
         ax.set_ylabel(g["yl"])
         ax.grid(alpha=0.3)
-        for it in summ[n]["項目"][:1]:
-            if n in ("4", "5"):
-                ax.axhline(it["LS-DYNA"], color="#d9534f", ls="--", lw=1.2, label="LS-DYNA（最終値）")
-                ax.axhline(it["理論"], color="#555", ls=":", lw=1.2, label="理論（最終値）")
-        if n == "1":
-            ax.axhline(summ[n]["項目"][0]["LS-DYNA"], color="#d9534f", ls="--", lw=1.2, label="LS-DYNA（波の大きさ）")
-        if n == "2":
-            ax.axhline(summ[n]["項目"][5]["LS-DYNA"], color="#d9534f", ls="--", lw=1.2, label="LS-DYNA（最大変位）")
         ax.legend(fontsize=8)
-        ax.set_title(f"{summ[n]['id']}  {summ[n]['名前']}", fontsize=10)
+        ax.set_title(f"{summ[n]['id']}  open-mechanical と LS-DYNA の比較", fontsize=10)
         fig.tight_layout()
         p = os.path.join(OUT, f"fig_{case}_history.png")
         fig.savefig(p, facecolor="white")
