@@ -610,8 +610,8 @@ def _cg(A, b, M, tol=1e-10, maxiter=5000):
         return spla.cg(A, b, M=M, tol=tol, maxiter=maxiter)
 
 
-def _pcg(A, b, M, tol=1e-10, maxiter=3000, x0=None):
-    """前処理付き共役勾配法（行列×ベクトル積を使用コア数で並列化）"""
+def _pcg(A, b, M, tol=1e-10, maxiter=3000, x0=None, hist=None):
+    """前処理付き共役勾配法（行列×ベクトル積を使用コア数で並列化）。hist に相対残差の履歴を追記"""
     from .parallel import ParallelMatvec
     mv = ParallelMatvec(A)
     nb = np.linalg.norm(b)
@@ -631,7 +631,10 @@ def _pcg(A, b, M, tol=1e-10, maxiter=3000, x0=None):
         alpha = rz / (p @ Ap)
         x += alpha * p
         r -= alpha * Ap
-        if np.linalg.norm(r) < tol * nb:
+        rn = np.linalg.norm(r)
+        if hist is not None:
+            hist.append(rn / nb)
+        if rn < tol * nb:
             return x, 0, it
         z = M(r)
         rz_new = r @ z
@@ -719,7 +722,16 @@ def _linear_solve(A: sp.csc_matrix, b: np.ndarray, log=print, coords=None,
             t0 = time.time()
             M = build_amg(A, B, comps=coords[:, 3].astype(int) if coords is not None else None)
             t1 = time.time()
-            xsol, info, it = _pcg(A.tocsr(), b, M, tol=1e-10, maxiter=400)
+            hist = []
+            xsol, info, it = _pcg(A.tocsr(), b, M, tol=1e-10, maxiter=400, hist=hist)
+            if info != 0 and len(hist) > 150 and hist[-1] < hist[-150]:
+                # 遅いが確実に下がっているなら、残りの回数を見積もって続ける（頑健 AMG の準備より速いことが多い）
+                rate = (hist[-1] / hist[-150]) ** (1 / 150)
+                need = int(np.log(1e-10 / hist[-1]) / np.log(rate)) + 20
+                if need < 4000:
+                    log(f"  収束が遅いため続けます（あと約 {need} 回の見込み）")
+                    xsol, info, it2 = _pcg(A.tocsr(), b, M, tol=1e-10, maxiter=need + 400, x0=xsol, hist=hist)
+                    it += it2
             t2 = time.time()
             rr = _rel_res(A, xsol, b)
             if rr < 1e-8 or (info == 0 and rr < 1e-6):   # 条件数が大きいと真の残差は 1e-8 まで下がらないことがある
