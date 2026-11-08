@@ -523,6 +523,11 @@ class MainWindow(QMainWindow):
             self.edges_combo.addItem(label)
         self.edges_combo.currentIndexChanged.connect(lambda _: self.refresh_view())
         g.addWidget(self.edges_combo)
+        self.minmax_chk = QCheckBox("最大・最小を表示")
+        self.minmax_chk.setChecked(True)
+        self.minmax_chk.setToolTip("コンター上の最大値（赤）・最小値（青）の札を表示します")
+        self.minmax_chk.toggled.connect(lambda _: self.refresh_view())
+        g.addWidget(self.minmax_chk)
         self.tab_res = R.count() - 1
         # --- 表示
         t = R.add_tab("表示")
@@ -3688,8 +3693,9 @@ class MainWindow(QMainWindow):
         imax = used[np.argmax(vals[used])]
         imin = used[np.argmin(vals[used])]
         xmax, xmin = mesh.nodes[imax], mesh.nodes[imin]          # 変形前の座標
-        _labels(pl, pts[[imax]], [f"Max {vals[imax]:.4g}"], 12, "black", point_color="red", bg="#ffffff")
-        _labels(pl, pts[[imin]], [f"Min {vals[imin]:.4g}"], 12, "black", point_color="blue", bg="#ffffff")
+        if self.minmax_chk.isChecked():
+            _labels(pl, pts[[imax]], [f"Max {vals[imax]:.4g}"], 12, "black", point_color="red", bg="#ffffff")
+            _labels(pl, pts[[imin]], [f"Min {vals[imin]:.4g}"], 12, "black", point_color="blue", bg="#ffffff")
         if self.probe_text and getattr(self, "_probe_pt", None) is not None:
             _labels(pl, [pts[self._probe_pt]], [self._probe_val], 12, "black", point_color="magenta", bg="#ffffcc")
         unit = key.split("[")[-1].rstrip("]") if "[" in key else ""
