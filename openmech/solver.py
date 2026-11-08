@@ -281,6 +281,7 @@ class BC:
     nodes: list[int] = field(default_factory=list)   # 面の代わりに節点を直接指定（線・点の拘束用）
     step_factors: list = field(default_factory=list)  # ステップごとの倍率（空ならすべて 1）
     bodies: list = field(default_factory=list)        # 熱条件などボディに与える条件（空 = すべてのボディ）
+    exprs: dict = field(default_factory=dict)         # 成分ごとの式 {成分番号: "F/2"}（values には評価値）
 
     def to_dict(self):
         d = {"kind": self.kind, "faces": list(map(int, self.faces)),
@@ -291,12 +292,15 @@ class BC:
             d["step_factors"] = [float(x) for x in self.step_factors]
         if self.bodies:
             d["bodies"] = [int(b) for b in self.bodies]
+        if self.exprs:
+            d["exprs"] = {str(k): str(v) for k, v in self.exprs.items()}
         return d
 
     @staticmethod
     def from_dict(d):
         return BC(d["kind"], d.get("faces", []), d.get("values", [0, 0, 0]), d.get("name", ""),
-                  d.get("nodes", []), d.get("step_factors", []), d.get("bodies", []))
+                  d.get("nodes", []), d.get("step_factors", []), d.get("bodies", []),
+                  {int(k): v for k, v in d.get("exprs", {}).items()})
 
     def label(self) -> str:
         jp = {"symmetry": "対称領域", "frictionless": "摩擦なし支持", "fixed": "固定支持", "displacement": "強制変位", "force": "力",

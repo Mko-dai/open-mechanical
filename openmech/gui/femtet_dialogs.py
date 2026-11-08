@@ -13,6 +13,8 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, 
 
 from ..geometry import AXES, FEATURE_CHOICES, FEATURES, PLANES
 from ..materials import LIBRARY, Material
+from ..params import ParamError, eval_points, field_text, points_have_expr, set_field
+from .expr import ExprEdit, env_of
 
 
 def _spin(v, lo=-1e9, hi=1e9, dec=4, suffix=""):
@@ -46,6 +48,7 @@ class FeatureDialog(QDialog):
     def __init__(self, ftype, values: dict, title_suffix="の作成", parent=None, targets_text=""):
         super().__init__(parent)
         self.ftype = ftype
+        self._env = env_of(parent)
         name, _, params = FEATURES[ftype]
         self.setWindowTitle(f"{name}{title_suffix}")
         lay = QVBoxLayout(self)
@@ -79,10 +82,12 @@ class FeatureDialog(QDialog):
                 w.addItems(PLANES)
                 w.setCurrentText(str(v))
             elif key in ("points", "path"):
-                w = QLineEdit(str(v))
+                w = QLineEdit(field_text(values, key, default) if key == "points" else str(v))
                 w.setMinimumWidth(320)
+                if key == "points":
+                    w.setToolTip("頂点の座標にも式・変数が使えます（例: 0,0; L,0; L,H; 0,H）")
             else:
-                w = _spin(v, suffix="")
+                w = ExprEdit(field_text(values, key, default), env=lambda: self._env)
             self.widgets[key] = w
             groups[gname].addRow(label.replace(" [mm]", "") + (" [mm]" if "[mm]" in label else ""), w)
         if ftype == "extrude":
@@ -104,9 +109,29 @@ class FeatureDialog(QDialog):
             t = QLabel(targets_text)
             t.setStyleSheet("color:#555")
             lay.addWidget(t)
+        if self._env:
+            t = QLabel("変数: " + ", ".join(f"{k} = {v:.6g}" for k, v in list(self._env.items())[:12])
+                       + (" …" if len(self._env) > 12 else "") + "（寸法の欄に変数や式を書けます）")
+            t.setWordWrap(True)
+            t.setStyleSheet("color:#2a6fdb")
+            lay.addWidget(t)
         _buttons(self, lay)
 
+    def accept(self):
+        for k, w in self.widgets.items():
+            try:
+                if isinstance(w, ExprEdit):
+                    w.value()
+                elif k == "points" and points_have_expr(w.text()):
+                    eval_points(w.text(), self._env)
+            except ParamError as e:
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "式の入力", f"{e}")
+                return
+        super().accept()
+
     def values(self) -> dict:
+        """入力値（式の欄は式の文字列のまま）"""
         out = {}
         for k, w in self.widgets.items():
             if isinstance(w, QComboBox):
@@ -114,8 +139,16 @@ class FeatureDialog(QDialog):
             elif isinstance(w, QLineEdit):
                 out[k] = w.text()
             else:
-                out[k] = w.value()
+                out[k] = w.raw()
         return out
+
+    def apply_to(self, f: dict):
+        """フィーチャー f に入力値を入れる（式は f["expr"] に保存し、数値の欄には計算した値）"""
+        for k, v in self.values().items():
+            if isinstance(self.widgets[k], ExprEdit) or k == "points":
+                set_field(f, k, v, self._env)
+            else:
+                f[k] = v
 
 
 # ---------------------------------------------------------------------------- 材料定数
@@ -366,8 +399,13 @@ class BCDialog(QDialog):
     KINDS = [("displacement", "変位（拘束）"), ("force", "荷重（力）"), ("pressure", "圧力"),
              ("moment", "モーメント")]
 
-    def __init__(self, name: str, kind: str = "displacement", values=None, parent=None, n_faces=0):
+    def __init__(self, name: str, kind: str = "displacement", values=None, parent=None, n_faces=0, exprs=None):
         super().__init__(parent)
+        self._env = env_of(parent)
+        exprs = {int(k): v for k, v in (exprs or {}).items()}
+
+        def txt(i, v):
+            return exprs.get(i, v)
         self.setWindowTitle("境界条件の編集")
         self.resize(440, 360)
         lay = QVBoxLayout(self)
@@ -400,7 +438,7 @@ class BCDialog(QDialog):
             val = values[i] if (kind == "displacement" and i < len(values)) else 0.0
             c = QCheckBox("拘束")
             c.setChecked(val is not None)
-            sp = _spin(0.0 if val is None else val, dec=6, suffix="mm")
+            sp = ExprEdit(txt(i, 0.0 if val is None else val), env=lambda: self._env, suffix="mm")
             c.toggled.connect(sp.setEnabled)
             sp.setEnabled(val is not None)
             w = QWidget()
@@ -418,7 +456,7 @@ class BCDialog(QDialog):
         self.vec = []
         for i, ax in enumerate("XYZ"):
             val = values[i] if (kind in ("force", "moment") and i < len(values) and values[i] is not None) else 0.0
-            sp = _spin(val, dec=4)
+            sp = ExprEdit(txt(i, val) if kind in ("force", "moment") else val, env=lambda: self._env)
             fv.addRow(f"{ax} 成分", sp)
             self.vec.append(sp)
         self.vec_note = QLabel("")
@@ -428,8 +466,8 @@ class BCDialog(QDialog):
         # 圧力
         self.g_p = QGroupBox("圧力")
         fp = QFormLayout(self.g_p)
-        self.p = _spin(values[0] if (kind == "pressure" and values and values[0] is not None) else 0.0,
-                       dec=6, suffix="MPa")
+        self.p = ExprEdit(txt(0, values[0]) if (kind == "pressure" and values and values[0] is not None) else 0.0,
+                          env=lambda: self._env, suffix="MPa")
         fp.addRow("圧力（正: 面を押す向き）", self.p)
         v.addWidget(self.g_p)
         v.addStretch()
@@ -452,14 +490,31 @@ class BCDialog(QDialog):
                 return k
         return "displacement"
 
-    def result(self):
+    def _edits(self):
         k = self.kind()
         if k == "displacement":
-            vals = [sp.value() if c.isChecked() else None for c, sp in zip(self.dchk, self.dval)]
-            if all(v == 0.0 for v in vals):
-                k = "fixed"
-        elif k == "pressure":
-            vals = [self.p.value()]
-        else:
-            vals = [sp.value() for sp in self.vec]
-        return self.name.text().strip(), k, vals
+            return [sp if c.isChecked() else None for c, sp in zip(self.dchk, self.dval)]
+        if k == "pressure":
+            return [self.p]
+        return list(self.vec)
+
+    def accept(self):
+        for sp in self._edits():
+            if sp is not None and not sp.ok():
+                from PySide6.QtWidgets import QMessageBox
+                try:
+                    sp.value()
+                except ParamError as e:
+                    QMessageBox.warning(self, "式の入力", str(e))
+                return
+        super().accept()
+
+    def result(self):
+        """(名前, 種類, 値, 式 {成分: 式})"""
+        k = self.kind()
+        eds = self._edits()
+        vals = [None if sp is None else sp.value() for sp in eds]
+        exprs = {i: sp.raw() for i, sp in enumerate(eds) if sp is not None and isinstance(sp.raw(), str)}
+        if k == "displacement" and all(v == 0.0 for v in vals) and not exprs:
+            k = "fixed"
+        return self.name.text().strip(), k, vals, exprs

@@ -43,6 +43,10 @@ class Project:
     # 解析の種類: "static"（静的構造）/ "transient"（過渡構造。陰解法・陽解法は dynamic.method）
     analysis_type: str = "static"
     dynamic: dict = field(default_factory=dict)         # dynamics.DynamicSettings の内容
+    # 変数（Femtet の「変数」）: [{"name": "L", "expr": "100", "comment": ""}]。寸法・荷重の欄に式で使える
+    params: list = field(default_factory=list)
+    mesh_size_expr: str = ""                            # メッシュサイズの式（空 = 数値のみ）
+    parametric: dict = field(default_factory=dict)      # パラメトリック解析の設定と最後の結果
 
     def share_map(self) -> dict:
         """{ボディ番号: パート番号}（節点を共有するボディのグループ）"""
@@ -149,7 +153,8 @@ class Project:
                 "contacts": [c.to_dict() for c in self.contacts], "contact_tolerance": self.contact_tolerance,
                 "settings": self.settings.to_dict(),
                 "share_topology": self.share_topology, "parts": self.parts, "env_temp": self.env_temp,
-                "analysis_type": self.analysis_type, "dynamic": self.dynamic}
+                "analysis_type": self.analysis_type, "dynamic": self.dynamic,
+                "params": self.params, "mesh_size_expr": self.mesh_size_expr, "parametric": self.parametric}
 
     @staticmethod
     def from_dict(d) -> "Project":
@@ -171,7 +176,44 @@ class Project:
                        settings=AnalysisSettings.from_dict(d.get("settings", {})),
                        share_topology=d.get("share_topology", "none"), parts=d.get("parts", []),
                        env_temp=d.get("env_temp", 22.0),
-                       analysis_type=d.get("analysis_type", "static"), dynamic=d.get("dynamic", {}))
+                       analysis_type=d.get("analysis_type", "static"), dynamic=d.get("dynamic", {}),
+                       params=d.get("params", []), mesh_size_expr=d.get("mesh_size_expr", ""),
+                       parametric=d.get("parametric", {}))
+
+    # ------------------------------------------------------------- 変数・式
+    def env(self, overrides=None) -> dict:
+        """変数の値 {変数名: 値}"""
+        from .params import resolve
+        return resolve(self.params, overrides)
+
+    def has_expressions(self) -> bool:
+        g = self.geometry
+        return bool(self.params or self.mesh_size_expr or g.get("expr")
+                    or any(f.get("expr") for f in g.get("features", [])) or any(b.exprs for b in self.bcs))
+
+    def apply_params(self, overrides=None) -> dict:
+        """変数を評価し、式の入った欄（寸法・荷重・メッシュサイズ）の数値を計算し直す。変数の値を返す"""
+        from .params import ParamError, apply_to_dict, evaluate
+        env = self.env(overrides)
+        g = self.geometry
+        apply_to_dict(g, env, "形状")
+        for i, f in enumerate(g.get("features", [])):
+            apply_to_dict(f, env, f"フィーチャー {i + 1}")
+        for b in self.bcs:
+            for k, ex in b.exprs.items():
+                try:
+                    b.values[int(k)] = evaluate(ex, env)
+                except ParamError as e:
+                    raise ParamError(f"境界条件「{b.name or b.kind}」: {e}") from None
+        if self.mesh_size_expr:
+            try:
+                self.mesh_size = max(0.0, evaluate(self.mesh_size_expr, env))
+            except ParamError as e:
+                raise ParamError(f"メッシュサイズ: {e}") from None
+        return env
+
+    def copy(self) -> "Project":
+        return Project.from_dict(json.loads(json.dumps(self.to_dict())))
 
     def save(self, path):
         with open(path, "w", encoding="utf-8") as f:

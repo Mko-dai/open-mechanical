@@ -159,6 +159,86 @@ try:
     P(f"過渡（陰解法）OK: {len(fr)} 時刻 / 最大接触力 {fr[-1].info['最大接触力 [N]']:.1f} N")
 except Exception:
     P("NG 過渡\n" + traceback.format_exc())
+# 変数・式・パラメトリック解析
+try:
+    from openmech.gui import parametric_dialogs as PD
+    w._set_analysis_type("static")
+    w.project.geometry = {"kind": "model", "features": []}
+    w.project.bcs = []
+    w.project.params = [{"name": "L", "expr": "100", "comment": "長さ"}, {"name": "H", "expr": "L/5", "comment": "高さ"},
+                        {"name": "F", "expr": "-1000", "comment": "荷重"}]
+    w.remesh()
+
+    def fill(self):
+        self.widgets["x"].setText("0")
+        self.widgets["dx"].setText("L")
+        self.widgets["dy"].setText("20")
+        self.widgets["dz"].setText("H")
+        return 1
+    FeatureDialog.exec = fill
+    w.create_body("box", dialog=True)
+    FeatureDialog.exec = lambda self: 1
+    f = w._features()[-1]
+    assert f["dx"] == 100 and f["dz"] == 20 and f["expr"] == {"dx": "L", "dz": "H"}, f
+    info = w.mesh.face_info()
+    f0 = [x["id"] for x in info if abs(x["centroid"][0]) < 1e-6][0]
+    f1 = [x["id"] for x in info if abs(x["centroid"][0] - 100) < 1e-6][0]
+    w.project.bcs = [BC("fixed", [f0], name="固定"), BC("force", [f1], [0, 0, -1000.0], "荷重", exprs={2: "F"})]
+    w.select_node(("feature", len(w._features()) - 1))
+    app.processEvents()
+    w._feature_set(len(w._features()) - 1, "dy", "H+5")
+    assert f["dy"] == 25 and f["expr"]["dy"] == "H+5", f
+    w._feature_set(len(w._features()) - 1, "dy", 20.0)
+    w.remesh()
+    vd = PD.VariablesDialog(w.project.params, w, used=w._variable_usage())
+    vd.show()
+    app.processEvents()
+    vd.grab().save(os.path.join(out, "gui_variables.png"))
+    vd.close()
+    old = [dict(x) for x in w.project.params]
+    w.project.params[0]["expr"] = "150"
+    w._apply_variables(old)
+    lo, hi = w.mesh.bounds()
+    assert abs(hi[0] - lo[0] - 150) < 1e-6 and abs(hi[2] - lo[2] - 30) < 1e-6, (lo, hi)
+    P(f"変数 OK: L=150 → 形状 {hi - lo}、使用箇所 {w._variable_usage()}")
+    w.project.params[0]["expr"] = "100"
+    w._apply_variables()
+
+    def pset(self):
+        self.checks[0].setChecked(True)
+        self.vt.item(0, 2).setText("60")
+        self.vt.item(0, 3).setText("140")
+        self.vt.item(0, 4).setText("4")
+        self.show()
+        app.processEvents()
+        self.grab().save(os.path.join(out, "gui_parametric_setup.png"))
+        return 1
+    PD.ParametricDialog.exec = pset
+
+    def rshow(self):
+        self.show()
+        app.processEvents()
+        self.grab().save(os.path.join(out, "gui_parametric_result.png"))
+        self.t.selectRow(4)
+        self._apply()
+        return 1
+    PD.ParametricResultDialog.exec = rshow
+    w.run_parametric()
+    rows = w.project.parametric["results"]
+    for r in rows:
+        P("  ", r["変数"], {k: round(v, 5) for k, v in r["出力"].items()}, r["状態"])
+    assert all(r["状態"] == "完了" for r in rows)
+    E = w.project.material.E
+    for r in rows:
+        L = r["変数"]["L"]
+        H = L / 5
+        th = 1000 * L ** 3 / (3 * E * 20 * H ** 3 / 12)
+        P(f"   L={L:g}: 最大全変形 {r['出力']['最大 全変形 [mm]']:.5g} / はり理論 {th:.5g}")
+    lo, hi = w.mesh.bounds()
+    P(f"パラメトリック OK: {len(rows)} ケース、反映後の長さ {hi[0] - lo[0]:g}（期待 140）")
+    w.grab().save(os.path.join(out, "gui_parametric_main.png"))
+except Exception:
+    P("NG パラメトリック\n" + traceback.format_exc())
 P("完了")
 logf.close()
 w.close()

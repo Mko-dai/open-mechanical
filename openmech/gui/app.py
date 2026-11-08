@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import math
 import os
 import sys
@@ -26,7 +27,7 @@ import traceback
 import numpy as np
 from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QFont, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFrame,
+from PySide6.QtWidgets import (QApplication, QProgressDialog, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFrame,
                                QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
                                QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
                                QPushButton, QSplitter, QTabWidget, QToolButton, QTreeWidget,
@@ -39,6 +40,8 @@ from .. import __version__
 from ..contact import (BEHAVIORS, CONTACT_TYPES, FORMULATIONS, INTERFACE, STATUS_JP, ContactRegion,
                        detect_contacts)
 from ..export import write_csv, write_report, write_vtu
+from ..params import ParamError, evaluate, field_text, is_number, set_field
+from .expr import ExprEdit
 from ..geometry import (AXES, CAD_EXT, CONTROL_TYPES, FEATURES, MESH_DEFAULTS, OPS, PLANES, PRIMITIVES,
                         GeometryError, build_mesh, mesh_quality,
                         EDIT_FEATURES, FEATURE_CHOICES, PLANE_MODES, feature_body_keys, gmsh_available, is_shell_model, new_feature,
@@ -420,6 +423,7 @@ class MainWindow(QMainWindow):
         R.button(g, "保存", make_icon("#6c7a89", "保"), self.save_project)
         g = R.add_group(t, "解析")
         R.button(g, "解析", make_icon("#2e9d3a", "⚡"), self.run_solve)
+        R.button(g, "パラメトリック", make_icon("#1971c2", "パ"), self.run_parametric)
         g = R.add_group(t, "ジオメトリ")
         R.button(g, "インポート", make_icon("#4a78c2", "読"), self.import_file)
         R.button(g, "簡単形状", make_icon("#4a78c2", "形"), lambda: self.select_node(("geometry",)))
@@ -457,6 +461,10 @@ class MainWindow(QMainWindow):
         R.button(g, "穴", make_icon(OP_COLORS["cut"], "穴"), self.create_hole)
         g = R.add_group(t, "インポート")
         R.button(g, "STEP", make_icon(OP_COLORS["new"], "読"), self.add_import_feature)
+        g = R.add_group(t, "変数")
+        R.button(g, "変数", make_icon("#1971c2", "変"), self.edit_variables)
+        R.button(g, "パラメトリック\n解析", make_icon("#1971c2", "パ"), self.run_parametric)
+        R.button(g, "結果", make_icon("#1971c2", "表"), self.show_parametric_results)
         g = R.add_group(t, "編集")
         R.button(g, "元に戻す", make_icon("#5d6d7e", "↶"), self.undo)
         R.button(g, "やり直す", make_icon("#5d6d7e", "↷"), self.redo)
@@ -757,8 +765,8 @@ class MainWindow(QMainWindow):
                 dlg = BCDialog(name, "displacement", None, self, n_faces=len(self.selected_faces))
                 if not dlg.exec():
                     return
-                name, kind, vals = dlg.result()
-                self.project.bcs.append(BC(kind, list(self.selected_faces), vals, name))
+                name, kind, vals, exprs = dlg.result()
+                self.project.bcs.append(BC(kind, list(self.selected_faces), vals, name, exprs=exprs))
                 self.log(f"境界条件「{name}」を作成しました")
             self.bc_name.setEditText(name)
         self._fill_attr_combos()
@@ -818,13 +826,171 @@ class MainWindow(QMainWindow):
                                     "面を選んで名前を入力し［設定］を押すと作成されます。")
             return
         bc = self.project.bcs[idx]
-        dlg = BCDialog(bc.name, bc.kind, bc.values, self, n_faces=len(bc.faces))
+        dlg = BCDialog(bc.name, bc.kind, bc.values, self, n_faces=len(bc.faces), exprs=bc.exprs)
         if dlg.exec():
-            bc.name, bc.kind, bc.values = dlg.result()
+            bc.name, bc.kind, bc.values, bc.exprs = dlg.result()
             self.bc_name.setEditText(bc.name)
             self._fill_attr_combos()
             self.invalidate()
             self.refresh_view()
+
+    # ======================================================================= 変数・パラメトリック解析
+    def _variable_usage(self) -> dict:
+        """{変数名: [使っている場所…]}"""
+        from ..params import names_in, split_points
+        used = {}
+
+        def note(expr, where):
+            for nm in names_in(expr):
+                used.setdefault(nm, []).append(where)
+        for i, f in enumerate(self.project.geometry.get("features", [])):
+            for k, ex in (f.get("expr") or {}).items():
+                note(ex if k != "points" else " + ".join(c for r in split_points(ex) for c in r),
+                     f"{FEATURES.get(f['type'], (f['type'],))[0]}{i + 1} の {k}")
+        for b in self.project.bcs:
+            for c, ex in b.exprs.items():
+                note(ex, f"境界条件「{b.name or BC_JP.get(b.kind, b.kind)}」")
+        if self.project.mesh_size_expr:
+            note(self.project.mesh_size_expr, "メッシュサイズ")
+        for p in self.project.params:
+            note(p.get("expr", ""), f"変数 {p['name']} の式")
+        return used
+
+    def edit_variables(self):
+        from .parametric_dialogs import VariablesDialog
+        dlg = VariablesDialog(self.project.params, self, used=self._variable_usage())
+        if not dlg.exec():
+            return
+        old = [dict(p) for p in self.project.params]
+        self.project.params = dlg.params()
+        if not self._apply_variables(old):
+            return
+        self.log("変数を更新しました: " + ", ".join(f"{k} = {v:g}" for k, v in self.project.env().items()))
+
+    def _apply_variables(self, old_params=None) -> bool:
+        """変数の変更を寸法・荷重に反映して形状を作り直す（エラーなら元の変数に戻す）"""
+        before = json.dumps(self.project.geometry, sort_keys=True), self.project.mesh_size
+        try:
+            self.project.apply_params()
+        except ParamError as e:
+            QMessageBox.warning(self, "変数", f"{e}\n\n変数の変更を取り消します。")
+            if old_params is not None:
+                self.project.params = old_params
+                self.project.apply_params()
+            return False
+        if (json.dumps(self.project.geometry, sort_keys=True), self.project.mesh_size) != before:
+            self.remesh()
+        else:
+            self.invalidate()
+            self.rebuild_tree()
+        return True
+
+    def run_parametric(self):
+        from .parametric_dialogs import ParametricDialog
+        if not self.project.params:
+            r = QMessageBox.question(self, "パラメトリック解析",
+                                     "変数がありません。［変数］で変数を作り、寸法や荷重の欄で使ってから実行してください。\n"
+                                     "いま変数を作りますか？")
+            if r == QMessageBox.Yes:
+                self.edit_variables()
+            return
+        try:
+            env = self.project.apply_params()
+        except ParamError as e:
+            QMessageBox.warning(self, "パラメトリック解析", str(e))
+            return
+        if self.mesh is None or self.mesh_dirty:
+            if not self.remesh():
+                return
+        if not self.project.bcs and self.project.analysis_type == "static":
+            QMessageBox.information(self, "パラメトリック解析", "先に支持・荷重を設定してください。")
+            return
+        dlg = ParametricDialog(self.project.params, env, self.project.parametric.get("settings"), self,
+                               transient=self.project.analysis_type == "transient")
+        if not dlg.exec():
+            return
+        st = dlg.settings()
+        cases, outputs = dlg.cases(), dlg.outputs()
+        self.project.parametric = {"settings": st}
+        from ..parametric import run_parametric
+        prog = QProgressDialog("パラメトリック解析を実行しています…", "中断", 0, len(cases), self)
+        prog.setWindowTitle("パラメトリック解析")
+        prog.setWindowModality(Qt.WindowModal)
+        prog.setMinimumDuration(0)
+        self._busy(True)
+
+        def progress(i, n):
+            prog.setValue(i)
+            prog.setLabelText(f"ケース {min(i + 1, n)} / {n} を解析しています…")
+            QApplication.processEvents()
+
+        def log(msg):
+            self.log(str(msg))
+            QApplication.processEvents()
+        t0 = datetime.datetime.now()
+        try:
+            rows = run_parametric(self.project, cases, outputs, log=log, progress=progress,
+                                  cancel=prog.wasCanceled, base_mesh=self.mesh)
+        finally:
+            prog.close()
+            self._busy(False)
+        n_ok = sum(r["状態"] == "完了" for r in rows)
+        self.project.parametric["results"] = rows
+        self.log(f"パラメトリック解析: {n_ok}/{len(rows)} ケース完了（{(datetime.datetime.now() - t0).total_seconds():.0f} 秒）")
+        self.rebuild_tree()
+        self.show_parametric_results()
+
+    def show_parametric_results(self):
+        from .parametric_dialogs import ParametricResultDialog
+        rows = self.project.parametric.get("results")
+        if not rows:
+            QMessageBox.information(self, "パラメトリック解析", "まだ結果がありません。［パラメトリック解析］で実行してください。")
+            return
+        swept = list(self.project.parametric.get("settings", {}).get("sweeps", {}))
+        ParametricResultDialog(rows, swept, self, apply_case=self._apply_case).exec()
+
+    def _apply_case(self, values: dict):
+        """パラメトリック解析のケースの値を変数に入れる（その変数の式は値で置き換わる）"""
+        old = [dict(p) for p in self.project.params]
+        for p in self.project.params:
+            if p["name"] in values:
+                p["expr"] = f"{values[p['name']]:.10g}"
+        if self._apply_variables(old):
+            self.log("変数に反映: " + ", ".join(f"{k} = {v:g}" for k, v in values.items()))
+
+    def _details_variables(self):
+        s = self._section("変数")
+        try:
+            env = self.project.env()
+        except ParamError as e:
+            env = {}
+            self._row(s, "エラー", str(e))
+        for p in self.project.params:
+            v = env.get(p["name"])
+            txt = (f"{v:.8g}" if v is not None else "—") + ("" if is_number(p.get("expr", 0)) else f"　（= {p['expr']}）")
+            self._row(s, p["name"], txt + (f"　{p['comment']}" if p.get("comment") else ""))
+        b = QPushButton("変数を編集…")
+        b.clicked.connect(lambda: self._later(self.edit_variables))
+        self._row(s, "", b)
+        used = self._variable_usage()
+        if used:
+            s2 = self._section("使用箇所")
+            for nm, wh in used.items():
+                self._row(s2, nm, "、".join(wh[:6]) + (" …" if len(wh) > 6 else ""))
+
+    def _details_parametric(self):
+        st = self.project.parametric.get("settings", {})
+        rows = self.project.parametric.get("results", [])
+        s = self._section("設定")
+        for nm, sw in st.get("sweeps", {}).items():
+            self._row(s, nm, sw.get("values") or f"{sw.get('start')} → {sw.get('stop')}（{sw.get('n')} 分割）")
+        self._row(s, "ケース数", f"{len(rows)}（完了 {sum(r['状態'] == '完了' for r in rows)}）")
+        b = QPushButton("結果の表・グラフ…")
+        b.clicked.connect(lambda: self._later(self.show_parametric_results))
+        self._row(s, "", b)
+        b = QPushButton("もう一度実行…")
+        b.clicked.connect(lambda: self._later(self.run_parametric))
+        self._row(s, "", b)
 
     def _build_menu(self):
         mb = self.menuBar()
@@ -868,6 +1034,12 @@ class MainWindow(QMainWindow):
         a.setShortcut(QKeySequence.SelectAll)
         a.triggered.connect(self.select_body)
         em.addAction(a)
+        vm = mb.addMenu("変数")
+        for text, fn in [("変数…", self.edit_variables), ("パラメトリック解析…", self.run_parametric),
+                         ("パラメトリック解析の結果…", self.show_parametric_results)]:
+            a = QAction(text, self)
+            a.triggered.connect(fn)
+            vm.addAction(a)
         hm = mb.addMenu("ヘルプ")
         a = QAction("使い方", self)
         a.triggered.connect(self.show_help)
@@ -1100,6 +1272,11 @@ class MainWindow(QMainWindow):
 
         proj = add(None, "プロジェクト", ("project",), "#6c7a89", "P", bold=True)
         model = add(proj, "モデル (A4)", ("model",), "#6c7a89", "M")
+        if self.project.params:
+            add(model, f"変数（{len(self.project.params)}）", ("variables",), "#1971c2", "変")
+        if self.project.parametric.get("results"):
+            add(model, f"パラメトリック解析（{len(self.project.parametric['results'])} ケース）", ("parametric",),
+                "#1971c2", "パ")
         geo = add(model, "ジオメトリ", ("geometry",), "#4a78c2", "G")
         gk = self.project.geometry.get("kind")
         live = set(self.mesh.body_ids().tolist()) if self.mesh is not None else set()
@@ -1224,7 +1401,11 @@ class MainWindow(QMainWindow):
 
     def on_tree_double(self, item, _col=0):
         node = tuple(item.data(0, Qt.UserRole))
-        if node[0] == "feature":
+        if node[0] == "variables":
+            self._later(self.edit_variables)
+        elif node[0] == "parametric":
+            self._later(self.show_parametric_results)
+        elif node[0] == "feature":
             self._later(lambda: self.edit_feature(node[1]))
         elif node[0] == "mat":
             self._later(lambda: self.edit_material(node[1]))
@@ -1298,7 +1479,8 @@ class MainWindow(QMainWindow):
         k = self.current[0]
         title = {"geometry": "ジオメトリ", "material": "材料", "mesh": "メッシュ", "sizing": "メッシュ制御",
                  "analysis": "静的構造 (A5)", "settings": "解析設定", "solution": "解析結果 (A6)",
-                 "info": "解析情報", "project": "プロジェクト", "model": "モデル (A4)", "coords": "座標系"}
+                 "info": "解析情報", "project": "プロジェクト", "model": "モデル (A4)", "coords": "座標系",
+                 "variables": "変数", "parametric": "パラメトリック解析"}
         if k == "feature":
             f = self.project.geometry["features"][self.current[1]]
             name = (f"{FEATURES[f['type']][0]}{self.current[1] + 1}" if f["type"] in FEATURES
@@ -1846,7 +2028,7 @@ class MainWindow(QMainWindow):
         dlg = FeatureDialog(ftype, f, "の作成（クリックした寸法。必要なら修正して OK）", self)
         if not dlg.exec():
             return
-        f.update(dlg.values())
+        dlg.apply_to(f)
         self._features().append(f)
         self.selected_faces, self.selected_bodies = [], []
         self.current = ("feature", len(self._features()) - 1)
@@ -1870,7 +2052,7 @@ class MainWindow(QMainWindow):
         dlg = FeatureDialog(ftype, f, "の作成", self)
         if not dlg.exec():
             return
-        f.update(dlg.values())
+        dlg.apply_to(f)
         self._features().append(f)
         self.selected_faces, self.selected_bodies = [], []
         self.current = ("feature", len(self._features()) - 1)
@@ -1930,7 +2112,7 @@ class MainWindow(QMainWindow):
         dlg = FeatureDialog(ftype, f, "", self, targets_text=txt)
         if not dlg.exec():
             return
-        f.update(dlg.values())
+        dlg.apply_to(f)
         if targets:
             f["targets"] = targets
         self._hist_label = self._feature_label(f)
@@ -1955,7 +2137,7 @@ class MainWindow(QMainWindow):
             dlg = FeatureDialog("disk", f, "（穴）", self)
             if not dlg.exec():
                 return
-            f.update(dlg.values())
+            dlg.apply_to(f)
             if self.selected_bodies:
                 f["targets"] = list(self.selected_bodies)
             self._features().append(f)
@@ -1969,7 +2151,7 @@ class MainWindow(QMainWindow):
         dlg = FeatureDialog("cylinder", f, "（穴）", self, targets_text=txt)
         if not dlg.exec():
             return
-        f.update(dlg.values())
+        dlg.apply_to(f)
         if targets:
             f["targets"] = targets
         self._features().append(f)
@@ -1996,7 +2178,7 @@ class MainWindow(QMainWindow):
             return
         dlg = FeatureDialog(f["type"], f, "の編集", self)
         if dlg.exec():
-            f.update(dlg.values())
+            dlg.apply_to(f)
             self.remesh()
 
     def edit_selected_body(self):
@@ -2075,7 +2257,7 @@ class MainWindow(QMainWindow):
                 w.setCurrentText(str(v))
                 w.currentTextChanged.connect(lambda t, key=key: self._feature_set(i, key, t))
             elif key == "points":
-                w = QLineEdit(str(v))
+                w = QLineEdit(field_text(f, key, default))
                 w.setToolTip("スケッチ平面上の (u, v) 座標を「;」区切りで。XY 平面なら u=X, v=Y、"
                              "YZ 平面なら u=Y, v=Z、ZX 平面なら u=Z, v=X")
                 w.editingFinished.connect(lambda w=w, key=key: self._feature_set(i, key, w.text()))
@@ -2093,8 +2275,8 @@ class MainWindow(QMainWindow):
                 b.clicked.connect(pick)
                 h.addWidget(b)
             else:
-                w = dspin(float(v), -1e7, 1e7, 3, 1.0)
-                w.valueChanged.connect(lambda val, key=key: self._feature_set(i, key, val))
+                w = ExprEdit(field_text(f, key, default))
+                w.rawChanged.connect(lambda val, key=key: self._feature_set(i, key, val))
             self._row(s2, label, w)
         s3 = self._section("操作")
         sup = QCheckBox("抑制（一時的に無効）")
@@ -2109,7 +2291,15 @@ class MainWindow(QMainWindow):
         feats = self._features()
         if i >= len(feats):
             return
-        feats[i][key] = value
+        if key == "points" or (isinstance(value, (int, float, str)) and not isinstance(value, bool)
+                               and key not in FEATURE_CHOICES and key not in ("axis", "plane", "path", "op")):
+            try:
+                set_field(feats[i], key, value, self.project.env())
+            except (ParamError, ValueError) as e:
+                QMessageBox.warning(self, "式の入力", str(e))
+                return
+        else:
+            feats[i][key] = value
         self.mesh_dirty = True
         self.result = None
         # 連続で値を変えても1回だけ作り直す
@@ -2410,9 +2600,8 @@ class MainWindow(QMainWindow):
         order.setCurrentIndex(0 if self.project.mesh_order == 2 else 2)
         order.currentIndexChanged.connect(lambda _: self._mesh_set("order", order.currentData()))
         self._row(s, "要素次数", order)
-        size = dspin(self.project.mesh_size, 0.0, 1e6, 3, 0.5, "mm")
-        size.setSpecialValueText("既定（解像度から決定）")
-        size.valueChanged.connect(lambda v: self._mesh_set("size", v))
+        size = ExprEdit(self.project.mesh_size_expr or self.project.mesh_size, suffix="mm（0 = 既定）")
+        size.rawChanged.connect(lambda v: self._mesh_set("size", v))
         self._row(s, "要素サイズ", size)
         s = self._section("サイズ調整")
         res = QDoubleSpinBox()
@@ -2477,8 +2666,16 @@ class MainWindow(QMainWindow):
     def _mesh_set(self, what, v):
         if what == "order":
             self.project.mesh_order = v
+        elif isinstance(v, str):
+            try:
+                self.project.mesh_size = max(0.0, evaluate(v, self.project.env()))
+            except ParamError as e:
+                QMessageBox.warning(self, "メッシュサイズ", str(e))
+                return
+            self.project.mesh_size_expr = v
         else:
-            self.project.mesh_size = v
+            self.project.mesh_size = max(0.0, float(v))
+            self.project.mesh_size_expr = ""
         self.invalidate(mesh=True)
 
     # ------------------------------------------------------------ メッシュ制御（Ansys のメッシュ制御）
@@ -3008,8 +3205,8 @@ class MainWindow(QMainWindow):
             self._row(s2, "", f"材料の物性をこの温度で評価し、熱ひずみ α(T − 参照温度) を与えます（環境温度 {self.project.env_temp:g}°C）")
         elif bc.kind == "pressure":
             self._row(s2, "定義方法", "垂直方向")
-            sp = dspin(float(bc.values[0] or 0), dec=6, suffix=unit)
-            sp.valueChanged.connect(lambda v: self._bc_value(i, 0, v))
+            sp = ExprEdit(bc.exprs.get(0, bc.values[0] or 0), suffix=unit)
+            sp.rawChanged.connect(lambda v: self._bc_value(i, 0, v))
             self._row(s2, "大きさ", sp)
         else:
             self._row(s2, "定義方法", "成分")
@@ -3022,17 +3219,17 @@ class MainWindow(QMainWindow):
                     cb = QComboBox()
                     cb.addItems(["自由", "固定値"])
                     cb.setCurrentIndex(0 if v is None else 1)
-                    sp = dspin(0.0 if v is None else float(v), dec=6, suffix=unit)
+                    sp = ExprEdit(bc.exprs.get(c, 0.0 if v is None else float(v)), suffix=unit)
                     sp.setEnabled(v is not None)
                     cb.currentIndexChanged.connect(lambda idx, c=c, sp=sp: (sp.setEnabled(idx == 1),
-                                                   self._bc_value(i, c, sp.value() if idx == 1 else None)))
-                    sp.valueChanged.connect(lambda val, c=c, cb=cb: cb.currentIndex() == 1 and self._bc_value(i, c, val))
+                                                   self._bc_value(i, c, sp.raw() if idx == 1 else None)))
+                    sp.rawChanged.connect(lambda val, c=c, cb=cb: cb.currentIndex() == 1 and self._bc_value(i, c, val))
                     h.addWidget(cb)
                     h.addWidget(sp)
                     self._row(s2, f"{ax} 成分", w)
                 else:
-                    sp = dspin(float(v or 0), dec=6 if bc.kind == "gravity" else 4, suffix=unit)
-                    sp.valueChanged.connect(lambda val, c=c: self._bc_value(i, c, val))
+                    sp = ExprEdit(bc.exprs.get(c, float(v or 0)), suffix=unit)
+                    sp.rawChanged.connect(lambda val, c=c: self._bc_value(i, c, val))
                     self._row(s2, f"{ax} 成分", sp)
         ns = self.project.settings.n_steps
         if ns > 1 and bc.kind != "fixed":
@@ -3065,10 +3262,20 @@ class MainWindow(QMainWindow):
             self.rebuild_tree(details=False)
 
     def _bc_value(self, i, c, v):
-        vals = list(self.project.bcs[i].values)
+        bc = self.project.bcs[i]
+        vals = list(bc.values)
         while len(vals) <= c:
             vals.append(0.0)
-        vals[c] = v
+        if isinstance(v, str):
+            try:
+                vals[c] = evaluate(v, self.project.env())
+            except ParamError as e:
+                QMessageBox.warning(self, "式の入力", str(e))
+                return
+            bc.exprs[c] = v
+        else:
+            vals[c] = v
+            bc.exprs.pop(c, None)
         self.project.bcs[i].values = vals
         self.invalidate()
         self.refresh_view()
