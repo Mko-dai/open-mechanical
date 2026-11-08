@@ -63,6 +63,8 @@ class VariablesDialog(QDialog):
         self.t.setColumnWidth(1, 170)
         self.t.setColumnWidth(2, 110)
         lay.addWidget(self.t)
+        self.msg = QLabel("")           # _add → _recalc で使うので先に作る
+        self.msg.setWordWrap(True)
         for p in params:
             self._add(p.get("name", ""), p.get("expr", ""), p.get("comment", ""))
         row = QHBoxLayout()
@@ -73,8 +75,6 @@ class VariablesDialog(QDialog):
             row.addWidget(b)
         row.addStretch()
         lay.addLayout(row)
-        self.msg = QLabel("")
-        self.msg.setWordWrap(True)
         lay.addWidget(self.msg)
         _ok_cancel(self, lay)
         self.t.itemChanged.connect(lambda *_: self._recalc())
