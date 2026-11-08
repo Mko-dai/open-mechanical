@@ -60,13 +60,16 @@ t1 = time.time()
 dte = element_dt(mesh, D, emat, rho_e) * 0.9
 P(f"要素の安定時間増分: 最小 {dte.min():.2e} s / 中央値 {np.median(dte):.2e} s（{time.time() - t1:.0f} s）")
 target = float(dte.min())
-for cand in (2e-7, 1.5e-7, 1e-7, 7e-8, 5e-8, 3e-8, 2e-8):
+LIMIT = float(os.environ.get("ADDED_MASS", "5"))     # 追加質量の上限 [%]
+for cand in (2e-7, 1.5e-7, 1e-7, 7e-8, 5e-8, 3e-8, 2e-8, 1.5e-8, 1e-8, 5e-9):
     if cand <= dte.min():
         break
-    add = float((rho_e * vol * (np.maximum(1, (cand / dte) ** 2) - 1)).sum())
-    if add / mass < 0.02:
+    sc = np.maximum(1, (cand / dte) ** 2)
+    add = float((rho_e * vol * (sc - 1)).sum()) / mass * 100
+    P(f"  目標 {cand:.1e} s → 追加質量 {add:.2f} %（{int((sc > 1).sum()):,} 要素）")
+    if add < LIMIT:
         target = cand
-        P(f"質量スケーリング: 目標 {cand:.1e} s（追加質量 {add / mass * 100:.2f} %）")
+        P(f"質量スケーリング: 目標 {cand:.1e} s を採用")
         break
 
 pts, _ = _quadrature(mesh.elems.shape[1])
