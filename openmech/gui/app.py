@@ -571,6 +571,7 @@ class MainWindow(QMainWindow):
         R.button(g, "電極", make_icon(BC_COLORS["voltage"], "電"), menu=self._bc_menu(["voltage", "ground", "charge"]))
         g = R.add_group(t, "解析")
         R.button(g, "解析", make_icon("#2e9d3a", "⚡"), self.run_solve)
+        R.button(g, "はり（骨組み）", make_icon("#4a78c2", "梁"), self.open_frame)
         self.tab_env = R.count() - 1
         # --- 解析結果
         t = R.add_tab("解析結果")
@@ -4052,6 +4053,17 @@ class MainWindow(QMainWindow):
         b = QPushButton("パスに沿ったグラフ…")
         b.clicked.connect(lambda: self._path_plot(key))
         self._row(tools, "", b)
+
+    def open_frame(self):
+        """はり要素（骨組み）解析のダイアログ。材料は材料ライブラリとプロジェクトの材料定数"""
+        from .frame_dialog import FrameDialog
+        md = (self.project.analysis_opts or {}).get("frame")
+        dlg = FrameDialog(self, model=md, materials=dict(self.project.materials))
+        dlg.exec()
+        try:
+            self.project.analysis_opts = dict(self.project.analysis_opts or {}, frame=dlg.model())
+        except Exception:  # noqa: BLE001
+            pass
 
     def _path_plot(self, key):
         from .charts import chart_dialog

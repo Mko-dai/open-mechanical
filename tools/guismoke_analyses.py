@@ -126,6 +126,33 @@ for k in A.BC_SPEC:
         P(f"NG  境界条件の追加 {k}\n" + traceback.format_exc())
 P(f"境界条件の追加 OK: {len(A.BC_SPEC)} 種類")
 w.grab().save(os.path.join(out, "bcs.png"))
+# はり（骨組み）
+try:
+    from openmech.gui.frame_dialog import EXAMPLE, FrameDialog
+    d = FrameDialog(w, model=EXAMPLE)
+    d.show()
+    app.processEvents()
+    d.run_static()
+    app.processEvents()
+    d.grab().save(os.path.join(out, "frame_static.png"))
+    d.run_modal()
+    app.processEvents()
+    d.grab().save(os.path.join(out, "frame_modal.png"))
+    P("OK  はり（骨組み）: " + d.msg.toPlainText().splitlines()[0])
+    d.close()
+except Exception:
+    P("NG  はり（骨組み）\n" + traceback.format_exc())
+# 材料のダイアログ（熱・電気・疲労の欄）
+try:
+    from openmech.gui.femtet_dialogs import MaterialDialog
+    md = MaterialDialog("鋼", w.project.material, w)
+    md.show()
+    app.processEvents()
+    mm = md.material()
+    P(f"OK  材料ダイアログ: 熱伝導率 {mm.conductivity} / S-N {len(mm.sn_table)} 点 / 圧電 {bool(mm.piezo)}")
+    md.close()
+except Exception:
+    P("NG  材料ダイアログ\n" + traceback.format_exc())
 P("完了")
 logf.close()
 w.close()
