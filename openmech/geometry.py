@@ -1101,6 +1101,270 @@ def _sweep_mesh(gmsh, ls, order, h, log):
     return m
 
 
+def _prism_tets(tri, o0, o1):
+    """三角柱（下の三角形 tri + o0、上 + o1）を四面体 3 つに分ける。
+
+    頂点番号の小さい順に分割の向きを決める規則なので、隣り合う三角柱の共有面で分割がそろう。"""
+    t = np.sort(tri, axis=1)
+    a, b, c = t[:, 0], t[:, 1], t[:, 2]
+    return [np.column_stack([a + o0, b + o0, c + o0, c + o1]),
+            np.column_stack([a + o0, b + o0, b + o1, c + o1]),
+            np.column_stack([a + o0, a + o1, b + o1, c + o1])]
+
+
+def _layered_sweep_mesh(gmsh, ls, order, h, log, share=None, wedge=False):
+    """多層スイープ（複数ボディ・積層構造）。Ansys の「手法: スイープ」を積層品向けに広げたもの。
+
+    すべてのボディの断面（スイープ方向に垂直な平らな面）を 1 つの平面に重ねて分割（fragment）し、
+    その平面を三角形で切る。断面が変わる高さ（レベル）で区切った各層について、三角形ごとに
+    どのボディの中かを調べ、三角柱を積み上げる。層の境目の節点は共有されるので、
+    ボディ同士の境界はぴったり一致する（節点共有しない場合は後で分ける）。
+
+    条件: すべての面が「スイープ方向に垂直な平面」か「スイープ方向に平行な面（側面）」であること。
+    wedge=True なら三角柱要素（Wedge6/15）のまま返す。False なら三角柱を四面体 3 つに分ける。
+    """
+    occ = gmsh.model.occ
+    vols = [t for _, t in gmsh.model.getEntities(3)]
+    if not vols:
+        raise GeometryError("スイープするボディがありません")
+    surfs = [t for _, t in sorted(gmsh.model.getEntities(2), key=lambda e: e[1])]
+    blo = np.array(gmsh.model.getBoundingBox(-1, -1)[:3])
+    bhi = np.array(gmsh.model.getBoundingBox(-1, -1)[3:])
+    diag = float(np.linalg.norm(bhi - blo))
+    tol = 1e-6 * max(1.0, diag)
+    want = ls.get("axis", "auto")
+    ax = int(np.argmin(bhi - blo)) if want not in ("X", "Y", "Z") else "XYZ".index(want)
+    e_ax = np.eye(3)[ax]
+    # 面の分類: 垂直な平面（断面）/ 平行な面（側面）
+    perp, levels, bad = [], [], []
+    for st in surfs:
+        bb = gmsh.model.getBoundingBox(2, st)
+        typ = gmsh.model.getType(2, st)
+        if typ == "Plane" and bb[ax + 3] - bb[ax] < tol * 10:
+            perp.append((st, 0.5 * (bb[ax] + bb[ax + 3])))
+            levels.append(0.5 * (bb[ax] + bb[ax + 3]))
+            continue
+        # 側面: いくつかの点で法線がスイープ方向と直交していること
+        (u0, v0), (u1, v1) = [np.asarray(x) for x in gmsh.model.getParametrizationBounds(2, st)]
+        uv = []
+        for a in (0.25, 0.5, 0.75):
+            for b in (0.25, 0.5, 0.75):
+                uv += [u0 + a * (u1 - u0), v0 + b * (v1 - v0)]
+        nrm = np.asarray(gmsh.model.getNormal(st, uv)).reshape(-1, 3)
+        if np.max(np.abs(nrm @ e_ax)) > 1e-3:
+            up, _ = gmsh.model.getAdjacencies(2, st)
+            bad.append(st)
+    if bad:
+        bodies = set()
+        for st in bad:
+            up, _ = gmsh.model.getAdjacencies(2, st)
+            for v in up:
+                ph = gmsh.model.getPhysicalGroupsForEntity(3, int(v))
+                bodies.add(int(ph[0]) - 1 if len(ph) else 0)
+        raise GeometryError(
+            f"スイープできない面があります（{'XYZ'[ax]} 方向に断面が一定でない形状）: ボディ "
+            + ", ".join(f"B{b}" for b in sorted(bodies)) + "\n丸み付け（Z 方向以外の辺）・球・斜めの面などはスイープできません。"
+            "四面体メッシュ（近接の捕捉）を使ってください。")
+    lv = np.sort(np.asarray(levels))
+    keep = np.concatenate([[True], np.diff(lv) > tol * 10])
+    lv = lv[keep]
+    if len(lv) < 2:
+        raise GeometryError("スイープ方向に垂直な面が見つかりません")
+    # 断面を 1 つの平面（最下のレベル）に重ねて分割する
+    copies = []
+    for st, z in perp:
+        c = occ.copy([(2, st)])
+        d = [0.0, 0.0, 0.0]
+        d[ax] = float(lv[0] - z)
+        occ.translate(c, *d)
+        copies += c
+    if len(copies) > 1:
+        arr, amap = occ.fragment(copies[:1], copies[1:])
+    else:
+        arr = copies
+    occ.synchronize()
+    arr_tags = sorted({t for d_, t in arr if d_ == 2})
+    hin = float(ls.get("size") or 0) or h
+    for t in arr_tags:
+        for (d_, e) in gmsh.model.getBoundary([(2, t)], oriented=False, recursive=True):
+            if d_ == 0:
+                gmsh.model.mesh.setSize([(0, e)], hin)
+    log(f"多層スイープ: {'XYZ'[ax]} 方向、断面が変わる高さ {len(lv)} か所、平面の区画 {len(arr_tags)} 個")
+    gmsh.model.mesh.generate(2)
+    ntags, ncoord, _ = gmsh.model.mesh.getNodes()
+    ncoord = np.asarray(ncoord).reshape(-1, 3)
+    idx = np.full(int(np.max(ntags)) + 1, -1, dtype=np.int64)
+    idx[np.asarray(ntags, dtype=np.int64)] = np.arange(len(ntags))
+    tris, piece = [], []
+    for t in arr_tags:
+        ets, _, ens = gmsh.model.mesh.getElements(2, t)
+        for et, en in zip(ets, ens):
+            if int(et) == 2:
+                tt = idx[np.asarray(en, dtype=np.int64)].reshape(-1, 3)
+                tris.append(tt)
+                piece.append(np.full(len(tt), t))
+    if not tris:
+        raise GeometryError("断面を三角形で切れませんでした")
+    tri = np.concatenate(tris)
+    piece = np.concatenate(piece)
+    used = np.unique(tri)
+    P = ncoord[used]
+    tri = np.searchsorted(used, tri)
+    n2 = len(P)
+    # 区画ごとの代表点（区画の中の一番大きい三角形の重心）
+    area = 0.5 * np.linalg.norm(np.cross(P[tri[:, 1]] - P[tri[:, 0]], P[tri[:, 2]] - P[tri[:, 0]]), axis=1)
+    rep = {}
+    for t in arr_tags:
+        ii = np.nonzero(piece == t)[0]
+        if len(ii):
+            k = ii[np.argmax(area[ii])]
+            rep[t] = P[tri[k]].mean(0)
+    # ボディの範囲（候補を絞る）
+    vbox = {v: np.asarray(gmsh.model.getBoundingBox(3, v)) for v in vols}
+    vbody = {}
+    for v in vols:
+        ph = gmsh.model.getPhysicalGroupsForEntity(3, v)
+        vbody[v] = int(ph[0]) - 1 if len(ph) else 0
+    # 層ごとの分割数と高さの列
+    hz = float(ls.get("layer_size") or 0) or h
+    divs = int(ls.get("divs", 0) or 0)
+    zs = [float(lv[0])]
+    slab_rng = []
+    for a, b in zip(lv[:-1], lv[1:]):
+        n = divs if divs > 0 else max(1, int(round((b - a) / hz)))
+        k0 = len(zs) - 1
+        zs += [float(a + (b - a) * (j + 1) / n) for j in range(n)]
+        slab_rng.append((k0, len(zs) - 1, 0.5 * (a + b)))
+    zs = np.asarray(zs)
+    # 区画 × 層 → ボディ
+    elems, ebody = [], []
+    for k0, k1, zm in slab_rng:
+        owner = {}
+        for t, c in rep.items():
+            q = c.copy()
+            q[ax] = zm
+            for v in vols:
+                bb = vbox[v]
+                if np.all(q >= bb[:3] - tol) and np.all(q <= bb[3:] + tol):
+                    if gmsh.model.isInside(3, v, q.tolist()):
+                        owner[t] = v
+                        break
+        if not owner:
+            continue
+        sel = np.array([t in owner for t in piece])
+        if not sel.any():
+            continue
+        tsel = tri[sel]
+        bsel = np.array([vbody[owner[t]] for t in piece[sel]], dtype=np.int64)
+        for k in range(k0, k1):
+            o0, o1 = k * n2, (k + 1) * n2
+            if wedge:
+                elems.append(np.column_stack([tsel + o0, tsel + o1]))
+                ebody.append(bsel)
+            else:
+                for tt in _prism_tets(tsel, o0, o1):
+                    elems.append(tt)
+                    ebody.append(bsel)
+    if not elems:
+        raise GeometryError("スイープでボディの中に要素ができませんでした")
+    el = np.vstack(elems)
+    eb = np.concatenate(ebody)
+    nodes_all = np.repeat(P[None], len(zs), axis=0)
+    nodes_all[:, :, ax] = zs[:, None]
+    nodes_all = nodes_all.reshape(-1, 3)
+    usedn = np.unique(el)
+    remap = np.full(len(nodes_all), -1, dtype=np.int64)
+    remap[usedn] = np.arange(len(usedn))
+    nodes = nodes_all[usedn]
+    el = remap[el]
+    if not wedge:
+        X = nodes[el]
+        vol = np.einsum("ij,ij->i", np.cross(X[:, 1] - X[:, 0], X[:, 2] - X[:, 0]), X[:, 3] - X[:, 0])
+        flip = vol < 0
+        el[flip] = el[flip][:, [0, 2, 1, 3]]
+    else:
+        X = nodes[el]
+        vol = np.einsum("ij,ij->i", np.cross(X[:, 1] - X[:, 0], X[:, 2] - X[:, 0]), X[:, 3] - X[:, 0])
+        flip = vol < 0
+        el[flip] = el[flip][:, [0, 2, 1, 3, 5, 4]]
+    m = Mesh(nodes, el)
+    m.elem_body = eb
+    # ボディごとの体積の確認（CAD の体積と比べる）
+    ev = np.abs(m.element_volumes())
+    worst = 0.0
+    for v in vols:
+        V = occ.getMass(3, v)
+        mv = float(ev[eb == vbody[v]].sum())
+        if V > 0:
+            worst = max(worst, abs(mv - V) / V)
+    if worst > 0.05:
+        log(f"注意: スイープのメッシュの体積が CAD と最大 {worst * 100:.1f}% 違います（曲面の近似）")
+    if order == 2:
+        m = m.to_quadratic()
+        m.elem_body = eb
+        curved = [st for st in surfs if gmsh.model.getType(2, st) != "Plane"]
+        if curved:
+            _project_midnodes(gmsh, m, curved, h)
+    m = m.split_body_interfaces(share)
+    _assign_face_ids(gmsh, m, surfs, tol=max(1e-3 * h, 10 * tol))
+    log(f"多層スイープ完了: 層 {len(zs) - 1} / {'三角柱' if wedge else '四面体（三角柱を 3 分割）'} {m.n_elems:,} 要素"
+        f"（体積の差 最大 {worst * 100:.2f}%）")
+    return m
+
+
+def _project_midnodes(gmsh, m, curved, h):
+    """2 次要素の中間節点のうち、曲面のすぐ近くにあるものを CAD の面へ移す"""
+    corner = m.elems.shape[1] // 2 if m.elems.shape[1] in (10, 20) else (6 if m.elems.shape[1] == 15 else 4)
+    mids = np.unique(m.elems[:, corner:])
+    if not len(mids):
+        return
+    Xm = m.nodes[mids]
+    best = np.full(len(mids), np.inf)
+    proj = Xm.copy()
+    for st in curved:
+        bb = np.asarray(gmsh.model.getBoundingBox(2, st))
+        pad = 0.1 * h
+        near = np.nonzero(np.all(Xm >= bb[:3] - pad, axis=1) & np.all(Xm <= bb[3:] + pad, axis=1))[0]
+        if not len(near):
+            continue
+        cp = np.array(gmsh.model.getClosestPoint(2, st, Xm[near].ravel().tolist())[0]).reshape(-1, 3)
+        d = np.linalg.norm(cp - Xm[near], axis=1)
+        better = d < best[near]
+        best[near[better]], proj[near[better]] = d[better], cp[better]
+    ok = best < 0.05 * h
+    m.nodes[mids[ok]] = proj[ok]
+
+
+def _assign_face_ids(gmsh, m, surfs, tol):
+    """境界の三角形に CAD のサーフェス番号を付ける（四面体メッシュの _extract_mesh と同じ番号の付け方）"""
+    bt = m.boundary_tris
+    cen = m.nodes[bt].mean(axis=1)
+    best = np.full(len(cen), np.inf)
+    fid = np.full(len(cen), -1, dtype=np.int64)
+    for i, st in enumerate(surfs):
+        bb = np.asarray(gmsh.model.getBoundingBox(2, st))
+        pad = 10 * tol + 1e-9
+        near = np.nonzero(np.all(cen >= bb[:3] - pad, axis=1) & np.all(cen <= bb[3:] + pad, axis=1))[0]
+        if not len(near):
+            continue
+        cp = np.array(gmsh.model.getClosestPoint(2, st, cen[near].ravel().tolist())[0]).reshape(-1, 3)
+        d = np.linalg.norm(cp - cen[near], axis=1)
+        better = d < best[near]
+        best[near[better]], fid[near[better]] = d[better], i
+    if (fid < 0).any():
+        m.group_faces()
+        return
+    n_surf = len(surfs)
+    tb = m.tri_body() if m.elem_body is not None else np.zeros(len(fid), dtype=np.int64)
+    first_body = {}
+    for f, b in zip(fid.tolist(), tb.tolist()):
+        first_body[f] = min(b, first_body.get(f, b))
+    second = np.array([b != first_body[f] for f, b in zip(fid.tolist(), tb.tolist())])
+    fid = np.where(second, fid + n_surf, fid)
+    _, fid = np.unique(fid, return_inverse=True)
+    m.set_face_ids(fid)
+
+
 def mesh_quality(mesh) -> dict:
     """メッシュの品質（Ansys の メッシュメトリック 相当、頂点4点で評価）
 
@@ -1410,7 +1674,11 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
             return mesh
         fix_msgs = []
         if sweeps:
-            mesh = _sweep_mesh(gmsh, sweeps[-1], order, h, log)
+            sw = sweeps[-1]
+            if len(gmsh.model.getEntities(3)) > 1 or sw.get("layered"):
+                mesh = _layered_sweep_mesh(gmsh, sw, order, h, log, share=share)
+            else:
+                mesh = _sweep_mesh(gmsh, sw, order, h, log)
         else:
             if ms.get("capture_proximity"):
                 pm = _apply_proximity(gmsh, h, ms, log)
