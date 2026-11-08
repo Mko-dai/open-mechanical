@@ -1533,7 +1533,11 @@ class MainWindow(QMainWindow):
     # ======================================================================= マウスで作図
     def _sketch_bar(self):
         bar = QFrame()
-        bar.setStyleSheet("QFrame#skbar{background:#fff4d6;border-bottom:1px solid #e0b850;}")
+        bar.setStyleSheet("QFrame#skbar{background:#fff4d6;border-bottom:1px solid #e0b850;}"
+                          "QFrame#skbar QLabel{color:#222;}"
+                          "QFrame#skbar QPushButton{color:#222;background:#fff;border:1px solid #c9a227;"
+                          "border-radius:3px;padding:2px 8px;}"
+                          "QFrame#skbar QPushButton:hover{background:#ffe9a8;}")
         bar.setObjectName("skbar")
         h = QHBoxLayout(bar)
         h.setContentsMargins(6, 3, 6, 3)
@@ -1803,14 +1807,18 @@ class MainWindow(QMainWindow):
         if marks:
             pl.add_points(np.array(marks, float), color="#d9480f", point_size=10, render_points_as_spheres=True,
                           name="sk_pts", pickable=False, reset_camera=False, render=False)
+        # 3D 画面の文字は日本語が出ないので英数字で（説明は上のバーに日本語で出している）
         c = sk.cursor
-        txt = f"{name}: {sk.prompt}"
+        lines_txt = []
         if c is not None and sk.kind in ("pt", "poly"):
-            txt += f"\nX {c[0]:g}  Y {c[1]:g}  Z {c[2]:g}"
+            lines_txt.append(f"X {c[0]:g}  Y {c[1]:g}  Z {c[2]:g}")
         if sk.kind == "h" and sk.cursor_h is not None:
-            txt += f"\n長さ {sk.cursor_h:g} mm"
+            lines_txt.append(f"H {sk.cursor_h:g} mm")
         if info:
-            txt += f"\n{info}"
+            for jp, en in (("半径", "R"), ("長さ", "L"), ("頂点", "Point"), (" / ", "   "), ("×", "x")):
+                info = info.replace(jp, en)
+            lines_txt.append(info)
+        txt = "\n".join(lines_txt)
         pl.add_text(txt, position="upper_right", font_size=10, color="#d9480f", name="sk_label", render=False)
         pl.render()
 
