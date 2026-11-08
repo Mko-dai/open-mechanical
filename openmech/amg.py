@@ -99,7 +99,8 @@ def build(A, B=None, max_coarse=3000, degree=3, comps=None, robust=False):
         A_setup = A
     if robust:
         # 材料の剛性差が大きい・薄い層が多いモデル向け: 平滑化集約（準備は重いが収束が安定）
-        ml = pyamg.smoothed_aggregation_solver(A_setup, B=B, symmetry="hermitian", strength="symmetric",
+        ml = pyamg.smoothed_aggregation_solver(A_setup, B=B, symmetry="hermitian",
+                                               strength=("symmetric", {"theta": 0.05}),   # 柔らかい層との弱い結合は切る
                                                max_coarse=max_coarse, smooth="jacobi")
     else:
         ml = pyamg.smoothed_aggregation_solver(A_setup, B=B, symmetry="hermitian", strength="symmetric",

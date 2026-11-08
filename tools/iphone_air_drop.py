@@ -218,6 +218,16 @@ t0 = time.time()
 mesh = p.mesh(log=lambda *a: P("  ", *a))
 P(f"メッシュ: 節点 {mesh.n_nodes:,} / 要素 {mesh.n_elems:,} / ボディ {len(mesh.body_ids())}（{time.time() - t0:.1f} s）")
 
+# 品質の悪い要素の場所（どの部品のどこか）
+from openmech.geometry import mesh_quality  # noqa: E402
+q = mesh_quality(mesh)["_quality"]
+worst = np.argsort(q)[:15]
+P("品質の低い要素（品質・部品・重心 [mm]）:")
+for e in worst:
+    c = mesh.nodes[mesh.elems[e, :4]].mean(0)
+    P(f"   {q[e]:.4f}  {body_name.get(int(mesh.elem_body[e]), '?')}  ({c[0]:.2f}, {c[1]:.2f}, {c[2]:.2f})")
+if os.environ.get("CHECK"):
+    sys.exit(0)
 vol = mesh.element_volumes()
 rho = np.array([p.materials[body_mat[int(b)]].density for b in mesh.elem_body]) * 1e-12
 mass_t = float((vol * rho).sum())
