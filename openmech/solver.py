@@ -1,4 +1,4 @@
-"""線形静的構造解析ソルバー（3次元、等方弾性、Tet4 / Tet10）。
+"""線形静的構造解析ソルバー（3次元、等方弾性、Tet4 / Tet10 / 三角柱 Wedge6 / Wedge15）。
 
 単位系: mm, N, MPa, t（トン）, s
 """
@@ -31,6 +31,9 @@ NODE_L10 = np.vstack([np.eye(4)] + [0.5 * (np.eye(4)[i] + np.eye(4)[j]) for i, j
 
 
 def shape_N(L: np.ndarray, nn: int) -> np.ndarray:
+    if nn in (6, 15):
+        from .elements import wedge_N
+        return wedge_N(L, nn)
     if nn == 4:
         return L.copy()
     N = np.empty(10)
@@ -41,7 +44,10 @@ def shape_N(L: np.ndarray, nn: int) -> np.ndarray:
 
 
 def shape_dN_dxi(L: np.ndarray, nn: int) -> np.ndarray:
-    """(nn,3) 自然座標での形状関数の微分。"""
+    """(nn,3) 自然座標での形状関数の微分。四面体は L が体積座標 (4,)、三角柱は (r,s,t)"""
+    if nn in (6, 15):
+        from .elements import wedge_dN
+        return wedge_dN(L, nn)
     if nn == 4:
         return _DL_DXI.copy()
     dNdL = np.zeros((10, 4))
@@ -90,7 +96,26 @@ def _B_matrix(dNdx: np.ndarray) -> np.ndarray:
 
 
 def _quadrature(nn):
+    if nn in (6, 15):
+        from .elements import wedge_quadrature
+        return wedge_quadrature(nn)
     return (GAUSS4, GAUSS4_W) if nn == 10 else (GAUSS1, GAUSS1_W)
+
+
+def _quadrature_full(nn):
+    """質量・体積力用（2 次の形状関数の積まで十分な精度）"""
+    if nn in (6, 15):
+        from .elements import wedge_quadrature
+        return wedge_quadrature(nn, full=True)
+    return GAUSS4, GAUSS4_W
+
+
+def node_points(nn):
+    """要素の各節点の自然座標（節点での応力評価用）"""
+    if nn in (6, 15):
+        from .elements import wedge_node_points
+        return wedge_node_points(nn)
+    return NODE_L10 if nn == 10 else NODE_L4
 
 
 # ---------------------------------------------------------------------------- 組み立て
@@ -230,7 +255,7 @@ def body_force_vector(mesh: Mesh, b: np.ndarray) -> np.ndarray:
     if b.ndim == 1:
         b = np.broadcast_to(b, (mesh.n_elems, 3))
     nn = mesh.elems.shape[1]
-    pts, wts = GAUSS4, GAUSS4_W  # 2次の形状関数まで厳密に積分できる
+    pts, wts = _quadrature_full(nn)  # 2次の形状関数まで厳密に積分できる
     X = mesh.nodes[mesh.elems]
     F = np.zeros((mesh.n_nodes, 3))
     for L, w in zip(pts, wts):
@@ -258,6 +283,33 @@ def surface_weights(mesh: Mesh, tris: np.ndarray):
     else:
         w = np.repeat(A[:, None] / 3.0, 3, axis=1)
     return tris, w, n, A
+
+
+def face_load_weights(mesh: Mesh, faces):
+    """面の上の一様な表面力を節点に配る重み。
+
+    返り値: (節点番号 (K,), ∫N dA (K,), ∫N n dA (K,3), 面積の合計)
+    四面体の面（Tri3/Tri6）に加え、三角柱の側面（Quad4/Quad8）も正しく積分する。
+    """
+    rows = np.concatenate([np.nonzero(mesh.face_ids == int(f))[0] for f in faces]) if len(faces) else np.zeros(0, int)
+    qof = mesh.boundary_quad_of if getattr(mesh, "is_wedge", False) else None
+    qof = qof[rows] if qof is not None else np.full(len(rows), -1)
+    tri_rows = rows[qof < 0]
+    tris = mesh.boundary_tris_full[tri_rows]
+    tri, w, n, A = surface_weights(mesh, tris)
+    idx = [tri.ravel()]
+    ws = [w.ravel()]
+    wn = [(w[:, :, None] * n[:, None, :]).reshape(-1, 3)]
+    Atot = float(A.sum())
+    if (qof >= 0).any():
+        from .elements import quad_load_weights
+        quads = mesh.boundary_quads_full[np.unique(qof[qof >= 0])]
+        qi, qw, qwn, qa = quad_load_weights(mesh.nodes, quads)
+        idx.append(qi.ravel())
+        ws.append(qw.ravel())
+        wn.append(qwn.reshape(-1, 3))
+        Atot += float(qa.sum())
+    return np.concatenate(idx), np.concatenate(ws), np.concatenate(wn), Atot
 
 
 # ---------------------------------------------------------------------------- 境界条件
@@ -349,23 +401,18 @@ def build_load_and_constraints(mesh: Mesh, material: Material, bcs: list[BC], rh
                 for d in (3 * nodes + c):
                     fixed[int(d)] = float(vals[c])
         elif bc.kind == "force":
-            tris = np.concatenate([mesh.face_tris(f) for f in bc.faces])
-            tri, w, _, A = surface_weights(mesh, tris)
-            Atot = A.sum()
+            nodes, w, _, Atot = face_load_weights(mesh, bc.faces)
             t = np.asarray(bc.values, float) / Atot
             for c in range(3):
-                np.add.at(F, 3 * tri.ravel() + c, (w * t[c]).ravel())
+                np.add.at(F, 3 * nodes + c, w * t[c])
         elif bc.kind == "pressure":
             p = float(bc.values[0])
-            tris = np.concatenate([mesh.face_tris(f) for f in bc.faces])
-            tri, w, n, _ = surface_weights(mesh, tris)
+            nodes, _, wvec, _ = face_load_weights(mesh, bc.faces)
             for c in range(3):
-                np.add.at(F, 3 * tri.ravel() + c, (-p * w * n[:, c:c + 1]).ravel())
+                np.add.at(F, 3 * nodes + c, -p * wvec[:, c])
         elif bc.kind == "moment":
-            tris = np.concatenate([mesh.face_tris(f) for f in bc.faces])
-            tri, w, _, _ = surface_weights(mesh, tris)
-            nodes = tri.ravel()
-            wn = np.bincount(nodes, weights=w.ravel(), minlength=mesh.n_nodes)
+            nodes, w, _, _ = face_load_weights(mesh, bc.faces)
+            wn = np.bincount(nodes, weights=w, minlength=mesh.n_nodes)
             idx = np.nonzero(wn)[0]
             wi = wn[idx]
             r = mesh.nodes[idx] - (mesh.nodes[idx] * wi[:, None]).sum(0) / wi.sum()
@@ -495,7 +542,7 @@ def nodal_stress(mesh: Mesh, u: np.ndarray, D: np.ndarray, chunk: int = 50000, e
     """各要素の節点位置で応力を評価し、節点で平均化する（Ansys の節点平均と同じ）。"""
     from .parallel import chunks, pmap
     nn = mesh.elems.shape[1]
-    Lnodes = NODE_L10 if nn == 10 else NODE_L4
+    Lnodes = node_points(nn)
     dNa = [shape_dN_dxi(Lnodes[a], nn) for a in range(nn)]
     U = u.reshape(-1, 3)
     ne = mesh.n_elems

@@ -95,17 +95,8 @@ MODELS = {1: m1, 2: m2, 3: m3, 4: m4, 5: m5}
 # ---------------------------------------------------------------------------- 評価
 def stats(mesh, secs, fix_log):
     q = mesh_quality(mesh)
-    X = mesh.nodes[mesh.elems[:, :4]]
-    # 歪度（要素ごと）: mesh_quality と同じ式
-    e = [X[:, j] - X[:, i] for i, j in ((0, 1), (0, 2), (0, 3))]
-    V = np.abs(np.einsum("ij,ij->i", np.cross(e[0], e[1]), e[2])) / 6
-    a, b, c = e
-    num = np.linalg.norm(np.einsum("i,ij->ij", (a * a).sum(1), np.cross(b, c))
-                         + np.einsum("i,ij->ij", (b * b).sum(1), np.cross(c, a))
-                         + np.einsum("i,ij->ij", (c * c).sum(1), np.cross(a, b)), axis=1)
-    R = num / np.maximum(12 * V, 1e-300)
-    Vopt = 8 * np.sqrt(3) / 27 * R ** 3
-    skew = np.clip((Vopt - V) / np.maximum(Vopt, 1e-300), 0, 1)
+    skew = q["_skew"]
+    ar = q["_ar"]
     jr = tet10_jacobian_ratio(mesh)
     n = len(skew)
     bands = {name: round(100.0 * float(np.sum((skew >= lo) & (skew < hi))) / n, 3) for name, lo, hi in BANDS}
@@ -115,10 +106,11 @@ def stats(mesh, secs, fix_log):
         if mesh.elem_body is not None else 1, "メッシュ時間 [s]": round(secs, 1),
         "要素品質": {**q["要素品質"], "1%点": float(np.percentile(eq, 1))},
         "歪度": {**q["歪度"], "99%点": float(np.percentile(skew, 99))},
-        "アスペクト比": {**q["アスペクト比"], "99%点": float(np.percentile(_ar(mesh), 99))},
+        "アスペクト比": {**q["アスペクト比"], "99%点": float(np.percentile(ar, 99))},
         "ヤコビアン比": {"最小": float(jr.min()), "平均": float(jr.mean()), "0.5 未満の要素": int(np.sum(jr < 0.5))},
         "歪度の区分 [%]": bands,
         "要素品質 0.1 未満の要素": int(np.sum(eq < 0.1)),
+        "要素の形": "三角柱" if getattr(mesh, "is_wedge", False) else "四面体",
         "自動修正": list(fix_log or []),
     }, skew, eq
 
@@ -141,8 +133,11 @@ def render(mesh, eq, path_base):
     except ImportError:
         return []
     pv.OFF_SCREEN = True
-    cells = np.hstack([np.full((mesh.n_elems, 1), 4), mesh.elems[:, :4]]).ravel()
-    grid = pv.UnstructuredGrid(cells, np.full(mesh.n_elems, pv.CellType.TETRA, dtype=np.uint8), mesh.nodes)
+    wedge = getattr(mesh, "is_wedge", False)
+    k = 6 if wedge else 4
+    cells = np.hstack([np.full((mesh.n_elems, 1), k), mesh.elems[:, :k]]).ravel()
+    ctype = pv.CellType.WEDGE if wedge else pv.CellType.TETRA
+    grid = pv.UnstructuredGrid(cells, np.full(mesh.n_elems, ctype, dtype=np.uint8), mesh.nodes)
     grid.cell_data["要素品質"] = eq
     out = []
     lo, hi = mesh.bounds()

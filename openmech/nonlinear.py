@@ -143,7 +143,8 @@ def tl_internal(mesh: Mesh, D, elem_mat, u, chunk=20000):
 def tl_cauchy_nodal(mesh: Mesh, u, D, elem_mat, chunk=50000):
     """節点のコーシー応力とグリーン・ラグランジュひずみ"""
     nn = mesh.elems.shape[1]
-    Lnodes = NODE_L10 if nn == 10 else NODE_L4
+    from .solver import node_points
+    Lnodes = node_points(nn)
     U = u.reshape(-1, 3)
     acc_s = np.zeros((mesh.n_nodes, 6))
     acc_e = np.zeros((mesh.n_nodes, 6))

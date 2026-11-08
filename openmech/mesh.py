@@ -1,8 +1,11 @@
-"""四面体メッシュのデータ構造と、境界面の抽出・面グループ分け。
+"""四面体・三角柱メッシュのデータ構造と、境界面の抽出・面グループ分け。
 
 内部の節点順序は VTK に合わせています。
   Tet4 : 頂点 0,1,2,3
   Tet10: 頂点 0-3 + 中間節点 4:(0,1) 5:(1,2) 6:(0,2) 7:(0,3) 8:(1,3) 9:(2,3)
+  Wedge6 / Wedge15（三角柱、多層スイープで作る）: elements.py を参照
+三角柱の側面（四角形）は、境界の三角形の並びには 2 つの三角形として入れ（表示・面番号・選択用）、
+荷重の積分用に四角形のまま boundary_quads_full にも持つ。
 """
 from __future__ import annotations
 
@@ -33,19 +36,27 @@ class Mesh:
     elem_body: np.ndarray | None = None  # 要素ごとのボディ番号（ボディキー）
     body_names: dict | None = None       # ボディ番号 → 表示名
     _btri_owner: np.ndarray | None = field(default=None, repr=False)
+    _bquad_full: np.ndarray | None = field(default=None, repr=False)
+    _bquad_of: np.ndarray | None = field(default=None, repr=False)
     node_origin: np.ndarray | None = None   # 分離前の節点番号（ボディ境界で複製した節点用）
 
     def __post_init__(self):
         self.nodes = np.asarray(self.nodes, dtype=float)
         self.elems = np.asarray(self.elems, dtype=np.int64)
-        if self.elems.shape[1] not in (4, 10):
-            raise ValueError("Tet4 または Tet10 のみ対応しています")
+        if self.elems.shape[1] not in (4, 10, 6, 15):
+            raise ValueError("Tet4 / Tet10 / Wedge6 / Wedge15 のみ対応しています")
         self._fix_orientation()
 
     # ------------------------------------------------------------------ 基本情報
     @property
     def order(self) -> int:
-        return 2 if self.elems.shape[1] == 10 else 1
+        return 2 if self.elems.shape[1] in (10, 15) else 1
+
+    @property
+    def is_wedge(self) -> bool:
+        """三角柱（ソリッド）要素か。シェル・2D の 6 節点三角形は含まない"""
+        return (self.elems.shape[1] in (6, 15) and not getattr(self, "is_shell", False)
+                and not getattr(self, "is_2d", False))
 
     @property
     def n_nodes(self) -> int:
@@ -59,6 +70,9 @@ class Mesh:
         return self.nodes.min(axis=0), self.nodes.max(axis=0)
 
     def element_volumes(self) -> np.ndarray:
+        if self.is_wedge:
+            from .elements import wedge_volumes
+            return wedge_volumes(self.nodes, self.elems)
         p = self.nodes[self.elems[:, :4]]
         a, b, c = p[:, 1] - p[:, 0], p[:, 2] - p[:, 0], p[:, 3] - p[:, 0]
         return np.einsum("ij,ij->i", a, np.cross(b, c)) / 6.0
@@ -68,6 +82,19 @@ class Mesh:
 
     # ------------------------------------------------------------------ 前処理
     def _fix_orientation(self):
+        if self.is_wedge:
+            # 下面の三角形の法線が上面の方を向くように（逆なら 1↔2・4↔5 を入れ替え）
+            p = self.nodes[self.elems[:, :6]]
+            nrm = np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0])
+            up = p[:, 3:].mean(1) - p[:, :3].mean(1)
+            bad = np.einsum("ij,ij->i", nrm, up) < 0
+            if bad.any():
+                perm = [0, 2, 1, 3, 5, 4]
+                if self.elems.shape[1] == 15:
+                    # 辺 6:(0,1)↔8:(2,0), 7:(1,2) はそのまま、9:(3,4)↔11:(5,3), 13:(1,4)↔14:(2,5)
+                    perm += [8, 7, 6, 11, 10, 9, 12, 14, 13]
+                self.elems[bad] = self.elems[bad][:, perm]
+            return
         vol = self.element_volumes()
         bad = vol < 0
         if bad.any():
@@ -80,17 +107,23 @@ class Mesh:
             self.elems[bad] = e
 
     def to_quadratic(self) -> "Mesh":
-        """Tet4 → Tet10（辺の中点に節点を追加）。"""
+        """Tet4 → Tet10 / Wedge6 → Wedge15（辺の中点に節点を追加）。"""
         if self.order == 2:
             return self
         e = self.elems
-        edges = np.concatenate([e[:, TET10_EDGES[k]] for k in range(6)])
+        if self.is_wedge:
+            from .elements import WEDGE15_EDGES
+            elist = np.array(WEDGE15_EDGES)
+        else:
+            elist = TET10_EDGES
+        ne_ = len(elist)
+        edges = np.concatenate([e[:, elist[k]] for k in range(ne_)])
         edges.sort(axis=1)
         uniq, inv = np.unique(edges, axis=0, return_inverse=True)
         inv = inv.reshape(-1)
         mids = 0.5 * (self.nodes[uniq[:, 0]] + self.nodes[uniq[:, 1]])
         new_nodes = np.vstack([self.nodes, mids])
-        mid_idx = (inv + self.n_nodes).reshape(6, -1).T
+        mid_idx = (inv + self.n_nodes).reshape(ne_, -1).T
         new = Mesh(new_nodes, np.hstack([e, mid_idx]))
         if self.face_ids is not None:
             # 頂点番号は変わらないので境界三角形の並びも同じ
@@ -149,6 +182,8 @@ class Mesh:
 
     # ------------------------------------------------------------------ 境界
     def _compute_boundary(self):
+        if self.is_wedge:
+            return self._compute_boundary_wedge()
         e = self.elems
         faces = np.concatenate([e[:, TET_FACES[k]] for k in range(4)])
         key = np.sort(faces, axis=1)
@@ -161,6 +196,56 @@ class Mesh:
             self._btri_full = full[once]
         else:
             self._btri_full = self._btri
+
+    def _compute_boundary_wedge(self):
+        from .elements import WEDGE15_QUAD_LOOP, WEDGE15_TRI_FACES, WEDGE_QUAD_FACES, WEDGE_TRI_FACES
+        e = self.elems
+        ne = len(e)
+        quad2 = self.elems.shape[1] == 15
+        # 三角形の面（上下）
+        tf = np.concatenate([e[:, WEDGE_TRI_FACES[k]] for k in range(2)])
+        _, ti, tc = np.unique(np.sort(tf, axis=1), axis=0, return_index=True, return_counts=True)
+        t_once = ti[tc == 1]
+        # 四角形の面（側面）
+        qf = np.concatenate([e[:, WEDGE_QUAD_FACES[k]] for k in range(3)])
+        _, qi, qc = np.unique(np.sort(qf, axis=1), axis=0, return_index=True, return_counts=True)
+        q_once = qi[qc == 1]
+        quads = qf[q_once]
+        if quad2:
+            tfull = np.concatenate([e[:, WEDGE15_TRI_FACES[k]] for k in range(2)])[t_once]
+            qloop = np.concatenate([e[:, WEDGE15_QUAD_LOOP[k]] for k in range(3)])[q_once]
+        else:
+            tfull = tf[t_once]
+            qloop = quads
+        a, b, c, d = quads.T
+        # 四角形を 2 つの三角形に（向きはそのまま外向き）
+        tri_q = np.concatenate([np.column_stack([a, b, c]), np.column_stack([a, c, d])])
+        nq = len(quads)
+        if quad2:
+            L = qloop        # [c0,m01,c1,m12,c2,m23,c3,m30]
+            full_q = np.concatenate([np.column_stack([L[:, 0], L[:, 2], L[:, 4], L[:, 1], L[:, 3], L[:, 5]]),
+                                     np.column_stack([L[:, 0], L[:, 4], L[:, 6], L[:, 5], L[:, 7], L[:, 1]])])
+        else:
+            full_q = tri_q
+        self._btri = np.concatenate([tf[t_once], tri_q])
+        self._btri_full = np.concatenate([tfull, full_q])
+        self._btri_owner = np.concatenate([t_once % ne, np.tile(q_once % ne, 2)])
+        self._bquad_full = qloop
+        self._bquad_of = np.concatenate([np.full(len(t_once), -1), np.tile(np.arange(nq), 2)])
+
+    @property
+    def boundary_quads_full(self) -> np.ndarray:
+        """三角柱の側面（境界の四角形）。Quad4 か、周の順の Quad8"""
+        if self._btri is None:
+            self._compute_boundary()
+        return self._bquad_full if self._bquad_full is not None else np.zeros((0, 4), dtype=np.int64)
+
+    @property
+    def boundary_quad_of(self):
+        """境界の三角形ごとに、もとの四角形の番号（四角形から作った三角形でなければ -1）"""
+        if self._btri is None:
+            self._compute_boundary()
+        return self._bquad_of
 
     @property
     def boundary_tris(self) -> np.ndarray:

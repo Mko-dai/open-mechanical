@@ -56,7 +56,9 @@ try:
     feats = laminate()
     spec = {"kind": "model", "features": feats}
     res = {}
-    for name, ctrl in (("四面体（既定）", []), ("多層スイープ", [{"type": "sweep", "axis": "Z", "divs": 0, "layer_size": 0.7}])):
+    for name, ctrl in (("四面体（既定）", []),
+                       ("多層スイープ（四面体に分割）", [{"type": "sweep", "axis": "Z", "layer_size": 0.7, "element": "tet"}]),
+                       ("多層スイープ（三角柱）", [{"type": "sweep", "axis": "Z", "layer_size": 0.7, "element": "wedge"}])):
         t0 = time.time()
         logs = []
         st = {"capture_proximity": True} if ctrl is None else {}
@@ -71,7 +73,7 @@ try:
         res[name] = m
     # 面番号が四面体とスイープで同じ面を指すか
     a = {f["id"]: f for f in res["四面体（既定）"].face_info()}
-    b = {f["id"]: f for f in res["多層スイープ"].face_info()}
+    b = {f["id"]: f for f in res["多層スイープ（三角柱）"].face_info()}
     same = sum(1 for k in a if k in b and np.linalg.norm(np.subtract(a[k]["centroid"], b[k]["centroid"])) < 0.5)
     P(f"[積層板] 面の数 四面体 {len(a)} / スイープ {len(b)}、同じ番号で同じ場所の面 {same}")
     # 曲げ: x=0 の面を固定、x=100 の面に下向き 100 N
@@ -97,12 +99,22 @@ try:
     os.environ.setdefault("MESH", "2.0")
     import iphone_air_model as ip
     spec = ip.p.geometry
-    for name, ctrl in (("多層スイープ（面内 2 mm）", [{"type": "sweep", "axis": "Z", "divs": 0, "layer_size": 1.0}]),):
+    for name, ctrl in (("多層スイープ（三角柱・面内 2 mm）", [{"type": "sweep", "axis": "Z", "layer_size": 1.0, "element": "wedge"}]),):
         t0 = time.time()
         logs = []
         m = build_mesh(spec, 2.0, 2, log=lambda s: logs.append(s), local_sizes=ctrl, share=ip.p.share_map())
         q, eq = quality(m)
         P(f"[iPhone] {name}: {q} / {time.time() - t0:.1f} s / ボディ {len(np.unique(m.elem_body))}")
+        # 重力 1000 G（落下の等価静解析）で解けるか: 背面（z=0 側）を固定
+        p = ip.p
+        info = m.face_info()
+        lo = m.nodes[:, 2].min()
+        f0 = [f["id"] for f in info if abs(f["centroid"][2] - lo) < 1e-3 and f["normal"][2] < -0.99]
+        p.bcs = [BC("fixed", f0), BC("gravity", [], [0, 0, -9.81e6])]
+        t1 = time.time()
+        r = p.run(m, log=lambda *x: None)
+        P(f"    重力 1000 G・背面固定: 最大変位 {r.disp_mag.max():.4g} mm / 最大ミーゼス {r.von_mises.max():.4g} MPa / "
+          f"{time.time() - t1:.1f} s")
         for s in logs[-4:]:
             P("    " + str(s))
         try:

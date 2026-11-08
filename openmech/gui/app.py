@@ -2766,7 +2766,7 @@ class MainWindow(QMainWindow):
         elif t in ("sizing", "refinement"):
             self._scope_row(s, ls.get("faces", []), lambda faces: self._ls_set(i, "faces", list(faces), True))
         elif t == "sweep":
-            self._row(s, "ジオメトリ", "モデルのボディ（ボディが1つのモデル）")
+            self._row(s, "ジオメトリ", "すべてのボディ（積層品は多層スイープ）")
         else:
             self._row(s, "ジオメトリ", "影響球の中の領域")
         s2 = self._section("定義")
@@ -2814,8 +2814,17 @@ class MainWindow(QMainWindow):
             dv.setValue(int(ls.get("divs", 0)))
             dv.setKeyboardTracking(False)
             dv.valueChanged.connect(lambda v: self._ls_set(i, "divs", int(v), True))
-            self._row(s2, "スイープ分割数", dv)
-            self._row(s2, "", "断面のメッシュを掃引方向に層状に押し出します（各層は2次四面体）")
+            self._row(s2, "スイープ分割数（層ごと）", dv)
+            self._row(s2, "要素の形", self._combo(
+                [("三角柱（Wedge15、薄い層向き）", "wedge"), ("四面体（三角柱を 3 分割）", "tet")],
+                ls.get("element", "wedge"), lambda v: self._ls_set(i, "element", v, True)))
+            ly = dspin(float(ls.get("layer_size", 0) or 0), 0.0, 1e6, 3, 0.1, "mm")
+            ly.setSpecialValueText("既定（要素サイズ）")
+            ly.valueChanged.connect(lambda v: self._ls_set(i, "layer_size", v))
+            self._row(s2, "厚さ方向の要素サイズ", ly)
+            self._row(s2, "", "断面（スイープ方向に垂直な面）を 1 枚の平面に重ねて三角形で切り、断面が変わる高さごとの"
+                      "層に押し出します。ボディ同士の境目は節点がそろいます。丸み付け・球など断面が一定でない形は"
+                      "スイープできません（四面体＋近接の捕捉を使ってください）。")
 
     def _scope_row(self, sec, faces, apply_fn):
         """Ansys と同じ「ジオメトリ: n 面 [適用] [キャンセル]」"""

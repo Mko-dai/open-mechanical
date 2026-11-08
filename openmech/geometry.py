@@ -1293,9 +1293,11 @@ def _layered_sweep_mesh(gmsh, ls, order, h, log, share=None, wedge=False):
     # ボディごとの体積の確認（CAD の体積と比べる）
     ev = np.abs(m.element_volumes())
     worst = 0.0
+    vcad = {}
     for v in vols:
-        V = occ.getMass(3, v)
-        mv = float(ev[eb == vbody[v]].sum())
+        vcad[vbody[v]] = vcad.get(vbody[v], 0.0) + occ.getMass(3, v)
+    for b, V in vcad.items():
+        mv = float(ev[eb == b].sum())
         if V > 0:
             worst = max(worst, abs(mv - V) / V)
     if worst > 0.05:
@@ -1372,7 +1374,10 @@ def mesh_quality(mesh) -> dict:
     要素品質: 正四面体 = 1（Ansys と同じ定義: C·V / √(Σ辺²)³）
     歪度: 体積基準（正四面体 = 0、つぶれた要素 = 1）
     アスペクト比: 最長辺 / 最短の高さ × √(2/3)（正四面体 = 1）
+    三角柱は _wedge_quality（要素品質は Ansys と同じ定義、歪度は角度基準）
     """
+    if getattr(mesh, "is_wedge", False):
+        return _wedge_quality(mesh)
     X = mesh.nodes[mesh.elems[:, :4]]
     e = [X[:, j] - X[:, i] for i, j in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))]
     l2 = np.stack([np.einsum("ij,ij->i", v, v) for v in e], 1)
@@ -1391,7 +1396,43 @@ def mesh_quality(mesh) -> dict:
     hmin = 3 * V / np.maximum(areas.max(1), 1e-300)
     ar = np.sqrt(l2.max(1)) / np.maximum(hmin, 1e-300) * np.sqrt(2.0 / 3.0)
     st = lambda v: {"最小": float(v.min()), "最大": float(v.max()), "平均": float(v.mean())}  # noqa: E731
-    return {"要素品質": st(q), "歪度": st(skew), "アスペクト比": st(ar), "_quality": q}
+    return {"要素品質": st(q), "歪度": st(skew), "アスペクト比": st(ar), "_quality": q, "_skew": skew, "_ar": ar}
+
+
+def _wedge_quality(mesh) -> dict:
+    """三角柱の品質（頂点 6 点で評価）
+
+    要素品質: C·V / √(Σ辺²)³（Ansys の Element Quality、三角柱の C = 62.35382。正三角形 × 高さ = 辺 で 1）
+    歪度: 面の内角の理想（三角形 60°、四角形 90°）からのずれの最大（等角歪度。0 = 理想、1 = つぶれ）
+    アスペクト比: 最長辺 / 最短辺
+    """
+    from .elements import WEDGE_QUAD_FACES, wedge_volumes
+    X = mesh.nodes[mesh.elems[:, :6]]
+    E9 = [(0, 1), (1, 2), (2, 0), (3, 4), (4, 5), (5, 3), (0, 3), (1, 4), (2, 5)]
+    l2 = np.stack([np.einsum("ij,ij->i", X[:, j] - X[:, i], X[:, j] - X[:, i]) for i, j in E9], 1)
+    V = np.abs(wedge_volumes(mesh.nodes, mesh.elems[:, :6]))
+    q = np.clip(62.35382 * V / np.sqrt(l2.sum(1)) ** 3, 0, 1)
+
+    def angles(P, cyc):
+        out = []
+        n = len(cyc)
+        for k in range(n):
+            a, b, c = P[:, cyc[k - 1]], P[:, cyc[k]], P[:, cyc[(k + 1) % n]]
+            u, v = a - b, c - b
+            cosv = np.einsum("ij,ij->i", u, v) / np.maximum(np.linalg.norm(u, axis=1) * np.linalg.norm(v, axis=1), 1e-300)
+            out.append(np.degrees(np.arccos(np.clip(cosv, -1, 1))))
+        return np.stack(out, 1)
+    sk = []
+    for cyc, th in (([0, 1, 2], 60.0), ([3, 4, 5], 60.0)):
+        a = angles(X, cyc)
+        sk.append(np.maximum((a.max(1) - th) / (180 - th), (th - a.min(1)) / th))
+    for f in WEDGE_QUAD_FACES:
+        a = angles(X, list(f))
+        sk.append(np.maximum((a.max(1) - 90) / 90, (90 - a.min(1)) / 90))
+    skew = np.clip(np.max(np.stack(sk, 1), axis=1), 0, 1)
+    ar = np.sqrt(l2.max(1) / np.maximum(l2.min(1), 1e-300))
+    st = lambda v: {"最小": float(v.min()), "最大": float(v.max()), "平均": float(v.mean())}  # noqa: E731
+    return {"要素品質": st(q), "歪度": st(skew), "アスペクト比": st(ar), "_quality": q, "_skew": skew, "_ar": ar}
 
 
 def tet10_jacobian_ratio(mesh) -> np.ndarray:
@@ -1688,8 +1729,9 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
         fix_msgs = []
         if sweeps:
             sw = sweeps[-1]
-            if len(gmsh.model.getEntities(3)) > 1 or sw.get("layered"):
-                mesh = _layered_sweep_mesh(gmsh, sw, order, h, log, share=share)
+            if len(gmsh.model.getEntities(3)) > 1 or sw.get("layered") or sw.get("element", "wedge") == "wedge":
+                mesh = _layered_sweep_mesh(gmsh, sw, order, h, log, share=share,
+                                           wedge=sw.get("element", "wedge") == "wedge")
             else:
                 mesh = _sweep_mesh(gmsh, sw, order, h, log)
         else:

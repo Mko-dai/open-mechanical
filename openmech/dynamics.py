@@ -64,7 +64,10 @@ def _poly_mul(a, b):
 
 
 def _tet_mass_ref(nn):
-    """要素の整合質量 = ρ V C（C は体積座標の多項式を厳密に積分した係数。合計 1）"""
+    """要素の整合質量 = ρ V C（C は体積座標の多項式を厳密に積分した係数。合計 1）。三角柱も同じ形で返す"""
+    if nn in (6, 15):
+        from .elements import wedge_mass_ref
+        return wedge_mass_ref(nn)
     if nn == 4:
         return (np.ones((4, 4)) + np.eye(4)) / 20.0
     e = lambda *idx: tuple(1 if i in idx else 0 for i in range(4))  # noqa: E731

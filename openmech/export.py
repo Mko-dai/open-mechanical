@@ -21,7 +21,7 @@ def write_vtu(path: str, result: Result):
     """VTK XML 非構造格子（バイナリ base64）。ParaView でそのまま開けます。"""
     m = result.mesh
     nn = m.elems.shape[1]
-    vtk_type = 24 if nn == 10 else 10
+    vtk_type = {10: 24, 4: 10, 6: 13, 15: 26}[nn]
     offsets = np.arange(1, m.n_elems + 1, dtype=np.int64) * nn
     point_data = {"Displacement": result.u.astype(np.float64)}
     for name, arr in result.fields().items():

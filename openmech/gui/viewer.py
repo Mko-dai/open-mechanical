@@ -35,6 +35,27 @@ def surface_polydata(mesh: Mesh, points: np.ndarray | None = None) -> tuple[pv.P
     """
     pts = mesh.nodes if points is None else points
     t = mesh.boundary_tris_full
+    if getattr(mesh, "is_wedge", False):
+        # 三角柱: 上下の三角形はそのまま（Tri6 は 4 分割）、側面の四角形は周の節点をつないだ多角形で描く
+        qof = mesh.boundary_quad_of
+        trow = np.nonzero(qof < 0)[0]
+        cells, src = [], []
+        tt = t[trow]
+        if tt.shape[1] == 6:
+            a, b, c, ab, bc, ca = tt.T
+            for x in [(a, ab, ca), (ab, b, bc), (ca, bc, c), (ab, bc, ca)]:
+                cells.append(np.hstack([np.full((len(tt), 1), 3), np.stack(x, 1)]).ravel())
+                src.append(trow)
+        else:
+            cells.append(np.hstack([np.full((len(tt), 1), 3), tt]).ravel())
+            src.append(trow)
+        q = mesh.boundary_quads_full
+        first = np.full(len(q), -1, dtype=np.int64)
+        qr = np.nonzero(qof >= 0)[0]
+        first[qof[qr][::-1]] = qr[::-1]                      # 四角形ごとに最初の三角形の行
+        cells.append(np.hstack([np.full((len(q), 1), q.shape[1]), q]).ravel())
+        src.append(first)
+        return pv.PolyData(pts.copy(), np.concatenate(cells)), np.concatenate(src)
     if t.shape[1] == 6:
         a, b, c, ab, bc, ca = t.T
         tris = np.concatenate([np.stack(x, 1) for x in
