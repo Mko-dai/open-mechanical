@@ -2723,6 +2723,9 @@ class MainWindow(QMainWindow):
             ms.setToolTip("この時間増分より小さい要素だけ質量を増やして計算を速くします（LS-DYNA の DT2MS）。0 = なし")
             ms.valueChanged.connect(lambda v: self._dyn_set("mass_scaling_dt", v))
             self._row(s, "質量スケーリングの目標時間増分", ms)
+            self._row(s, "大変形", self._combo([("オフ", False), ("オン（Total Lagrangian）", True)],
+                                            ds.large_deflection, lambda v: self._dyn_set("large_deflection", v)))
+            self._row(s, "", "材料に塑性（2直線・多直線）を設定すると、陽解法では自動で塑性を考慮します")
         else:
             ha = dspin(ds.hht_alpha, -1 / 3, 0, 3, 0.05)
             ha.setToolTip("0 = Newmark 平均加速度法（エネルギー保存）。負にすると高い周波数の振動を減衰")
