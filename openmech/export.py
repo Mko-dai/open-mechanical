@@ -87,7 +87,7 @@ def write_report(path: str, result: Result, bcs, title: str = "構造解析レ�
     doc = f"""<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">
 <title>{html.escape(title)}</title>
 <style>
-body{{font-family:-apple-system,"Hiragino Sans","Yu Gothic",sans-serif;max-width:900px;margin:2em auto;color:#222}}
+body{{font-family:-apple-system,"Hiragino Sans","Yu Gothic","Meiryo",sans-serif;max-width:900px;margin:2em auto;color:#222}}
 h1{{border-bottom:3px solid #1f6feb;padding-bottom:.3em}} h2{{margin-top:1.6em;color:#1f6feb}}
 table{{border-collapse:collapse;width:100%}} th,td{{border:1px solid #ccc;padding:6px 10px;text-align:left}}
 th{{background:#f3f6fa;width:40%}} figure{{margin:1em 0}} img{{max-width:100%;border:1px solid #ddd}}

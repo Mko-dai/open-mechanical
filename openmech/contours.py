@@ -27,7 +27,11 @@ VIEWS = {"VMC1": "below", "LE1": "xy", "LE10": "iso", "LAME": "xy", "HOLE": "hol
 
 def _font():
     for p in ("/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc", "/System/Library/Fonts/Hiragino Sans GB.ttc",
-              "/Library/Fonts/Arial Unicode.ttf", "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"):
+              "/Library/Fonts/Arial Unicode.ttf", "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+              # Windows（メイリオ・游ゴシック・MS ゴシック）
+              r"C:\Windows\Fonts\meiryo.ttc", r"C:\Windows\Fonts\YuGothM.ttc", r"C:\Windows\Fonts\msgothic.ttc",
+              # Linux（Noto CJK）
+              "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"):
         if os.path.exists(p):
             return p
     return None
