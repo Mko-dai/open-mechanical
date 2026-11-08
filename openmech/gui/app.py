@@ -27,7 +27,7 @@ import traceback
 import numpy as np
 from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QFont, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
-from PySide6.QtWidgets import (QApplication, QProgressDialog, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFrame,
+from PySide6.QtWidgets import (QApplication, QProgressDialog, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFrame, QSpinBox,
                                QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
                                QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
                                QPushButton, QSplitter, QTabWidget, QToolButton, QTreeWidget,
@@ -50,6 +50,7 @@ from ..materials import LIBRARY, Material
 from ..history import History
 from ..project import Project
 from ..nonlinear import solve_static
+from ..analyses import ANALYSIS_JP, EXTRA_TYPES
 from ..solver import BC, solve
 from .femtet_dialogs import BCDialog, BodyAttrDialog, FeatureDialog, MaterialDialog
 from .viewer import FIELD_EN, feature_edges, surface_polydata
@@ -59,9 +60,17 @@ from .viewer import FIELD_EN, feature_edges, surface_polydata
 BC_JP = {"fixed": "固定支持", "displacement": "変位", "force": "力", "pressure": "圧力",
          "moment": "モーメント", "gravity": "標準地球重力", "thermal": "熱条件",
          "symmetry": "対称領域", "frictionless": "摩擦なし支持"}
+from ..solver import BC_EXTRA_JP as _BCX  # noqa: E402
+BC_JP.update(_BCX)
 BC_COLORS = {"fixed": "#5a4fcf", "displacement": "#e8b100", "force": "#e03131",
              "pressure": "#d6336c", "moment": "#ae3ec9", "gravity": "#f08c00", "thermal": "#c92a2a",
              "symmetry": "#1c7ed6", "frictionless": "#7048e8"}
+BC_COLORS.update({"remote_force": "#c2255c", "remote_displacement": "#b8860b", "point_mass": "#495057",
+                  "elastic_support": "#2b8a3e", "cylindrical_support": "#364fc7", "bearing_load": "#e8590c",
+                  "spring": "#5f3dc4", "bolt_pretension": "#862e9c", "temperature": "#e03131",
+                  "heat_flux": "#f76707", "heat_flow": "#fd7e14", "convection": "#1098ad", "radiation": "#f59f00",
+                  "heat_generation": "#c92a2a", "insulation": "#868e96", "voltage": "#1971c2", "ground": "#343a40",
+                  "charge": "#9c36b5", "compression_only": "#2f9e44"})
 BC_UNIT = {"displacement": "mm", "force": "N", "pressure": "MPa", "moment": "N·mm", "gravity": "mm/s²",
            "thermal": "°C"}
 
@@ -81,7 +90,52 @@ RESULT_GROUPS = {
                  ("相当応力（下面） [MPa]", "相当応力（シェル下面）")],
     "接触ツール": [("接触:接触状態", "接触状態"), ("接触:接触圧 [MPa]", "接触圧"), ("接触:貫通量 [mm]", "貫通量"),
                ("接触:すべり距離 [mm]", "すべり距離"), ("接触:摩擦応力 [MPa]", "摩擦応力"), ("接触:隙間 [mm]", "隙間")],
+    "熱": [("温度 [°C]", "温度"), ("全熱流束 [W/m²]", "全熱流束"), ("方向熱流束 X [W/m²]", "方向熱流束 X"),
+          ("方向熱流束 Y [W/m²]", "方向熱流束 Y"), ("方向熱流束 Z [W/m²]", "方向熱流束 Z")],
+    "電気": [("電位 [V]", "電位"), ("電界の大きさ [V/mm]", "電界の大きさ"), ("電界 X [V/mm]", "電界 X"),
+           ("電界 Y [V/mm]", "電界 Y"), ("電界 Z [V/mm]", "電界 Z"), ("電束密度の大きさ [C/m²]", "電束密度")],
+    "振動": [("変位振幅 [mm]", "変位振幅（調和応答）"), ("変位 1σ（相対） [mm]", "変位 1σ（ランダム振動）"),
+           ("相当応力 1σ（Segalman） [MPa]", "相当応力 1σ（ランダム振動）")],
+    "疲労ツール": [("疲労:寿命 [回]", "寿命"), ("疲労:損傷度", "損傷度"), ("疲労:安全率（疲労）", "安全率（疲労）"),
+               ("疲労:応力振幅（補正後） [MPa]", "等価応力振幅")],
 }
+# 解析の種類ごとに最初に表示する結果
+DEFAULT_RESULTS = {"thermal": ["温度 [°C]", "全熱流束 [W/m²]"], "electrostatic": ["電位 [V]", "電界の大きさ [V/mm]"],
+                   "harmonic": ["変位振幅 [mm]", "相当応力（ミーゼス） [MPa]"],
+                   "random": ["変位 1σ（相対） [mm]", "相当応力 1σ（Segalman） [MPa]"],
+                   "modal": ["全変形 [mm]"], "buckling": ["全変形 [mm]"],
+                   "piezo": ["全変形 [mm]", "電位 [V]", "相当応力（ミーゼス） [MPa]"]}
+# 追加の境界条件: 種類 → (値の欄 [(ラベル, 単位, 既定値, 自由にできるか)], オプション)
+#   オプション: point（位置）, behavior（剛体/変形可）, bodies（ボディに与える）, ground（地面の点）
+BC_SPEC = {
+    "remote_force": ([("力 X", "N", 0.0, False), ("力 Y", "N", 0.0, False), ("力 Z", "N", -1000.0, False),
+                      ("モーメント X", "N·mm", 0.0, False), ("モーメント Y", "N·mm", 0.0, False),
+                      ("モーメント Z", "N·mm", 0.0, False)], {"point", "behavior"}),
+    "remote_displacement": ([("変位 X", "mm", 0.0, True), ("変位 Y", "mm", 0.0, True), ("変位 Z", "mm", 0.0, True),
+                             ("回転 X", "rad", 0.0, True), ("回転 Y", "rad", 0.0, True), ("回転 Z", "rad", 0.0, True)],
+                            {"point", "behavior"}),
+    "point_mass": ([("質量", "kg", 1.0, False), ("慣性モーメント Ixx", "kg·mm²", 0.0, False),
+                    ("慣性モーメント Iyy", "kg·mm²", 0.0, False), ("慣性モーメント Izz", "kg·mm²", 0.0, False)],
+                   {"point", "behavior"}),
+    "elastic_support": ([("基礎剛性（面積あたり）", "N/mm³", 10.0, False)], set()),
+    "cylindrical_support": ([("半径方向", "mm", 0.0, True), ("軸方向", "mm", None, True), ("接線方向", "mm", None, True)],
+                            set()),
+    "bearing_load": ([("力 X", "N", 0.0, False), ("力 Y", "N", -1000.0, False), ("力 Z", "N", 0.0, False)], set()),
+    "spring": ([("ばね定数", "N/mm", 1000.0, False), ("予荷重（引張 正）", "N", 0.0, False)], {"behavior", "ground"}),
+    "bolt_pretension": ([("予張力", "N", 10000.0, False)], {"point", "bodies"}),
+    "temperature": ([("温度", "°C", 100.0, False)], set()),
+    "heat_flux": ([("熱流束（入る向き 正）", "W/m²", 1000.0, False)], set()),
+    "heat_flow": ([("熱流量", "W", 10.0, False)], set()),
+    "convection": ([("熱伝達係数", "W/(m²·K)", 10.0, False), ("周囲温度", "°C", 22.0, False)], set()),
+    "radiation": ([("放射率", "", 0.8, False), ("周囲温度", "°C", 22.0, False)], set()),
+    "heat_generation": ([("内部発熱", "W/m³", 1e6, False)], {"bodies"}),
+    "voltage": ([("電圧", "V", 100.0, False)], set()),
+    "ground": ([], set()),
+    "charge": ([("電荷", "C", 1e-9, False)], set()),
+}
+NO_FACE_KINDS = ("gravity", "thermal", "heat_generation", "bolt_pretension")
+SUPPORT_LIKE = ("fixed", "displacement", "symmetry", "frictionless", "remote_displacement", "elastic_support",
+                "cylindrical_support", "spring")
 RESULT_NAME = {k: v for g in RESULT_GROUPS.values() for k, v in g}
 RESULT_TYPE_JP = {
     "全変形 [mm]": "全変形", "相当応力（ミーゼス） [MPa]": "相当 (von-Mises) 応力",
@@ -502,6 +556,19 @@ class MainWindow(QMainWindow):
         R.button(g, "支持", make_icon(BC_COLORS["fixed"], "支"), menu=self._bc_menu(["fixed", "displacement", "frictionless", "symmetry"]))
         for k in ["fixed", "displacement", "frictionless", "symmetry", "force", "pressure", "moment", "gravity", "thermal"]:
             R.button(g, BC_JP[k], make_icon(BC_COLORS[k], BC_JP[k][0]), lambda _=False, k=k: self.add_bc(k))
+        g = R.add_group(t, "リモート・接続")
+        R.button(g, "リモート", make_icon(BC_COLORS["remote_force"], "遠"),
+                 menu=self._bc_menu(["remote_force", "remote_displacement", "point_mass"]))
+        R.button(g, "支持（追加）", make_icon(BC_COLORS["cylindrical_support"], "円"),
+                 menu=self._bc_menu(["cylindrical_support", "elastic_support", "spring"]))
+        R.button(g, "ベアリング", make_icon(BC_COLORS["bearing_load"], "軸"), lambda: self.add_bc("bearing_load"))
+        R.button(g, "ボルト予張力", make_icon(BC_COLORS["bolt_pretension"], "ボ"), lambda: self.add_bc("bolt_pretension"))
+        g = R.add_group(t, "熱")
+        R.button(g, "熱荷重", make_icon(BC_COLORS["temperature"], "熱"),
+                 menu=self._bc_menu(["temperature", "heat_flux", "heat_flow", "convection", "radiation",
+                                     "heat_generation"]))
+        g = R.add_group(t, "電気")
+        R.button(g, "電極", make_icon(BC_COLORS["voltage"], "電"), menu=self._bc_menu(["voltage", "ground", "charge"]))
         g = R.add_group(t, "解析")
         R.button(g, "解析", make_icon("#2e9d3a", "⚡"), self.run_solve)
         self.tab_env = R.count() - 1
@@ -512,6 +579,8 @@ class MainWindow(QMainWindow):
             m = QMenu(self)
             for key, name in items:
                 menu_action(m, name, lambda k=key: self.add_result(k))
+            if grp == "ツール":
+                menu_action(m, "ユーザー定義結果（式）", lambda: self.add_result("式:SEQV"))
             R.button(g, grp, make_icon("#c0392b" if grp == "応力" else "#2c7fb8" if grp == "変形" else "#8e6c2e",
                                        grp[0]), menu=m)
         g = R.add_group(t, "表示")
@@ -1099,7 +1168,7 @@ class MainWindow(QMainWindow):
             return STATUS_PENDING if self.mesh_dirty else STATUS_OK
         if k == "bc":
             bc = self.project.bcs[node[1]]
-            return STATUS_ERROR if (bc.kind not in ("gravity", "thermal") and not bc.faces) else STATUS_OK
+            return STATUS_ERROR if (bc.kind not in NO_FACE_KINDS and not bc.faces) else STATUS_OK
         if k == "analysis":
             bad = any(self.status_of(("bc", i)) == STATUS_ERROR for i in range(len(self.project.bcs)))
             return STATUS_ERROR if bad or not self._has_support() else STATUS_OK
@@ -1110,7 +1179,7 @@ class MainWindow(QMainWindow):
         return STATUS_NONE
 
     def _has_support(self):
-        return any(b.kind in ("fixed", "displacement", "symmetry", "frictionless") for b in self.project.bcs)
+        return any(b.kind in SUPPORT_LIKE for b in self.project.bcs)
 
     # ======================================================================= ツリー
     # ======================================================================= 操作履歴
@@ -2622,6 +2691,31 @@ class MainWindow(QMainWindow):
         out = dict(r.fields())
         for k, v in (getattr(r, "contact", None) or {}).items():
             out["接触:" + k] = v
+        want = set(self.project.results)
+        if any(k.startswith("疲労:") for k in want) and not getattr(r, "only_extra", False):
+            try:
+                from ..postproc import fatigue
+                fo = (self.project.analysis_opts or {}).get("fatigue", {})
+                mat = self.project.material
+                if self.mesh is not None and self.mesh.elem_body is not None and self.project.materials:
+                    names = {self.project.assignment(b).get("mat") for b in self.mesh.body_ids()}
+                    names.discard(None)
+                    if len(names) == 1:
+                        mat = self.project.materials.get(names.pop(), mat)
+                f = fatigue(r.stress, mat, loading=fo.get("loading", "reversed"), ratio=fo.get("ratio", -1.0),
+                            scale=fo.get("scale", 1.0), mean_corr=fo.get("mean_corr", "none"),
+                            comp=fo.get("comp", "signed_vm"), design_life=fo.get("design_life", 1e9))
+                for k, v in f.items():
+                    out["疲労:" + k] = v
+            except ValueError as e:
+                self._fatigue_error = str(e)
+        for k in want:
+            if k.startswith("式:"):
+                try:
+                    from ..postproc import user_result
+                    out[k] = user_result(k[2:], out, self.mesh)
+                except Exception as e:  # noqa: BLE001
+                    self._expr_error = str(e)
         return out
 
     def _details_material(self):
@@ -2928,14 +3022,29 @@ class MainWindow(QMainWindow):
         self._row(sec, "ジオメトリ", w)
 
     def _analysis_label(self):
-        if self.project.analysis_type != "transient":
-            return "静的構造"
+        t = self.project.analysis_type
+        if t == "thermal":
+            return "過渡熱" if (self.project.analysis_opts or {}).get("thermal", {}).get("transient") else "定常熱"
+        if t in ANALYSIS_JP and t != "transient":
+            return ANALYSIS_JP[t]
         return "過渡構造（陽解法）" if (self.project.dynamic or {}).get("method") == "explicit" else "過渡構造（陰解法）"
 
     def _set_analysis_type(self, key):
         p = self.project
-        if key == "static":
-            p.analysis_type = "static"
+        if key in ("static",) + EXTRA_TYPES or key == "thermal_t":
+            p.analysis_type = "thermal" if key == "thermal_t" else key
+            if key in ("thermal", "thermal_t"):
+                o = dict(p.analysis_opts or {})
+                o["thermal"] = dict(o.get("thermal", {}), transient=(key == "thermal_t"))
+                p.analysis_opts = o
+            if p.analysis_type in DEFAULT_RESULTS:
+                p.results = list(DEFAULT_RESULTS[p.analysis_type])
+            elif not any(r in ("全変形 [mm]", "相当応力（ミーゼス） [MPa]") for r in p.results):
+                p.results = ["全変形 [mm]", "相当応力（ミーゼス） [MPa]"]
+            self.invalidate()
+            self.rebuild_tree()
+            self._later(self.build_details)
+            return
         else:
             p.analysis_type = "transient"
             d = dict(p.dynamic or {})
@@ -2949,10 +3058,18 @@ class MainWindow(QMainWindow):
 
     def _details_analysis(self):
         s = self._section("定義")
-        cur = "static" if self.project.analysis_type != "transient" else (self.project.dynamic or {}).get("method", "implicit")
+        p = self.project
+        t = p.analysis_type
+        cur = ((p.dynamic or {}).get("method", "implicit") if t == "transient" else
+               "thermal_t" if (t == "thermal" and (p.analysis_opts or {}).get("thermal", {}).get("transient")) else t)
         self._row(s, "解析タイプ", self._combo(
             [("静的構造", "static"), ("過渡構造（陰解法・Newmark / HHT）", "implicit"),
-             ("過渡構造（陽解法・LS-DYNA 方式）", "explicit")], cur, self._set_analysis_type))
+             ("過渡構造（陽解法・LS-DYNA 方式）", "explicit"), ("モーダル（固有振動数）", "modal"),
+             ("固有値座屈", "buckling"), ("定常熱", "thermal"), ("過渡熱", "thermal_t"),
+             ("調和応答（モード重ね合わせ）", "harmonic"), ("ランダム振動（PSD）", "random"),
+             ("静電場", "electrostatic"), ("圧電（静解析）", "piezo")], cur, self._set_analysis_type))
+        if t in EXTRA_TYPES or t == "static":
+            self._details_analysis_opts(s)
         if self.project.analysis_type == "transient":
             self._row(s, "", "時間・初速度・剛体壁などは「解析設定」で設定します。荷重（力・圧力・重力）は t=0 から"
                       "（またはランプ時間で）かかります。")
@@ -2967,6 +3084,99 @@ class MainWindow(QMainWindow):
             self.invalidate()
         et.valueChanged.connect(set_env)
         self._row(s2, "環境温度", et)
+
+    def _opt(self, key, value, sub=None, rebuild=False):
+        o = dict(self.project.analysis_opts or {})
+        if sub:
+            o[sub] = dict(o.get(sub, {}), **{key: value})
+        else:
+            o[key] = value
+        self.project.analysis_opts = o
+        self.invalidate()
+        if rebuild:
+            self._later(self.build_details)
+
+    def _details_analysis_opts(self, s):
+        """解析の種類ごとの設定（Ansys の解析設定に相当）"""
+        p = self.project
+        o = p.analysis_opts or {}
+        t = p.analysis_type
+
+        def ispin(key, val, lo, hi, label, sub=None):
+            w = QSpinBox()
+            w.setRange(lo, hi)
+            w.setValue(int(val))
+            w.valueChanged.connect(lambda v: self._opt(key, int(v), sub))
+            self._row(s, label, w)
+
+        def fspin(key, val, lo, hi, dec, step, unit, label, sub=None):
+            w = dspin(float(val), lo, hi, dec, step, unit)
+            w.valueChanged.connect(lambda v: self._opt(key, float(v), sub))
+            self._row(s, label, w)
+
+        if t == "static":
+            chk = QCheckBox("熱条件（温度・対流など）で定常熱解析を解き、その温度で熱応力を計算する")
+            chk.setChecked(bool(o.get("thermal_import")))
+            chk.toggled.connect(lambda v: self._opt("thermal_import", bool(v)))
+            self._row(s, "熱応力の連成", chk)
+        if t in ("modal", "harmonic", "random"):
+            ispin("n_modes", o.get("n_modes", 6 if t == "modal" else 20), 1, 500, "モード数")
+        if t == "modal":
+            fspin("f_min", o.get("f_min", 0.0), 0, 1e9, 3, 10, "Hz", "探す範囲の下限")
+            chk = QCheckBox("静解析の応力を含める（プリストレス）")
+            chk.setChecked(bool(o.get("prestress")))
+            chk.toggled.connect(lambda v: self._opt("prestress", bool(v)))
+            self._row(s, "プリストレス", chk)
+            self._row(s, "", "結果の「表示時間」でモードを切り替えます。変形・応力の大きさは相対値（質量正規化）")
+        if t == "buckling":
+            ispin("n_buckling", o.get("n_buckling", 3), 1, 50, "モード数")
+            self._row(s, "", "与えた荷重で静解析 → 座屈荷重係数（その何倍で座屈するか）")
+        if t == "thermal":
+            th = o.get("thermal", {})
+            fspin("init_temp", th.get("init_temp", 22.0), -273, 1e5, 2, 1, "°C", "初期温度", "thermal")
+            if th.get("transient"):
+                fspin("end_time", th.get("end_time", 1.0), 1e-9, 1e9, 4, 1, "s", "終了時間", "thermal")
+                ispin("n_steps", th.get("n_steps", 10), 1, 100000, "ステップ数", "thermal")
+            self._row(s, "", "材料の熱伝導率（過渡は密度・比熱も）が必要です。荷重は［環境］→［熱］から")
+        if t in ("harmonic", "random"):
+            fspin("zeta", o.get("zeta", 0.02), 0, 1, 4, 0.005, "", "減衰比")
+        if t == "harmonic":
+            fspin("f_min_h", o.get("f_min_h", 1.0), 0, 1e9, 3, 10, "Hz", "周波数の下限")
+            fspin("f_max_h", o.get("f_max_h", 1000.0), 0, 1e9, 3, 10, "Hz", "周波数の上限")
+            ispin("n_freq", o.get("n_freq", 100), 2, 100000, "周波数の点数")
+            ba = list(o.get("base_acc") or [0.0, 0.0, 0.0])
+            w = QWidget()
+            h = QHBoxLayout(w)
+            h.setContentsMargins(0, 0, 0, 0)
+            sps = []
+            for k in range(3):
+                sp = dspin(float(ba[k]), -1e6, 1e6, 4, 0.1)
+                sps.append(sp)
+                h.addWidget(sp)
+                sp.valueChanged.connect(lambda _=0: self._opt("base_acc", [x.value() for x in sps]))
+            self._row(s, "基礎加振 X, Y, Z [G]", w)
+            self._row(s, "", "基礎加振が 0 なら、荷重（力・圧力・重力）を振幅として使います。支持は固定")
+        if t == "random":
+            psd = o.get("psd") or [[20, 0.01], [2000, 0.01]]
+            ed = QLineEdit("; ".join(f"{a:g}, {b:g}" for a, b in psd))
+            ed.setToolTip("周波数 Hz, PSD G²/Hz を ; で区切る（例: 20, 0.01; 80, 0.04; 350, 0.04; 2000, 0.007）")
+
+            def set_psd():
+                try:
+                    rows = [[float(x) for x in r.split(",")] for r in ed.text().split(";") if r.strip()]
+                    assert len(rows) >= 2 and all(len(r) == 2 for r in rows)
+                    self._opt("psd", rows)
+                except Exception:  # noqa: BLE001
+                    QMessageBox.warning(self, "PSD", "「周波数, 値; 周波数, 値; …」の形で入力してください")
+            ed.editingFinished.connect(set_psd)
+            self._row(s, "加速度 PSD [Hz, G²/Hz]", ed)
+            d = list(o.get("psd_dir", [0, 0, 1]))
+            self._row(s, "入力の方向", self._combo([("X", "X"), ("Y", "Y"), ("Z", "Z")], "XYZ"[int(np.argmax(np.abs(d)))],
+                                               lambda v: self._opt("psd_dir", [float(v == a) for a in "XYZ"])))
+        if t == "electrostatic":
+            self._row(s, "", "材料の比誘電率を使います。電極は［環境］→［電気］の電圧・接地")
+        if t == "piezo":
+            self._row(s, "", "圧電材料（材料の piezo: 圧電定数 e・誘電率）と電極（電圧・接地）、支持が必要です")
 
     def _combo(self, items, current, on_change):
         c = QComboBox()
@@ -3277,7 +3487,7 @@ class MainWindow(QMainWindow):
             h.addWidget(ap)
             h.addStretch()
             self._row(s, "ジオメトリ", w)
-        elif bc.kind != "gravity":
+        elif bc.kind not in NO_FACE_KINDS:
             s = self._section("スコープ")
             self._scope_row(s, bc.faces, lambda faces: self._bc_apply(i, faces))
         s2 = self._section("定義")
@@ -3300,6 +3510,8 @@ class MainWindow(QMainWindow):
             sp.valueChanged.connect(lambda v: self._bc_value(i, 0, v))
             self._row(s2, "大きさ（温度）", sp)
             self._row(s2, "", f"材料の物性をこの温度で評価し、熱ひずみ α(T − 参照温度) を与えます（環境温度 {self.project.env_temp:g}°C）")
+        elif bc.kind in BC_SPEC:
+            self._details_bc_spec(i, bc, s2)
         elif bc.kind == "pressure":
             self._row(s2, "定義方法", "垂直方向")
             sp = ExprEdit(bc.exprs.get(0, bc.values[0] or 0), suffix=unit)
@@ -3348,6 +3560,88 @@ class MainWindow(QMainWindow):
             for c, ax in enumerate("XYZ"):
                 self._row(s3, f"{ax} 成分", f"{r[c]:.6g} N")
             self._row(s3, "合計", f"{np.linalg.norm(r):.6g} N")
+
+    def _details_bc_spec(self, i, bc, sec):
+        """追加の境界条件（リモート・ばね・熱・電気など）の詳細: 値の欄と位置・挙動"""
+        fields, opts = BC_SPEC[bc.kind]
+        vals = list(bc.values) + [None] * max(0, len(fields) - len(bc.values))
+        bc.values = vals[:max(len(fields), len(bc.values))]
+        for c, (lab, unit, dflt, can_free) in enumerate(fields):
+            v = vals[c]
+            if can_free:
+                w = QWidget()
+                h = QHBoxLayout(w)
+                h.setContentsMargins(0, 0, 0, 0)
+                cb = QComboBox()
+                cb.addItems(["自由", "固定値"])
+                cb.setCurrentIndex(0 if v is None else 1)
+                sp = dspin(0.0 if v is None else float(v), -1e12, 1e12, 6, 0.1, unit)
+                sp.setEnabled(v is not None)
+                cb.currentIndexChanged.connect(lambda idx, c=c, sp=sp: (sp.setEnabled(idx == 1),
+                                               self._bc_value(i, c, sp.value() if idx == 1 else None)))
+                sp.valueChanged.connect(lambda val, c=c, cb=cb: cb.currentIndex() == 1 and self._bc_value(i, c, val))
+                h.addWidget(cb)
+                h.addWidget(sp)
+                self._row(sec, lab, w)
+            else:
+                sp = ExprEdit(bc.exprs.get(c, float(v or 0.0)), suffix=unit)
+                sp.rawChanged.connect(lambda val, c=c: self._bc_value(i, c, val))
+                self._row(sec, lab, sp)
+        if "behavior" in opts:
+            self._row(sec, "挙動", self._combo([("変形可（RBE3）", "deformable"), ("剛体", "rigid")],
+                                             (bc.options or {}).get("behavior", "deformable"),
+                                             lambda v: self._bc_opt(i, "behavior", v)))
+        if "point" in opts or "ground" in opts:
+            key = "point" if "point" in opts else "ground"
+            cur = list(bc.point) if key == "point" else list((bc.options or {}).get("ground", []))
+            w = QWidget()
+            h = QHBoxLayout(w)
+            h.setContentsMargins(0, 0, 0, 0)
+            sps = []
+            for k in range(3):
+                sp = dspin(float(cur[k]) if len(cur) == 3 else 0.0, -1e9, 1e9, 4, 1.0)
+                sps.append(sp)
+                h.addWidget(sp)
+            auto = QCheckBox("面の重心" if key == "point" else "")
+            auto.setChecked(len(cur) != 3)
+            if key == "point":
+                h.addWidget(auto)
+
+            def apply_pt(*_):
+                pt = [] if (key == "point" and auto.isChecked()) else [sp.value() for sp in sps]
+                if key == "point":
+                    bc.point = pt
+                else:
+                    bc.options = dict(bc.options or {}, ground=pt)
+                self.invalidate()
+            for sp in sps:
+                sp.valueChanged.connect(apply_pt)
+            auto.toggled.connect(apply_pt)
+            self._row(sec, "位置 X, Y, Z [mm]" if key == "point" else "地面の点 X, Y, Z [mm]", w)
+        if bc.kind == "bolt_pretension":
+            self._row(sec, "ボルトのボディ", self._combo(
+                [(self._body_label(b), int(b)) for b in (self.mesh.body_ids() if self.mesh is not None else [0])],
+                int((bc.options or {}).get("body", 0)), lambda v: self._bc_opt(i, "body", int(v))))
+            self._row(sec, "", "断面は「位置」を通りボルトの軸（ボディの長手方向）に垂直な面。"
+                               "ステップ 1 で予張力、ステップ 2 で長さを固定して外力をかけます（Ansys と同じ）")
+        if bc.kind == "heat_generation":
+            self._row(sec, "", "「ボディ」選択で対象のボディを選び、もう一度この欄を開いて適用（空 = すべて）")
+            ap = QPushButton("選択中のボディに適用")
+            ap.clicked.connect(lambda: (setattr(bc, "bodies", list(self.selected_bodies)), self.invalidate()))
+            self._row(sec, "ボディ", ap)
+        notes = {"cylindrical_support": "円筒面に設定。各方向を「固定値」（0 = 固定）か「自由」に",
+                 "elastic_support": "面の法線方向のばね（Ansys の弾性支持）",
+                 "spring": "面（剛体結合）と地面の点を結ぶ、線の方向のばね",
+                 "bearing_load": "穴の内面に設定。力の向きに押される半分に分布します",
+                 "convection": "q = h (T∞ − T)", "radiation": "周囲への放射 q = εσ (T∞⁴ − T⁴)",
+                 "remote_force": "変形可は面を硬くしない（RBE3）。剛体は面を剛体として結ぶ"}
+        if bc.kind in notes:
+            self._row(sec, "", notes[bc.kind])
+
+    def _bc_opt(self, i, key, value):
+        bc = self.project.bcs[i]
+        bc.options = dict(bc.options or {}, **{key: value})
+        self.invalidate()
 
     def _bc_apply(self, i, faces):
         self.project.bcs[i].faces = list(faces)
@@ -3462,7 +3756,9 @@ class MainWindow(QMainWindow):
             st = self._section("時間")
             c = QComboBox()
             for j, r in enumerate(self.results):
-                if getattr(r, "history", None) is not None:
+                if getattr(r, "label", None):
+                    c.addItem(r.label, j)
+                elif getattr(r, "history", None) is not None:
                     c.addItem(f"時刻 {getattr(r, 'time', 0):.4g} s", j)
                 else:
                     c.addItem(f"ステップ {r.info.get('ステップ', j + 1)}（{getattr(r, 'time', j + 1):g} s）", j)
@@ -3473,13 +3769,15 @@ class MainWindow(QMainWindow):
                 self.result = self.results[self.result_index]
                 self._later(lambda: (self.build_details(), self.refresh_view()))
             c.currentIndexChanged.connect(pick)
-            self._row(st, "表示時間", c)
+            self._row(st, "モード" if getattr(self.results[-1], "modal_table", None) else
+                      "周波数" if getattr(self.results[-1], "frf", None) is not None else "表示時間", c)
             if getattr(self.results[-1], "history", None) is not None:
                 hb = QPushButton("時刻歴グラフ（エネルギー・接触力）…")
                 hb.clicked.connect(lambda: self._later(self.show_history_plot))
                 self._row(st, "", hb)
         s2 = self._section("定義")
-        self._row(s2, "タイプ", RESULT_TYPE_JP.get(key, RESULT_NAME.get(key, key)))
+        self._row(s2, "タイプ", RESULT_TYPE_JP.get(key, RESULT_NAME.get(key, key[2:] if key.startswith("式:") else key)))
+        self._details_result_tools(key)
         self._row(s2, "単位", key.split("[")[-1].rstrip("]") if "[" in key else "なし")
         if self.result is not None:
             vals = np.asarray(self._fields(self.result).get(key, []), float)
@@ -3505,17 +3803,24 @@ class MainWindow(QMainWindow):
 
     # ======================================================================= 追加・削除
     def add_bc(self, kind):
-        faces = [] if kind in ("gravity", "thermal") else list(self.selected_faces)
-        vals = {"fixed": [0.0, 0.0, 0.0], "displacement": [0.0, None, None], "force": [0.0, 0.0, -1000.0],
-                "pressure": [1.0], "moment": [0.0, 0.0, 1000.0], "gravity": [0.0, 0.0, -9806.65],
-                "thermal": [100.0], "symmetry": [], "frictionless": []}[kind]
+        faces = [] if kind in NO_FACE_KINDS else list(self.selected_faces)
+        if kind in BC_SPEC:
+            vals = [d for _, _, d, _ in BC_SPEC[kind][0]]
+        else:
+            vals = {"fixed": [0.0, 0.0, 0.0], "displacement": [0.0, None, None], "force": [0.0, 0.0, -1000.0],
+                    "pressure": [1.0], "moment": [0.0, 0.0, 1000.0], "gravity": [0.0, 0.0, -9806.65],
+                    "thermal": [100.0], "symmetry": [], "frictionless": []}[kind]
         bc = BC(kind, faces, vals, "")
-        if kind == "thermal":
+        if kind in BC_SPEC and "behavior" in BC_SPEC[kind][1]:
+            bc.options = {"behavior": "rigid" if kind == "spring" else "deformable"}
+        if kind == "bolt_pretension":
+            bc.options = {"body": int(self.selected_bodies[0]) if self.selected_bodies else 0}
+        if kind in ("thermal", "heat_generation"):
             bc.bodies = list(self.selected_bodies)
         self.project.bcs.append(bc)
         self.invalidate()
         self.select_node(("bc", len(self.project.bcs) - 1))
-        if kind not in ("gravity", "thermal") and not faces:
+        if kind not in NO_FACE_KINDS and not faces:
             self.log(f"{BC_JP[kind]} を追加しました。面を選択して詳細の「適用」を押してください。")
 
     def add_result(self, key):
@@ -3681,16 +3986,124 @@ class MainWindow(QMainWindow):
         else:
             QApplication.restoreOverrideCursor()
 
+    def _details_result_tools(self, key):
+        """モードの表・周波数応答・パス結果・疲労の設定・結果の式"""
+        from .charts import chart_dialog, table_dialog
+        r = self.result
+        if key.startswith("式:"):
+            s = self._section("ユーザー定義結果")
+            ed = QLineEdit(key[2:])
+            ed.setToolTip("使える名前: UX UY UZ USUM SX SY SZ SXY SYZ SXZ SEQV S1 S3 TEMP X Y Z、関数 sqrt abs max min …")
+
+            def set_expr():
+                i = self.current[1]
+                self.project.results[i] = "式:" + ed.text().strip()
+                self._later(lambda: (self.rebuild_tree(), self.select_node(("result", i))))
+            ed.editingFinished.connect(set_expr)
+            self._row(s, "式", ed)
+            if getattr(self, "_expr_error", ""):
+                self._row(s, "", "⚠ " + self._expr_error)
+                self._expr_error = ""
+        if key.startswith("疲労:"):
+            s = self._section("疲労ツール（応力寿命）")
+            fo = (self.project.analysis_opts or {}).get("fatigue", {})
+            from ..postproc import MEAN_CORR, STRESS_COMP
+            self._row(s, "荷重の種類", self._combo([("両振り（R = −1）", "reversed"), ("片振り（R = 0）", "zero"),
+                                                  ("応力比を指定", "ratio")], fo.get("loading", "reversed"),
+                                                 lambda v: self._opt("loading", v, "fatigue", rebuild=True)))
+            if fo.get("loading") == "ratio":
+                w = dspin(float(fo.get("ratio", -1.0)), -1e3, 1, 3, 0.1)
+                w.valueChanged.connect(lambda v: (self._opt("ratio", v, "fatigue"), self.refresh_view()))
+                self._row(s, "応力比 R", w)
+            w = dspin(float(fo.get("scale", 1.0)), 0, 1e6, 4, 0.1)
+            w.valueChanged.connect(lambda v: (self._opt("scale", v, "fatigue"), self.refresh_view()))
+            self._row(s, "倍率", w)
+            self._row(s, "平均応力補正", self._combo([(v, k) for k, v in MEAN_CORR.items()], fo.get("mean_corr", "none"),
+                                                   lambda v: (self._opt("mean_corr", v, "fatigue"), self.refresh_view())))
+            self._row(s, "応力の成分", self._combo([(v, k) for k, v in STRESS_COMP.items()], fo.get("comp", "signed_vm"),
+                                                lambda v: (self._opt("comp", v, "fatigue"), self.refresh_view())))
+            w = dspin(float(fo.get("design_life", 1e9)), 1, 1e15, 0, 1e6, "回")
+            w.valueChanged.connect(lambda v: (self._opt("design_life", v, "fatigue"), self.refresh_view()))
+            self._row(s, "設計寿命", w)
+            self._row(s, "", "材料の S-N 曲線（材料の sn_table）を使います。構造用鋼には代表的な曲線が入っています")
+            if getattr(self, "_fatigue_error", ""):
+                self._row(s, "", "⚠ " + self._fatigue_error)
+                self._fatigue_error = ""
+        if r is None:
+            return
+        tools = self._section("グラフ・表")
+        if getattr(r, "modal_table", None):
+            b = QPushButton("モードの一覧（振動数・有効質量）…")
+            b.clicked.connect(lambda: table_dialog(self, "モードの一覧", r.modal_table))
+            self._row(tools, "", b)
+        if getattr(r, "frf", None) is not None:
+            b = QPushButton("周波数応答のグラフ…")
+
+            def frf():
+                f, a = r.frf
+                chart_dialog(self, "周波数応答（全節点の最大変位振幅）", "周波数 [Hz]", "変位振幅 [mm]",
+                             [("最大変位振幅", f, a)], logy=True)
+            b.clicked.connect(frf)
+            self._row(tools, "", b)
+        if getattr(r, "thermal", None) is not None and r.thermal.reactions:
+            for bi, qv in r.thermal.reactions.items():
+                self._row(tools, f"熱流量（{self.project.bcs[bi].label() if bi < len(self.project.bcs) else bi}）",
+                          f"{qv:.6g} W")
+        b = QPushButton("パスに沿ったグラフ…")
+        b.clicked.connect(lambda: self._path_plot(key))
+        self._row(tools, "", b)
+
+    def _path_plot(self, key):
+        from .charts import chart_dialog
+        from ..postproc import path_values
+        if self.result is None or self.mesh is None:
+            return
+        vals = self._fields(self.result).get(key)
+        if vals is None:
+            return
+        lo, hi = self.mesh.bounds()
+        dlg = QDialog(self)
+        dlg.setWindowTitle("パス（始点と終点）")
+        lay = QVBoxLayout(dlg)
+        sp = []
+        for lab, pt in (("始点", lo), ("終点", hi)):
+            h = QHBoxLayout()
+            h.addWidget(QLabel(lab + " X, Y, Z [mm]"))
+            row = []
+            for k in range(3):
+                w = dspin(float(pt[k]), -1e9, 1e9, 4, 1.0)
+                row.append(w)
+                h.addWidget(w)
+            sp.append(row)
+            lay.addLayout(h)
+        if len(self.selected_faces) >= 1:
+            lay.addWidget(QLabel("（面を選んでいれば、その重心が初期値になります）"))
+        ok = QPushButton("グラフを表示")
+        ok.clicked.connect(dlg.accept)
+        lay.addWidget(ok)
+        info = {f["id"]: f for f in self.mesh.face_info()}
+        if len(self.selected_faces) >= 2:
+            for row, fid in zip(sp, self.selected_faces[:2]):
+                for k in range(3):
+                    row[k].setValue(float(info[int(fid)]["centroid"][k]))
+        if dlg.exec() != QDialog.Accepted:
+            return
+        p0 = [w.value() for w in sp[0]]
+        p1 = [w.value() for w in sp[1]]
+        d, v = path_values(self.mesh, vals, p0, p1, 101)
+        chart_dialog(self, f"パス結果: {RESULT_NAME.get(key, key)}", "始点からの距離 [mm]", key, [(key, d, v)])
+
     def run_solve(self):
         if self.worker and self.worker.isRunning():
             return
-        bad = [b for b in self.project.bcs if b.kind not in ("gravity", "thermal") and not b.faces]
+        bad = [b for b in self.project.bcs if b.kind not in NO_FACE_KINDS and not b.faces]
         if bad:
             QMessageBox.warning(self, "解析", "面が割り当てられていない荷重・支持があります（? マーク）。\n"
                                 "面を選択して詳細の「適用」を押してください。")
             return
         transient = self.project.analysis_type == "transient"
-        if not self._has_support() and not transient:
+        free_ok = self.project.analysis_type in ("modal", "thermal", "electrostatic")
+        if not self._has_support() and not transient and not free_ok:
             QMessageBox.warning(self, "解析", "支持がありません。「固定支持」などを追加してください。")
             return
         if self.mesh is None or self.mesh_dirty:
@@ -3712,6 +4125,15 @@ class MainWindow(QMainWindow):
         bad_c = [c.name for c in p.contacts if not c.suppressed and not (c.contact_faces and c.target_faces)]
         if bad_c:
             QMessageBox.warning(self, "接触", "面が割り当てられていない接触領域があります: " + ", ".join(bad_c))
+            return
+        if (p.analysis_type in EXTRA_TYPES or any(b.kind == "bolt_pretension" for b in p.bcs)
+                or (p.analysis_type == "static" and (p.analysis_opts or {}).get("thermal_import"))):
+            self._busy(True, f"{self._analysis_label()}を実行しています…")
+            self.worker = Worker(p.run_all, self.mesh)
+            self.worker.log.connect(lambda m: (self.solver_log.append(m), self.log(m)))
+            self.worker.done.connect(self._on_solved)
+            self.worker.failed.connect(self._on_solve_failed)
+            self.worker.start()
             return
         if transient:
             from ..dynamics import DynamicSettings, solve_dynamic
@@ -4227,6 +4649,14 @@ class MainWindow(QMainWindow):
             return f": {bc.values[0]:g} MPa"
         if bc.kind == "thermal":
             return f": {bc.values[0]:g} °C"
+        if bc.kind in BC_SPEC:
+            fl = BC_SPEC[bc.kind][0]
+            if not fl:
+                return ""
+            if len(fl) == 1 or bc.kind in ("convection", "radiation", "spring"):
+                return ": " + ", ".join(f"{v:g} {u}".strip() for v, (_, u, _, _) in zip(bc.values, fl) if v is not None)
+            mag = float(np.linalg.norm([v or 0 for v in bc.values[:3]]))
+            return f": {mag:g} {fl[0][1]}"
         vals = [v for v in bc.values[:3]]
         if bc.kind in ("force", "moment", "gravity"):
             mag = float(np.linalg.norm([v or 0 for v in vals]))
@@ -4235,7 +4665,7 @@ class MainWindow(QMainWindow):
 
     def _bc_anchor(self, bc):
         if not bc.faces:
-            if bc.kind in ("gravity", "thermal"):
+            if bc.kind in NO_FACE_KINDS:
                 lo, hi = self.mesh.bounds()
                 return 0.5 * (lo + hi)
             return None

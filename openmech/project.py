@@ -49,6 +49,8 @@ class Project:
     params: list = field(default_factory=list)
     mesh_size_expr: str = ""                            # メッシュサイズの式（空 = 数値のみ）
     parametric: dict = field(default_factory=dict)      # パラメトリック解析の設定と最後の結果
+    # 解析の種類ごとの設定（モーダルのモード数・熱の過渡設定・調和応答の周波数範囲など。analyses.py）
+    analysis_opts: dict = field(default_factory=dict)
 
     def share_map(self) -> dict:
         """{ボディ番号: パート番号}（節点を共有するボディのグループ）"""
@@ -157,7 +159,8 @@ class Project:
                 "settings": self.settings.to_dict(),
                 "share_topology": self.share_topology, "parts": self.parts, "env_temp": self.env_temp,
                 "analysis_type": self.analysis_type, "dynamic": self.dynamic,
-                "params": self.params, "mesh_size_expr": self.mesh_size_expr, "parametric": self.parametric}
+                "params": self.params, "mesh_size_expr": self.mesh_size_expr, "parametric": self.parametric,
+                "analysis_opts": self.analysis_opts}
 
     @staticmethod
     def from_dict(d) -> "Project":
@@ -183,7 +186,7 @@ class Project:
                        env_temp=d.get("env_temp", 22.0),
                        analysis_type=d.get("analysis_type", "static"), dynamic=d.get("dynamic", {}),
                        params=d.get("params", []), mesh_size_expr=d.get("mesh_size_expr", ""),
-                       parametric=d.get("parametric", {}))
+                       parametric=d.get("parametric", {}), analysis_opts=d.get("analysis_opts", {}))
 
     # ------------------------------------------------------------- 変数・式
     def env(self, overrides=None) -> dict:
@@ -256,6 +259,10 @@ class Project:
     def run_all(self, mesh=None, log=print, progress=None):
         mesh = mesh if mesh is not None else self.mesh(log=log)
         em = self.elem_materials(mesh)
+        from .analyses import EXTRA_TYPES, run_extra
+        if self.analysis_type in EXTRA_TYPES or any(b.kind == "bolt_pretension" for b in self.bcs) \
+                or (self.analysis_opts or {}).get("thermal_import"):
+            return run_extra(self, mesh, em, log=log, progress=progress)
         if self.analysis_type == "transient":
             from .dynamics import DynamicSettings, solve_dynamic
             return solve_dynamic(mesh, self.material, self.bcs, DynamicSettings.from_dict(self.dynamic),

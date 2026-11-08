@@ -1,0 +1,165 @@
+"""解析の種類ごとの実行（Project.run_all から呼ぶ）。どの解析も GUI で表示できる Result のリストを返す。
+
+analysis_type:
+  modal       モーダル          opts: n_modes, f_min, prestress（静解析の応力を含める）
+  buckling    固有値座屈        opts: n_buckling
+  thermal     定常熱 / 過渡熱   opts: thermal = ThermalSettings の内容
+  harmonic    調和応答          opts: n_modes, f_min_h, f_max_h, n_freq, zeta, base_acc（基礎加振の加速度振幅 [G] 3 成分 or 空）
+  random      ランダム振動      opts: n_modes, psd（[[Hz, G²/Hz], ...]）, psd_dir, zeta
+  electrostatic 静電場
+  piezo       圧電（静解析）
+static でボルト予張力があるとき、または opts.thermal_import（熱解析の温度で熱応力）のときもここを通る。
+"""
+from __future__ import annotations
+
+import numpy as np
+
+from .solver import Result, material_D, nodal_stress, solve
+
+EXTRA_TYPES = ("modal", "buckling", "thermal", "harmonic", "random", "electrostatic", "piezo")
+ANALYSIS_JP = {"static": "静的構造", "modal": "モーダル", "buckling": "固有値座屈", "thermal": "熱",
+               "harmonic": "調和応答", "random": "ランダム振動", "electrostatic": "静電場", "piezo": "圧電",
+               "transient": "過渡構造"}
+G = 9806.65
+
+
+def _field_result(mesh, material, extra: dict, info: dict, t=1.0, label=None) -> Result:
+    z = np.zeros((mesh.n_nodes, 6))
+    r = Result(mesh, material, np.zeros((mesh.n_nodes, 3)), z, z, {}, dict(info))
+    r.extra = extra
+    r.only_extra = True
+    r.time = t
+    if label:
+        r.label = label
+    return r
+
+
+def _mode_results(mesh, material, mr, em_pair):
+    """モード形 → Result（変形はモード形、応力は同じ倍率の相対値）"""
+    if em_pair is not None:
+        mats, em = em_pair
+        D = np.stack([material_D(m) for m in mats])
+    else:
+        D, em = material_D(material), None
+    out = []
+    table = mr.table()
+    for i in range(mr.n_modes):
+        u = mr.modes[i]
+        st, sn = nodal_stress(mesh, u.ravel(), D, elem_mat=em)
+        r = Result(mesh, material, u, st, sn, {}, dict(mr.info))
+        r.time = float(i + 1)
+        if mr.kind == "buckling":
+            r.info["座屈荷重係数"] = float(mr.load_factors[i])
+            r.label = f"モード {i + 1}（荷重係数 {mr.load_factors[i]:.5g}）"
+        else:
+            r.info["振動数 [Hz]"] = float(mr.freqs[i])
+            r.label = f"モード {i + 1}（{mr.freqs[i]:.5g} Hz）"
+        r.modal_table = table
+        r.mode_shape = True          # 変形・応力は相対値（大きさに意味はない）
+        out.append(r)
+    return out
+
+
+def run_extra(project, mesh, em, log=print, progress=None):
+    p = project
+    o = dict(p.analysis_opts or {})
+    t = p.analysis_type
+    mat = p.material
+    if t == "modal":
+        from .modal import solve_modal
+        Ks = None
+        if o.get("prestress"):
+            from .modal import gauss_stress_fn, stress_stiffness
+            st = solve(mesh, mat, p.bcs, log=log, elem_materials=em)
+            mats, eidx = em if em is not None else ([mat], np.zeros(mesh.n_elems, int))
+            D = np.stack([material_D(m) for m in mats])
+            Ks = stress_stiffness(mesh, gauss_stress_fn(mesh, st.u.ravel(), D, np.asarray(eidx)))
+            log("プリストレス付きモーダル: 静解析の応力による剛性を含めます")
+        mr = solve_modal(mesh, mat, p.bcs, n_modes=int(o.get("n_modes", 6)), f_min=float(o.get("f_min", 0.0)),
+                         elem_materials=em, log=log, progress=progress, K_sigma=Ks)
+        return _mode_results(mesh, mat, mr, em)
+    if t == "buckling":
+        from .modal import solve_buckling
+        mr = solve_buckling(mesh, mat, p.bcs, n_modes=int(o.get("n_buckling", 3)), elem_materials=em, log=log,
+                            progress=progress)
+        out = [mr.prestress] + _mode_results(mesh, mat, mr, em)
+        mr.prestress.label = "静解析（与えた荷重）"
+        mr.prestress.time = 0.0
+        return out
+    if t == "thermal":
+        from .thermal import ThermalSettings, solve_thermal
+        res = solve_thermal(mesh, mat, p.bcs, ThermalSettings.from_dict(o.get("thermal", {})), elem_materials=em,
+                            log=log, progress=progress)
+        out = []
+        for r in res:
+            fr = _field_result(mesh, mat, r.fields(), r.info, r.time,
+                               f"時間 {r.time:g} s" if o.get("thermal", {}).get("transient") else "定常")
+            fr.thermal = r
+            fr.reactions_heat = r.reactions
+            out.append(fr)
+        p._last_temperature = res[-1].T          # 熱応力に使う
+        return out
+    if t in ("harmonic", "random"):
+        from .modal import solve_modal
+        from .vibration import solve_harmonic, solve_random
+        nm = int(o.get("n_modes", 20))
+        mr = solve_modal(mesh, mat, p.bcs, n_modes=nm, elem_materials=em, log=log)
+        if t == "harmonic":
+            ba = o.get("base_acc")
+            base = np.asarray(ba, float) * G if ba and any(ba) else None
+            h = solve_harmonic(mr, mesh, mat, p.bcs, float(o.get("f_min_h", 1.0)), float(o.get("f_max_h", 1000.0)),
+                               int(o.get("n_freq", 100)), zeta=float(o.get("zeta", 0.02)), base_acc=base, log=log)
+            amp = h.max_amplitude()
+            # 表示する周波数: 応答のピーク（大きい順に最大 8 個）＋指定の周波数
+            pk = [k for k in range(1, len(amp) - 1) if amp[k] >= amp[k - 1] and amp[k] >= amp[k + 1]]
+            pk = sorted(sorted(pk, key=lambda k: -amp[k])[:8])
+            fs = [float(h.freqs[k]) for k in pk] + [float(x) for x in o.get("show_freqs", [])]
+            if not fs:
+                fs = [float(h.freqs[int(np.argmax(amp))])]
+            mats_D = (np.stack([material_D(m) for m in em[0]]), np.asarray(em[1])) if em is not None else (None, None)
+            out = []
+            for f in sorted(set(fs)):
+                r = h.at(f, mat, D=mats_D[0], elem_mat=mats_D[1])
+                r.label = f"{r.info['周波数 [Hz]']:.5g} Hz"
+                r.frf = (h.freqs, amp)
+                r.harmonic = h
+                out.append(r)
+            return out
+        psd = o.get("psd") or [[20, 0.01], [2000, 0.01]]
+        r = solve_random(mr, mesh, mat, psd, direction=o.get("psd_dir", [0, 0, 1]), zeta=float(o.get("zeta", 0.02)),
+                         elem_materials=em, log=log)
+        r.label = "1σ"
+        return [r]
+    if t == "electrostatic":
+        from .electric import solve_electrostatic
+        r = solve_electrostatic(mesh, mat, p.bcs, elem_materials=em, log=log)
+        return [_field_result(mesh, mat, r.fields(), r.info)]
+    if t == "piezo":
+        from .electric import solve_piezo_static
+        r, _ = solve_piezo_static(mesh, mat, p.bcs, elem_materials=em, log=log)
+        return [r]
+    # 静的構造（ボルト予張力・熱解析の温度の取り込み）
+    if o.get("thermal_import"):
+        from .thermal import ThermalSettings, solve_thermal, thermal_stress
+        th = solve_thermal(mesh, mat, p.bcs, ThermalSettings.from_dict(o.get("thermal", {})), elem_materials=em,
+                           log=log)
+        T = th[-1].T
+        r = thermal_stress(mesh, mat, p.bcs, T, elem_materials=em, log=log)
+        r.extra = {"温度 [°C]": T}
+        return [r]
+    if any(b.kind == "bolt_pretension" for b in p.bcs):
+        from .bolt import solve_pretension
+        if p.needs_nonlinear_solver(mesh):
+            from .nonlinear import solve_static
+
+            def fn(bcs, emm):
+                return solve_static(mesh, mat, bcs, p.contacts, p.settings, elem_materials=emm,
+                                    log=lambda *a: None, contact_tolerance=p.contact_tolerance)[-1]
+        else:
+            def fn(bcs, emm):
+                return solve(mesh, mat, bcs, log=lambda *a: None, elem_materials=emm)
+        res = solve_pretension(mesh, mat, p.bcs, fn, elem_materials=em, log=log)
+        for r in res:
+            r.label = r.info.get("解析", "")
+        return res
+    return [solve(mesh, mat, p.bcs, log=log, elem_materials=em)]

@@ -514,6 +514,8 @@ class Result:
 
     def fields(self) -> dict:
         """表示用の結果一覧 {名前: (N,) 配列}"""
+        if getattr(self, "only_extra", False):
+            return dict(getattr(self, "extra", None) or {})
         p = self.principal
         out = {
             "全変形 [mm]": self.disp_mag,
@@ -537,6 +539,12 @@ class Result:
         return out
 
     def summary(self) -> dict:
+        if getattr(self, "only_extra", False):
+            out = {}
+            for k, v in (getattr(self, "extra", None) or {}).items():
+                out[f"{k} 最大"] = float(np.nanmax(v))
+                out[f"{k} 最小"] = float(np.nanmin(v))
+            return out
         vm = self.von_mises
         i = int(np.argmax(vm))
         d = {
