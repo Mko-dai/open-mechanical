@@ -314,6 +314,17 @@ def face_load_weights(mesh: Mesh, faces):
 
 # ---------------------------------------------------------------------------- 境界条件
 
+# 追加の境界条件（remote.py / thermal.py / electric.py で処理）
+BC_EXTRA_JP = {"remote_force": "リモート荷重", "remote_displacement": "リモート変位", "point_mass": "点質量",
+               "elastic_support": "弾性支持", "cylindrical_support": "円筒支持", "bearing_load": "ベアリング荷重",
+               "bolt_pretension": "ボルト予張力", "spring": "ばね（ボディ－地面）", "compression_only": "圧縮のみ支持",
+               "temperature": "温度", "heat_flux": "熱流束", "heat_flow": "熱流量", "convection": "対流",
+               "radiation": "放射", "heat_generation": "内部発熱", "insulation": "断熱",
+               "voltage": "電圧", "charge": "電荷", "ground": "接地"}
+SUPPORT_KINDS = ("fixed", "displacement", "symmetry", "frictionless", "remote_displacement", "elastic_support",
+                 "cylindrical_support", "spring")
+
+
 @dataclass
 class BC:
     """境界条件・荷重の定義。
@@ -334,6 +345,8 @@ class BC:
     step_factors: list = field(default_factory=list)  # ステップごとの倍率（空ならすべて 1）
     bodies: list = field(default_factory=list)        # 熱条件などボディに与える条件（空 = すべてのボディ）
     exprs: dict = field(default_factory=dict)         # 成分ごとの式 {成分番号: "F/2"}（values には評価値）
+    point: list = field(default_factory=list)         # リモートポイント・ばねの位置 [x,y,z]（空 = 面の重心）
+    options: dict = field(default_factory=dict)       # 挙動（rigid/deformable）・軸・ボディなど種類ごとの設定
 
     def to_dict(self):
         d = {"kind": self.kind, "faces": list(map(int, self.faces)),
@@ -346,17 +359,23 @@ class BC:
             d["bodies"] = [int(b) for b in self.bodies]
         if self.exprs:
             d["exprs"] = {str(k): str(v) for k, v in self.exprs.items()}
+        if self.point:
+            d["point"] = [float(x) for x in self.point]
+        if self.options:
+            d["options"] = dict(self.options)
         return d
 
     @staticmethod
     def from_dict(d):
         return BC(d["kind"], d.get("faces", []), d.get("values", [0, 0, 0]), d.get("name", ""),
                   d.get("nodes", []), d.get("step_factors", []), d.get("bodies", []),
-                  {int(k): v for k, v in d.get("exprs", {}).items()})
+                  {int(k): v for k, v in d.get("exprs", {}).items()}, list(d.get("point", [])),
+                  dict(d.get("options", {})))
 
     def label(self) -> str:
         jp = {"symmetry": "対称領域", "frictionless": "摩擦なし支持", "fixed": "固定支持", "displacement": "強制変位", "force": "力",
-              "pressure": "圧力", "moment": "モーメント", "gravity": "重力加速度", "thermal": "熱条件"}
+              "pressure": "圧力", "moment": "モーメント", "gravity": "重力加速度", "thermal": "熱条件",
+              **{k: v for k, v in BC_EXTRA_JP.items()}}
         name = self.name or jp.get(self.kind, self.kind)
         unit = {"force": "N", "pressure": "MPa", "moment": "N·mm",
                 "gravity": "mm/s²", "displacement": "mm", "thermal": "°C"}.get(self.kind, "")
@@ -422,8 +441,8 @@ def build_load_and_constraints(mesh: Mesh, material: Material, bcs: list[BC], rh
             f = wi[:, None] * np.cross(omega, r)
             for c in range(3):
                 F[3 * idx + c] += f[:, c]
-        elif bc.kind == "thermal":
-            pass   # 熱条件は材料（温度での物性と熱ひずみ）として扱う
+        elif bc.kind == "thermal" or bc.kind in BC_EXTRA_JP:
+            pass   # 熱条件は材料として、リモート・ばね・円筒支持などは remote.py で扱う
         elif bc.kind == "gravity":
             acc = np.asarray(bc.values, float)
             if rho_e is None:
@@ -586,7 +605,7 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
         if progress:
             progress(x, msg)
 
-    if not any(b.kind in ("fixed", "displacement", "symmetry", "frictionless") for b in bcs):
+    if not any(b.kind in SUPPORT_KINDS for b in bcs):
         raise ValueError("拘束（固定支持 または 強制変位）がありません。少なくとも1つ設定してください。")
     mats, elem_mat, rho_e = None, None, None
     if elem_materials is not None:
@@ -609,6 +628,23 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
     F, fixed = build_load_and_constraints(mesh, material, bcs, rho_e=rho_e)
     if eps_th_m is not None:
         F = F + thermal_load_vector(mesh, D, elem_mat, eps_th_m)
+    from .remote import REMOTE_KINDS, extra_terms, pad
+    ex = None
+    if any(b.kind in REMOTE_KINDS for b in bcs):
+        acc = next((np.asarray(b.values, float) for b in bcs if b.kind == "gravity"), None)
+        ex = extra_terms(mesh, bcs, float(np.mean(np.abs(K.diagonal()))), acc=acc)
+        for note in ex.notes:
+            log(note)
+        K = pad(K, ex.n) + ex.K()
+        F = pad(F, ex.n) + ex.Fvec()
+        fixed.update(ex.fixed)
+        if (ex.direct or ex.mpc) and method == "auto":
+            method = "direct"
+    T_mpc = None
+    if ex is not None and ex.mpc:
+        from .remote import reduce_system
+        K_full, F_full = K, F
+        K, F, fixed, T_mpc = reduce_system(K, F, fixed, ex, float(np.mean(np.abs(K.diagonal()[:3 * mesh.n_nodes]))))
     ndof = K.shape[0]
     cdofs = np.fromiter(fixed.keys(), dtype=np.int64)
     cvals = np.fromiter(fixed.values(), dtype=float)
@@ -624,11 +660,23 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
     prog(0.45, f"連立方程式を解いています（自由度 {Kff.shape[0]:,}）…")
     t1 = time.time()
     dof_ids = np.nonzero(free)[0]
-    coords = np.column_stack([mesh.nodes[dof_ids // 3], dof_ids % 3])
+    nb = 3 * mesh.n_nodes
+    dn = np.minimum(dof_ids, nb - 1) if T_mpc is None else np.zeros(len(dof_ids), dtype=np.int64)
+    coords = np.column_stack([mesh.nodes[dn // 3], dn % 3])
     sl = mesh.sweep_lines() if getattr(mesh, "is_wedge", False) else None
-    lines = sl[dof_ids // 3] if sl is not None else None
+    lines = sl[dn // 3] if (sl is not None and ex is None) else None
     with np.errstate(all="ignore"):
-        uf = _linear_solve(Kff, rhs, log, coords=coords, method=method, lines=lines)
+        if ex is not None and ex.direct:
+            # ペナルティ（剛体結合・円筒支持）で条件数が大きいので、一度分解して反復改良で精度を上げる
+            fac = factorize(Kff.tocsc(), log)
+            uf = fac(rhs)
+            for _ in range(5):
+                rr = rhs - Kff @ uf
+                if np.linalg.norm(rr) <= 1e-12 * max(np.linalg.norm(rhs), 1e-300):
+                    break
+                uf = uf + fac(rr)
+        else:
+            uf = _linear_solve(Kff, rhs, log, coords=coords, method=method, lines=lines)
     if not np.all(np.isfinite(uf)):
         raise RuntimeError("解が求まりませんでした。拘束が不足して物体が自由に動ける状態"
                            "（剛体運動）になっていないか確認してください。")
@@ -639,21 +687,38 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
     u[free] = uf
     t_sol = time.time() - t1
     prog(0.85, "応力を計算中…")
-    stress, strain = nodal_stress(mesh, u, D, elem_mat=elem_mat, eps_th_m=eps_th_m)
     R = np.zeros(ndof)                  # 拘束していない自由度は釣り合い（≈0）
     R[cdofs] = Kc @ u - F[cdofs]
+    if T_mpc is not None:
+        # 反力は縮約した式の残差（独立自由度）を元の番号に戻す
+        R_r = R
+        u = T_mpc @ u
+        R = np.zeros(K_full.shape[0])
+        R[T_mpc.keep] = R_r
+    u_pilot = u[nb:]
+    u = u[:nb]
+    stress, strain = nodal_stress(mesh, u, D, elem_mat=elem_mat, eps_th_m=eps_th_m)
     reactions = {}
     for i, bc in enumerate(bcs):
         if bc.kind in ("fixed", "displacement", "symmetry", "frictionless"):
             nodes = mesh.face_nodes(bc.faces) if bc.faces else np.asarray(bc.nodes, dtype=np.int64)
-            reactions[i] = R.reshape(-1, 3)[nodes].sum(0)
+            reactions[i] = R[:nb].reshape(-1, 3)[nodes].sum(0)
+    reaction_moments = {}
+    if ex is not None:
+        for i, dofs in ex.reaction_dofs.items():
+            reactions[i] = R[dofs][:3].copy()
+            reaction_moments[i] = R[dofs][3:].copy()
     prog(1.0, "完了")
     info = {"自由度数": int(free.sum()), "節点数": mesh.n_nodes, "要素数": mesh.n_elems,
             "要素タイプ": "Tet10（2次）" if mesh.order == 2 else "Tet4（1次）",
             "使用コア数": get_threads(), "ソルバー": choose_method(int(free.sum()), method),
             "組立時間 [s]": round(t_asm, 2), "求解時間 [s]": round(t_sol, 2),
             "合計時間 [s]": round(time.time() - t0, 2), "相対残差": float(res)}
-    return Result(mesh, material, u.reshape(-1, 3), stress, strain, reactions, info, mats, elem_mat)
+    r = Result(mesh, material, u.reshape(-1, 3), stress, strain, reactions, info, mats, elem_mat)
+    r.reaction_moments = reaction_moments
+    if ex is not None and ex.pilots:
+        r.pilots = {i: (p, u_pilot[d0 - nb:d0 - nb + 6]) for i, p, d0 in ex.pilots}
+    return r
 
 
 def _cg(A, b, M, tol=1e-10, maxiter=5000):
@@ -751,6 +816,46 @@ def choose_method(n: int, method: str = "auto") -> str:
     if n > AUTO_ITERATIVE_DOF[d] and _amg_available():
         return "amg"
     return d
+
+
+def factorize(A, log=print):
+    """対称正定値（または対称）行列 A を一度だけ分解し、x = A⁻¹ b を返す関数を作る（固有値解析のシフト逆反復用）"""
+    n = A.shape[0]
+    d = _direct_backend()
+    if d == "pardiso":
+        try:
+            import pypardiso
+            solver = pypardiso.PyPardisoSolver()
+            Ac = A.tocsr()
+            solver.factorize(Ac)
+            log("  分解: PARDISO")
+            return lambda b: solver.solve(Ac, b)
+        except Exception:
+            pass
+    if d == "cholmod":
+        try:
+            from sksparse.cholmod import cholesky
+            f = cholesky(A.tocsc())
+            log("  分解: CHOLMOD")
+            return f
+        except Exception:
+            pass
+    from scipy.sparse.csgraph import reverse_cuthill_mckee
+    p = reverse_cuthill_mckee(A.tocsr(), symmetric_mode=True)
+    Ap = A[p][:, p].tocsc()
+    lu = spla.splu(Ap, permc_spec="NATURAL", diag_pivot_thresh=0.0, options=dict(SymmetricMode=True))
+    log("  分解: SciPy SuperLU")
+
+    def sol(b):
+        b = np.asarray(b)
+        if b.ndim == 1:
+            x = np.empty(n)
+            x[p] = lu.solve(b[p])
+        else:
+            x = np.empty_like(b, dtype=float)
+            x[p] = lu.solve(np.ascontiguousarray(b[p]))
+        return x
+    return sol
 
 
 def _linear_solve(A: sp.csc_matrix, b: np.ndarray, log=print, coords=None,

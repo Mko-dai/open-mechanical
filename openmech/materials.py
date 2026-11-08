@@ -44,6 +44,14 @@ class Material:
     plasticity: str = "none"
     tangent_modulus: float = 0.0
     ml_table: list = field(default_factory=list)
+    # 熱（Ansys Engineering Data の「等方熱伝導率」「比熱」）
+    conductivity: float = 0.0     # 熱伝導率 [W/(m·K)]（0 = 未設定）
+    specific_heat: float = 0.0    # 比熱 [J/(kg·K)]
+    # 電気（静電場・圧電）
+    permittivity: float = 1.0     # 比誘電率 εr
+    piezo: dict = field(default_factory=dict)   # 圧電: {"e": 6×3 の圧電定数 e [C/m²]（応力型）, "eps_s": [ε11,ε22,ε33] 比誘電率（ひずみ一定）}
+    # 疲労（S-N 曲線）: [[繰返し数, 応力振幅 MPa], ...]（両対数で補間）
+    sn_table: list = field(default_factory=list)
 
     @property
     def density_t_mm3(self) -> float:
@@ -200,5 +208,23 @@ LIBRARY: dict[str, Material] = {m.name: m for m in [
     Material("PA66（ナイロン）", 3000, 0.39, 1140, 80, 85),
     Material("PC（ポリカーボネート）", 2400, 0.37, 1200, 62, 65),
 ]}
+
+# 熱伝導率 [W/(m·K)]・比熱 [J/(kg·K)]・線膨張係数 [1/°C]（一般的な値）
+_THERMAL = {"構造用鋼 (Structural Steel)": (60.5, 434, 1.2e-5), "SS400": (51.6, 473, 1.17e-5),
+            "S45C": (47.5, 486, 1.17e-5), "ステンレス SUS304": (16.3, 500, 1.73e-5),
+            "アルミ合金 A5052": (137, 900, 2.38e-5), "アルミ合金 A6061-T6": (167, 896, 2.36e-5),
+            "アルミ合金 A7075-T6": (130, 960, 2.36e-5), "チタン合金 Ti-6Al-4V": (6.7, 526, 8.6e-6),
+            "ねずみ鋳鉄 FC250": (48, 460, 1.1e-5), "銅 C1100": (391, 385, 1.7e-5), "黄銅 C2801": (121, 380, 2.0e-5),
+            "ABS樹脂": (0.17, 1400, 8.0e-5), "POM（ジュラコン）": (0.23, 1470, 1.1e-4),
+            "PA66（ナイロン）": (0.25, 1700, 8.0e-5), "PC（ポリカーボネート）": (0.2, 1200, 6.8e-5)}
+for _n, (_k, _c, _a) in _THERMAL.items():
+    if _n in LIBRARY:
+        LIBRARY[_n].conductivity, LIBRARY[_n].specific_heat = _k, _c
+        if not LIBRARY[_n].alpha:
+            LIBRARY[_n].alpha = _a
+# 構造用鋼の S-N 曲線（Ansys Engineering Data の構造用鋼の代表的な形: 平均応力 0、両振り）
+LIBRARY["構造用鋼 (Structural Steel)"].sn_table = [
+    [10, 3999], [20, 2827], [50, 1896], [100, 1413], [200, 1069], [2000, 441], [10000, 262], [20000, 214],
+    [1e5, 138], [2e5, 114], [1e6, 86.2]]
 
 DEFAULT = "構造用鋼 (Structural Steel)"
