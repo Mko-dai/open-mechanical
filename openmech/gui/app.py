@@ -2602,7 +2602,54 @@ class MainWindow(QMainWindow):
             off = dspin(c.offset, -1e6, 1e6, 4, 0.01, "mm")
             off.valueChanged.connect(st("offset"))
             self._row(s, "オフセット", off)
-        self._row(s, "接触ジオメトリ修正", "なし")
+        th = dict(c.thread or {})
+        on = bool(th.get("axis"))
+        cb = QComboBox()
+        cb.addItem("なし", False)
+        cb.addItem("ボルトねじ", True)
+        cb.setCurrentIndex(1 if on else 0)
+
+        def set_thread(_=None, cb=cb):
+            if cb.currentData():
+                faces = c.contact_faces or []
+                ax, pt = [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]
+                if self.mesh is not None and faces:
+                    # 円筒面の軸を推定: 面の節点の主成分（最も長い方向）
+                    X = self.mesh.nodes[self.mesh.face_nodes(faces)]
+                    cen = X.mean(0)
+                    w_, V = np.linalg.eigh(np.cov((X - cen).T))
+                    ax, pt = V[:, int(np.argmax(w_))].tolist(), cen.tolist()
+                self._contact_set(i, "thread", dict(th or {}, point=pt, axis=ax, half_angle=th.get("half_angle", 30.0),
+                                                     pitch=th.get("pitch", 1.5)), True)
+            else:
+                self._contact_set(i, "thread", {}, True)
+        cb.currentIndexChanged.connect(set_thread)
+        self._row(s, "接触ジオメトリ修正", cb)
+        if on:
+            def tset(k, j=None):
+                def f(v):
+                    t2 = dict(c.thread)
+                    if j is None:
+                        t2[k] = float(v)
+                    else:
+                        lst = list(t2.get(k, [0, 0, 0]))
+                        lst[j] = float(v)
+                        t2[k] = lst
+                    self._contact_set(i, "thread", t2)
+                return f
+            for k, lab in (("point", "軸上の点"), ("axis", "軸の向き")):
+                for j, xyz in enumerate("XYZ"):
+                    sp = dspin(float(th[k][j]), -1e6, 1e6, 4, 1.0)
+                    sp.valueChanged.connect(tset(k, j))
+                    self._row(s, f"{lab} {xyz}", sp)
+            ha = dspin(float(th.get("half_angle", 30.0)), 1.0, 89.0, 2, 1.0, "°")
+            ha.valueChanged.connect(tset("half_angle"))
+            self._row(s, "ねじ山の半角（メートルねじ 30°）", ha)
+            pc = dspin(float(th.get("pitch", 1.5)), 0.01, 100.0, 3, 0.25, "mm")
+            pc.valueChanged.connect(tset("pitch"))
+            self._row(s, "ピッチ（記録用）", pc)
+            self._row(s, "", "円筒の接触面を、ねじ山の 2 つの斜面として扱います（軸方向の力がねじ山を通り、"
+                             "tan(半角) 倍の半径方向の力が出ます）。軸は面の形から推定しています。")
         self._row(s, "ターゲットジオメトリ修正", "なし")
 
     def _scope_row_named(self, sec, label, faces, apply_fn):
