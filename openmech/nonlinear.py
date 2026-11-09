@@ -208,26 +208,25 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
 
     # 荷重・拘束（境界条件ごと）
     from .remote import REMOTE_KINDS
-    NL_OK = ("elastic_support", "cylindrical_support", "bearing_load")
-    bad = sorted({b.kind for b in bcs if b.kind in REMOTE_KINDS and b.kind not in NL_OK
-                  and not (b.kind == "remote_force" and (b.options or {}).get("behavior", "deformable") != "rigid")})
-    if bad:
-        from .solver import BC_EXTRA_JP
-        raise ValueError("接触・大変形・塑性などの非線形解析では、次の条件にまだ対応していません: "
-                         + "、".join(BC_EXTRA_JP.get(k, k) for k in bad)
-                         + "（リモート荷重は「変形可」、支持は弾性支持・円筒支持なら使えます）")
     per_bc = [build_load_and_constraints(mesh, mats[0], [bc], rho_e=rho_e) for bc in bcs]
-    ex_bcs = [i for i, b in enumerate(bcs) if b.kind in REMOTE_KINDS]
-    if ex_bcs:
+    nb = ndof
+    ex = None
+    if any(b.kind in REMOTE_KINDS for b in bcs):
+        # リモートポイント・ばね・弾性支持・円筒支持など: パイロットの 6 自由度を後ろに足し、
+        # 多点拘束（剛体・RBE3）は各反復の連立方程式で消去する（remote.reduce_system）
         from .remote import extra_terms
-        for i in ex_bcs:
-            exi = extra_terms(mesh, [bcs[i]], 1.0)
-            if exi.F:
-                Fi = np.zeros(ndof)
-                for d, v in exi.F.items():
-                    if d < ndof:
-                        Fi[d] += v
-                per_bc[i] = (Fi, {})
+        vol0 = np.abs(mesh.element_volumes())
+        h0 = float(np.cbrt(np.median(vol0) * 6 * np.sqrt(2))) if len(vol0) else 1.0
+        kref = float(np.mean([m.E for m in mats])) * h0
+        acc = next((np.asarray(b.values, float) for b in bcs if b.kind == "gravity"), None)
+        ex = extra_terms(mesh, bcs, kref, acc=acc)
+        ndof = ex.n
+        for note in ex.notes:
+            log(note)
+        for i, b in enumerate(bcs):
+            if b.kind in REMOTE_KINDS:
+                per_bc[i] = (ex.Fvec_of(i), dict(ex.fixed_by.get(i, {})))
+    per_bc = [(np.r_[Fi, np.zeros(ndof - len(Fi))] if len(Fi) < ndof else Fi, fx) for Fi, fx in per_bc]
     ends = settings.end_times()
 
     th_bcs = [bc for bc in bcs if bc.kind == "thermal"]
@@ -243,15 +242,17 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
         F = np.zeros(ndof)
         fixed = {}
         if F_th is not None:
-            F += th_factor(t) * F_th
+            F[:nb] += th_factor(t) * F_th
         for bc, (Fi, fx) in zip(bcs, per_bc):
             f = _step_factor(bc, t, ends)
             if bc.kind in ("fixed", "symmetry", "frictionless"):
                 for d in fx:
                     fixed[d] = 0.0
-            elif bc.kind == "displacement":
+            elif bc.kind in ("displacement", "remote_displacement"):
                 for d, v in fx.items():
                     fixed[d] = f * v
+                if bc.kind == "remote_displacement":
+                    F += f * Fi
             else:
                 F += f * Fi
         return F, fixed
@@ -289,23 +290,10 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
         diagK = (K_lin.diagonal() if K_lin is not None else assemble_stiffness(mesh, D, elem_mat=elem_mat).diagonal())
         k_weak = 1e-8 * float(np.mean(np.abs(diagK)))
     W = sp.identity(ndof, format="csr") * k_weak if k_weak > 0 else None
-    if ex_bcs:
-        # 弾性支持・円筒支持の剛性（線形のばね）を、弱いばねと同じ形で足す（ペナルティの荷重は per_bc 側）
-        from .remote import extra_terms
-        kref = float(np.mean(np.abs((K_lin if K_lin is not None else assemble_stiffness(mesh, D, elem_mat=elem_mat)
-                                     ).diagonal())))
-        exk = extra_terms(mesh, [bcs[i] for i in ex_bcs], kref).K()
-        exk = exk[:ndof][:, :ndof]
-        if any(bcs[i].kind == "cylindrical_support" for i in ex_bcs):
-            # 円筒支持の強制変位（0 以外）の荷重は kref で作り直す
-            for i in ex_bcs:
-                if bcs[i].kind == "cylindrical_support":
-                    exi = extra_terms(mesh, [bcs[i]], kref)
-                    Fi = np.zeros(ndof)
-                    for d, v in exi.F.items():
-                        Fi[d] += v
-                    per_bc[i] = (Fi, {})
-        W = exk if W is None else (W + exk)
+    if ex is not None:
+        exk = ex.K()
+        if exk.nnz:
+            W = exk if W is None else (W + exk)
     from .parallel import set_threads
     set_threads(settings.n_cores)
     # 接触の剛性で条件が悪くなるため、非線形では既定で直接法
@@ -313,12 +301,21 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
 
     cur_t = [0.0]
 
-    def internal(u):
+    def internal_base(u):
         if ps is not None:
             return ps.internal(u, th_factor(cur_t[0]), large=LD)
         if LD:
             return tl_internal(mesh, D, elem_mat, u)
         return K_lin @ u, K_lin
+
+    if ex is None:
+        internal = internal_base
+    else:
+        from .remote import pad as _pad
+
+        def internal(u):
+            fi, Kb = internal_base(u[:nb])
+            return np.r_[fi, np.zeros(ndof - nb)], _pad(Kb, ndof)
 
     nonlinear = LD or nonlinear_contact or al or plastic
     history = []
@@ -334,6 +331,45 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
             p.lam_n, p.lam_t, p.active, p.stick = a.copy(), b.copy(), c.copy(), d.copy()
             p.tau_c, p.dt_c = e.copy(), f.copy()
 
+    def _contact(uu):
+        Kc, fc = contact_system(pairs, contacts, nb, uu[:nb])
+        if ndof > nb:
+            from .remote import pad as _pad
+            Kc, fc = _pad(Kc, ndof), np.r_[fc, np.zeros(ndof - nb)]
+        return Kc, fc
+
+    # 多点拘束の変換 u = T ũ（独立自由度 ũ）。収束の判定もこの独立自由度の残差 Tᵀ R で行う
+    Tm0 = None
+    if ex is not None and ex.mpc:
+        from .remote import reduce_system as _rs
+        Tm0 = _rs(sp.identity(ndof, format="csr"), np.zeros(ndof), {}, ex, 1.0)[3]
+        Tm0T = Tm0.T.tocsr()
+        _newidx = -np.ones(ndof, dtype=np.int64)
+        _newidx[Tm0.keep] = np.arange(len(Tm0.keep))
+        free_r = np.ones(len(Tm0.keep), bool)
+        _cr = _newidx[cdofs]
+        free_r[_cr[_cr >= 0]] = False
+
+    pen_state = {}
+
+    def res_norms(Rv, uu=None):
+        """収束判定に使う残差（自由な自由度）と反力（拘束した自由度）の大きさ。
+        変形可のリモート変位（従属の自由度の拘束）はペナルティのばねの力も釣り合いに含める"""
+        if Tm0 is None:
+            return np.linalg.norm(Rv[free]), np.linalg.norm(Rv[~free])
+        Rr = Tm0T @ Rv
+        react = np.linalg.norm(Rr[~free_r])
+        if uu is not None and pen_state.get("fix"):
+            from .remote import PENALTY
+            kp = PENALTY * pen_state["kref"]
+            ur = uu[Tm0.keep]
+            for d, v in pen_state["fix"].items():
+                trow = Tm0[d]
+                fpen = -kp * (float((trow @ ur)[0]) - v) * np.asarray(trow.todense()).ravel()
+                Rr = Rr + fpen
+                react = max(react, np.linalg.norm(fpen))
+        return np.linalg.norm(Rr[free_r]), react
+
     def equilibrium(t, u0):
         """時刻 t の釣り合いを解く。収束しなければ ConvergenceError"""
         u = u0.copy()
@@ -341,6 +377,15 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
         F, fixed = loads_at(t)
         vals = np.array([fixed.get(int(d), 0.0) for d in cdofs])
         u[cdofs] = vals
+        slave_fix = {}
+        if Tm0 is not None:
+            # 拘束した独立自由度（パイロットの強制変位）を従属の節点にも反映して、拘束式を満たす位置から始める
+            u = Tm0 @ u[Tm0.keep]
+            ind = _newidx[cdofs] >= 0
+            u[cdofs[ind]] = vals[ind]
+            # 従属の自由度の強制変位（変形可のリモート変位のパイロット）はペナルティで目標へ
+            slave_fix = {int(d): float(v) for d, v, k in zip(cdofs, vals, ind) if not k}
+            pen_state["fix"] = slave_fix
         max_it = settings.max_iterations if nonlinear else 1
         for it in range(1, max_it + 1):
             # 塑性: 1回目は前の釣り合い位置の接線で、強制変位の増分を全体に広げる（弾性予測子）。
@@ -349,7 +394,7 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
             ue = u0 if predictor else u
             fint, KT = internal(ue)
             if pairs:
-                Kc, fc = contact_system(pairs, contacts, ndof, ue)
+                Kc, fc = _contact(ue)
             else:
                 Kc, fc = None, np.zeros(ndof)
             Kt = KT if Kc is None else (KT + Kc)
@@ -361,10 +406,32 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
             if predictor and len(cdofs):
                 R = R - Kt[:, cdofs] @ (vals - u0[cdofs])
             Rf = R[free]
-            ref = max(np.linalg.norm(F[free]), np.linalg.norm(R[~free]), 1e-12)
-            Kff = Kt[free][:, free].tocsc()
-            with np.errstate(all="ignore"):
-                du_f = _linear_solve(Kff, Rf, lambda *a: None, method=method)
+            if ex is not None and ex.mpc:
+                # 多点拘束を消去した式で増分を解く（拘束した自由度の増分は 0）
+                from .remote import reduce_system
+                fx_inc = {int(d): 0.0 for d in cdofs}
+                if slave_fix:
+                    ucur = Tm0 @ u[Tm0.keep]
+                    for d, v in slave_fix.items():
+                        fx_inc[d] = v - ucur[d]
+                pen_state["kref"] = float(np.mean(np.abs(Kt.diagonal()[:nb])))
+                Kr, Rr, fr, Tm = reduce_system(Kt.tocsr(), R, fx_inc, ex, pen_state["kref"])
+                fre = np.ones(Kr.shape[0], bool)
+                if fr:
+                    fre[np.fromiter(fr.keys(), dtype=np.int64)] = False
+                Kff = Kr[fre][:, fre].tocsc()
+                Rf_r = Rr[fre]
+                with np.errstate(all="ignore"):
+                    dr = np.zeros(Kr.shape[0])
+                    dr[fre] = _linear_solve(Kff, Rf_r, lambda *a: None, method="direct")
+                du_f = (Tm @ dr)[free]
+                Rf_lin = Rf_r
+                du_lin = dr[fre]
+            else:
+                Kff = Kt[free][:, free].tocsc()
+                with np.errstate(all="ignore"):
+                    du_f = _linear_solve(Kff, Rf, lambda *a: None, method=method)
+                Rf_lin, du_lin = Rf, du_f
             if not np.all(np.isfinite(du_f)):
                 raise RuntimeError("剛性マトリクスが特異です。拘束が不足しているか、接触だけで支えられている"
                                    "ボディが浮いています。解析設定で「弱いバネ」をオンにするか、拘束を見直してください。")
@@ -384,18 +451,19 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
             changed, pen = (update_states(pairs, contacts, u, pen_tol=pen_tol) if pairs else (0, 0.0))
             # 収束判定（Ansys と同じく力の残差 / 参照力）。接触は更新後の状態での実際の接触力で評価
             if not nonlinear:
-                crit = _rel_res(Kff, du_f, Rf)
+                crit = _rel_res(Kff, du_lin, Rf_lin)
             else:
                 fint2 = internal(u)[0] if (LD or ps is not None) else K_lin @ u
                 R2 = F - fint2
                 if pairs:
-                    Kc2, fc2 = contact_system(pairs, contacts, ndof, u)
+                    Kc2, fc2 = _contact(u)
                     R2 = R2 + fc2 - Kc2 @ u
                 if W is not None:
                     R2 = R2 - W @ u
                 # 参照力 = 外力と反力の大きさ（Ansys と同じ考え方）
-                ref2 = max(np.linalg.norm(F[free]), np.linalg.norm(R2[~free]), 0.01)  # 最小参照値 0.01 N（Ansys と同じ）
-                crit = np.linalg.norm(R2[free]) / ref2
+                rf2, rc2 = res_norms(R2, u)
+                ref2 = max(res_norms(F)[0], rc2, 0.01)  # 最小参照値 0.01 N（Ansys と同じ）
+                crit = rf2 / ref2
             dcrit = np.linalg.norm(alpha * du_f) / max(np.linalg.norm(u[free]), 1e-30)
             history.append({"時間": round(t, 6), "反復": it, "力の残差比": float(crit),
                             "変位の変化比": float(dcrit), "接触状態の変化": int(changed),
@@ -448,8 +516,10 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
         t_prev = t_end
         if settings.store_results == "all" or si == len(ends) - 1:
             cur_t[0] = t_end
-            results.append(_make_result(mesh, mats, elem_mat, D, u, bcs, per_bc, loads_at(t_end)[0], pairs,
-                                        contacts, LD, internal, t_end, si + 1, settings, ps,
+            results.append(_make_result(mesh, mats, elem_mat, D, u[:nb], bcs,
+                                        [(Fi[:nb], {d: v for d, v in fx.items() if d < nb}) for Fi, fx in per_bc],
+                                        loads_at(t_end)[0][:nb], pairs,
+                                        contacts, LD, internal_base, t_end, si + 1, settings, ps,
                                         eps_th_m * th_factor(t_end) if has_th else None))
     info_common = {"自由度数": int(free.sum()), "節点数": mesh.n_nodes, "要素数": mesh.n_elems,
                    "要素タイプ": "Tet10（2次）" if mesh.order == 2 else "Tet4（1次）",

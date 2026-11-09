@@ -36,6 +36,14 @@ class Extra:
     direct: bool = False                           # 直接法を使うべきか（ペナルティで条件数が悪い）
     notes: list = field(default_factory=list)
     mpc: dict = field(default_factory=dict)        # 従属自由度 → (独立自由度の配列, 係数の配列)  u_s = Σ c u_m
+    F_by: dict = field(default_factory=dict)       # 境界条件の番号 → {dof: 力}（非線形のステップ倍率用）
+    fixed_by: dict = field(default_factory=dict)   # 境界条件の番号 → {dof: 値}
+
+    def Fvec_of(self, i):
+        F = np.zeros(self.n)
+        for d, v in self.F_by.get(i, {}).items():
+            F[d] += v
+        return F
 
     @property
     def n(self):
@@ -138,7 +146,17 @@ def extra_terms(mesh, bcs, kref: float, acc=None) -> Extra:
     kref: 剛性の大きさの目安（全体剛性の対角の平均）、acc: 重力加速度（点質量の重量）"""
     ex = Extra(3 * mesh.n_nodes)
     kp = PENALTY * kref
-    Fb = np.zeros(3 * mesh.n_nodes)
+    cur = [None]
+
+    def addF(d, v):
+        d = int(d)
+        ex.F[d] = ex.F.get(d, 0.0) + float(v)
+        fb = ex.F_by.setdefault(cur[0], {})
+        fb[d] = fb.get(d, 0.0) + float(v)
+
+    def addFb(arr):
+        for d in np.nonzero(arr)[0]:
+            addF(d, arr[d])
 
     def new_pilot(i, p):
         d0 = ex.n
@@ -179,6 +197,8 @@ def extra_terms(mesh, bcs, kref: float, acc=None) -> Extra:
     for i, b in enumerate(bcs):
         if b.kind not in REMOTE_KINDS:
             continue
+        cur[0] = i
+        Fb = np.zeros(3 * mesh.n_nodes)
         v = [None if x is None else float(x) for x in (list(b.values) + [None] * 6)[:6]]
         vz = [0.0 if x is None else x for x in v]
         if b.kind == "elastic_support":
@@ -209,7 +229,7 @@ def extra_terms(mesh, bcs, kref: float, acc=None) -> Extra:
                     if val:
                         f = kp * val * e
                         for k in range(3):
-                            ex.F[3 * nd + k] = ex.F.get(3 * nd + k, 0.0) + f[k]
+                            addF(3 * nd + k, f[k])
             ex.direct = True
             continue
         if b.kind == "bearing_load":
@@ -229,6 +249,7 @@ def extra_terms(mesh, bcs, kref: float, acc=None) -> Extra:
             f = acc_w / acc_w.sum()
             for k in range(3):
                 Fb[k::3] += f * Fv[k]
+            addFb(Fb)
             continue
         if not b.faces:
             raise ValueError(f"{b.label()}: 面を選んでください")
@@ -236,16 +257,18 @@ def extra_terms(mesh, bcs, kref: float, acc=None) -> Extra:
         beh = (b.options or {}).get("behavior", "deformable")
         if b.kind == "remote_force" and beh != "rigid":
             _distribute_load(mesh, b.faces, vz[:3], vz[3:6], p, Fb)
+            addFb(Fb)
             continue
         d0 = new_pilot(i, p)
         couple(i, b, p, d0)
         if b.kind == "remote_force":
             for k in range(6):
-                ex.F[d0 + k] = ex.F.get(d0 + k, 0.0) + vz[k]
+                addF(d0 + k, vz[k])
         elif b.kind == "remote_displacement":
             for k in range(6):
                 if v[k] is not None:
                     ex.fixed[d0 + k] = v[k]
+                    ex.fixed_by.setdefault(i, {})[d0 + k] = v[k]
             ex.reaction_dofs[i] = np.arange(d0, d0 + 6)
         elif b.kind == "point_mass":
             m_t = vz[0] * 1e-3                      # kg → t
@@ -255,7 +278,7 @@ def extra_terms(mesh, bcs, kref: float, acc=None) -> Extra:
                 ex.mrows.append([d0 + 3 + k]); ex.mcols.append([d0 + 3 + k]); ex.mvals.append([I[k]])
             if acc is not None:
                 for k in range(3):
-                    ex.F[d0 + k] = ex.F.get(d0 + k, 0.0) + m_t * float(acc[k])
+                    addF(d0 + k, m_t * float(acc[k]))
             # 回転自由度に質量がないと特異になるので、ごく小さな回転慣性を足す
             if not np.any(I):
                 for k in range(3):
@@ -272,9 +295,7 @@ def extra_terms(mesh, bcs, kref: float, acc=None) -> Extra:
             if pre:
                 f = pre * e                           # 予荷重（引張 正: 地面の方へ引く）
                 for kk in range(3):
-                    ex.F[d0 + kk] = ex.F.get(d0 + kk, 0.0) + f[kk]
-    for d in np.nonzero(Fb)[0]:
-        ex.F[int(d)] = ex.F.get(int(d), 0.0) + Fb[d]
+                    addF(d0 + kk, f[kk])
     return ex
 
 

@@ -214,13 +214,26 @@ def test_electrostatic_and_piezo():
     assert np.any(fo > fs * 1.05)                # 縦振動のモード: 開放（反共振）は短絡より高い
 
 
-def test_nonlinear_with_elastic_support_and_refusal():
+def test_nonlinear_with_supports_and_remote():
     from openmech.nonlinear import AnalysisSettings, solve_static
     m = bar(nx=40, ny=3, nz=3)
     r = solve_static(m, S, [BC("elastic_support", [face(m, 2, 0, -1)], [10.0]),
                             BC("pressure", [face(m, 2, 10, 1)], [1.0])], None,
                      AnalysisSettings(large_deflection=True), **q)[-1]
     assert r.u[:, 2].mean() == pytest.approx(-0.1, rel=1e-3)
-    with pytest.raises(ValueError):
-        solve_static(m, S, [BC("fixed", [face(m, 0, 0, -1)]), BC("point_mass", [face(m, 0, 200, 1)], [1, 0, 0, 0])],
-                     None, AnalysisSettings(large_deflection=True), **q)
+    fix, tip = face(m, 0, 0, -1), face(m, 0, 200, 1)
+    tipn = np.isclose(m.nodes[:, 0], 200)
+    cases = [[BC("fixed", [fix]), BC("remote_force", [tip], [0, 0, -100, 0, 0, 0], point=[250, 5, 5],
+                                     options={"behavior": "rigid"})],
+             [BC("fixed", [fix]), BC("remote_displacement", [tip], [None, None, -1.0, None, None, None],
+                                     options={"behavior": "deformable"})],
+             [BC("fixed", [fix]), BC("spring", [tip], [50.0, 0], options={"behavior": "rigid", "ground": [200, 5, -300]}),
+              BC("force", [tip], [0, 0, -100.])],
+             [BC("fixed", [fix]), BC("point_mass", [tip], [1.0, 0, 0, 0], point=[250, 5, 5],
+                                     options={"behavior": "rigid"}), BC("gravity", [], [0, 0, -9806.65])]]
+    for bcs in cases:
+        rl = solve(m, S, bcs, **q)
+        rn = solve_static(m, S, bcs, None, AnalysisSettings(), **q)[-1]
+        assert rn.u[tipn, 2].mean() == pytest.approx(rl.u[tipn, 2].mean(), rel=1e-6)
+    rL = solve_static(m, S, cases[1], None, AnalysisSettings(large_deflection=True), **q)[-1]
+    assert rL.u[tipn, 2].mean() == pytest.approx(-1.0, abs=1e-6)
