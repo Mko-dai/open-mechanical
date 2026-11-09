@@ -1956,8 +1956,11 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
         ctrl = [x for x in (local_sizes or []) if not x.get("suppressed")]
         sweeps = [x for x in ctrl if x.get("type") == "sweep"]
         if ctrl:
-            mins = _apply_local_sizes(gmsh, h, [x for x in ctrl if x.get("type") != "sweep"],
-                                      ms.get("growth_rate", 1.5))
+            loc = [x for x in ctrl if x.get("type") != "sweep"]
+            if ms.get("element_shape") == "hex" and not sweeps:
+                # すべて六面体は四面体を 4 分割するので、局所サイズも 2 倍で切って同じ細かさにする
+                loc = [dict(x, size=2 * float(x["size"])) if x.get("size") else x for x in loc]
+            mins = _apply_local_sizes(gmsh, h, loc, ms.get("growth_rate", 1.5))
             if mins:
                 gmsh.option.setNumber("Mesh.MeshSizeMin", min([hmin] + [v * 0.5 for v in mins]))
         mode2d = analysis_2d_mode(spec)
