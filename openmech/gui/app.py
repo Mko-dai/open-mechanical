@@ -2857,6 +2857,9 @@ class MainWindow(QMainWindow):
         res.setKeyboardTracking(False)
         res.valueChanged.connect(lambda v: self._ms_set("resolution", int(v)))
         self._row(s, "解像度（0 粗い 〜 7 細かい）", res)
+        self._row(s, "要素の形", self._combo(
+            [("四面体（Tet10）", "tet"), ("すべて六面体（Hex20、四面体を 4 分割）", "hex")],
+            self._ms("element_shape") or "tet", lambda v: self._ms_set("element_shape", v)))
         gr = dspin(self._ms("growth_rate"), 1.01, 5.0, 2, 0.05)
         gr.valueChanged.connect(lambda v: self._ms_set("growth_rate", v))
         self._row(s, "成長率", gr)

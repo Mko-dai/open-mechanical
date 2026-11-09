@@ -39,3 +39,33 @@ r = solve(m, mat, [BC("symmetry", [z0]), BC("pressure", [z1], [-100.0]),
           log=lambda *a: None)
 print(f"円柱 Hex20: 要素 {m.n_elems:,} / 体積 {m.volume():.3f}（理論 {np.pi * R * R * H:.3f}）/ σz 平均 {r.stress[:, 2].mean():.3f}"
       f"（理論 100）/ 伸び {r.u[:, 2].max():.6f}（理論 {100 * H / 200000:.6f}）")
+
+# すべて六面体（スイープできない形: 穴あき板）。穴縁の σx を Peterson の式（板厚平均）と比べる
+from openmech.benchmarks import hole_plate  # noqa: E402
+Lp, Wp, tp, dp, Fp = 200.0, 50.0, 5.0, 10.0, 5000.0
+q_ = dp / Wp
+kt = 3 - 3.14 * q_ + 3.667 * q_ ** 2 - 1.527 * q_ ** 3
+target = kt * Fp / ((Wp - dp) * tp)
+spec = {"kind": "plate_hole", "lx": Lp, "ly": Wp, "t": tp, "d": dp}
+m0 = build_mesh(spec, size=5.0, order=1, log=lambda *a: None)
+hole = [f["id"] for f in m0.face_info() if not f["flat"]]
+for shape in ("tet", "hex"):
+    t0 = time.time()
+    m = build_mesh(spec, size=5.0, order=2, log=lambda *a: None, local_sizes=[{"faces": hole, "size": 0.5}],
+                   settings={"element_shape": shape})
+    X = m.nodes
+    x0, x1 = face_where(m, 0, 0.0, -1), face_where(m, 0, Lp, 1)
+    corner = int(np.argmin(np.linalg.norm(X - [0, 0, 0], axis=1)))
+    corner2 = int(np.argmin(np.linalg.norm(X - [0, Wp, 0], axis=1)))
+    r = solve(m, mat, [BC("displacement", [x0], [0.0, None, None]),
+                       BC("displacement", [], [None, 0.0, 0.0], nodes=[corner]),
+                       BC("displacement", [], [None, None, 0.0], nodes=[corner2]),
+                       BC("force", [x1], [Fp, 0.0, 0.0])], log=lambda *a: None)
+    hn = m.face_nodes(hole)
+    sx, z = r.stress[hn, 0], X[hn, 2]
+    bins = np.clip((z / tp * 10).astype(int), 0, 9)
+    peak = float(np.mean([sx[bins == b].max() for b in range(10) if np.any(bins == b)]))
+    q = mesh_quality(m)
+    print(f"穴あき板 {shape}: 要素 {m.n_elems:,}（{m.elems.shape[1]} 節点）/ 節点 {m.n_nodes:,} / 穴縁 σx {peak:.2f} "
+          f"（理論 {target:.2f}、{peak / target - 1:+.2%}）/ 品質 平均 {q['要素品質']['平均']:.3f} 最小 {q['要素品質']['最小']:.3f}"
+          f" / {time.time() - t0:.1f}s")

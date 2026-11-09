@@ -825,6 +825,10 @@ def _reorder_tet10(nodes: np.ndarray, el: np.ndarray) -> np.ndarray:
     return np.hstack([el[:, :4], np.take_along_axis(el[:, 4:], pick, axis=1)])
 
 
+# gmsh の 20 節点六面体（中間節点 (0,1),(0,3),(0,4),(1,2),(1,5),(2,3),(2,6),(3,7),(4,5),(4,7),(5,6),(6,7)）→ VTK の順
+GMSH_HEX20_TO_VTK = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 13, 9, 16, 18, 19, 17, 10, 12, 14, 15])
+
+
 def _extract_mesh(gmsh, share: dict | None = None) -> Mesh:
     tags, coords, _ = gmsh.model.mesh.getNodes()
     coords = coords.reshape(-1, 3)
@@ -837,14 +841,18 @@ def _extract_mesh(gmsh, share: dict | None = None) -> Mesh:
         body = int(phys[0]) - 1 if len(phys) else 0
         etypes, _, enodes = gmsh.model.mesh.getElements(3, vtag)
         for t, en in zip(etypes, enodes):
-            npe = {4: 4, 11: 10}.get(int(t))
+            npe = {4: 4, 11: 10, 5: 8, 17: 20}.get(int(t))
             if npe is None:
                 continue
             b = tag2idx[en.astype(np.int64)].reshape(-1, npe)
+            if npe == 20:
+                b = b[:, GMSH_HEX20_TO_VTK]
             blocks.append(b)
             bodies.append(np.full(len(b), body, dtype=np.int64))
     if not blocks:
         raise GeometryError("四面体メッシュを作成できませんでした。メッシュサイズを変えて試してください。")
+    if len({b.shape[1] for b in blocks}) > 1:
+        raise GeometryError("要素の形が混ざったメッシュには対応していません（四面体か六面体のどちらかにしてください）")
     elems = np.vstack(blocks)
     elem_body = np.concatenate(bodies)
     # 使われている節点だけ残す
@@ -867,15 +875,23 @@ def _extract_mesh(gmsh, share: dict | None = None) -> Mesh:
     for fid, (_, stag) in enumerate(surfs):
         ets, _, ens = gmsh.model.mesh.getElements(2, stag)
         for t, en in zip(ets, ens):
-            npe = {2: 3, 9: 6}.get(int(t))
+            npe, nc = {2: (3, 3), 9: (6, 3), 3: (4, 4), 16: (8, 4)}.get(int(t), (None, None))
             if npe is None:
                 continue
-            tri = remap[tag2idx[en.astype(np.int64)].reshape(-1, npe)[:, :3]]
+            tri = remap[tag2idx[en.astype(np.int64)].reshape(-1, npe)[:, :nc]]
             for k in map(tuple, np.sort(tri, axis=1)):
                 key_of[k] = fid
-    orig = mesh.node_origin[mesh.boundary_tris]
-    bt = np.sort(orig, axis=1)
-    fids = np.array([key_of.get(tuple(k), -1) for k in bt])
+    if mesh.is_hex:
+        # 六面体: 境界の四角形の 4 頂点で対応を取り、そこから作った三角形へ
+        bq = mesh.boundary_quads_full
+        corners = bq[:, ::2] if bq.shape[1] == 8 else bq
+        qk = np.sort(mesh.node_origin[corners], axis=1)
+        qf = np.array([key_of.get(tuple(k), -1) for k in qk])
+        fids = qf[mesh.boundary_quad_of]
+    else:
+        orig = mesh.node_origin[mesh.boundary_tris]
+        bt = np.sort(orig, axis=1)
+        fids = np.array([key_of.get(tuple(k), -1) for k in bt])
     if (fids < 0).any():
         # 対応が取れない場合は角度で自動分割
         mesh.group_faces()
@@ -1018,7 +1034,8 @@ MESH_DEFAULTS = {
     # 近接の捕捉（Ansys の Capture Proximity）: 薄肉・狭いすき間に指定の要素数が入るよう要素を小さくする
     "capture_proximity": False,
     "size_points": [],
-    "cracks": [],                 # き裂（破壊力学）: geometry.crack_frame の辞書のリスト             # 局所の要素サイズ [[x, y, z, h], ...]（適応メッシュが設定）
+    "cracks": [],                 # き裂（破壊力学）: geometry.crack_frame の辞書のリスト
+    "element_shape": "tet",       # 要素の形: "tet"（四面体）/ "hex"（すべて六面体: 四面体を 4 つの六面体に分割）             # 局所の要素サイズ [[x, y, z, h], ...]（適応メッシュが設定）
     "proximity_cells": 3,         # すき間（板厚）を横切る要素数（Ansys の Num Cells Across Gap、既定 3）
     "proximity_min_size": 0.0,    # 近接の最小サイズ [mm]（0 = 曲率の最小サイズと同じ）
     "proximity_max_elements": 3e6,  # 近接の捕捉で見積もった要素数がこれを超えたら中止
@@ -1989,8 +2006,16 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
                 pm = _apply_proximity(gmsh, h, ms, log)
                 if pm is not None:
                     gmsh.option.setNumber("Mesh.MeshSizeMin", min(gmsh.option.getNumber("Mesh.MeshSizeMin"), pm))
+            hexall = ms.get("element_shape") == "hex"
+            if hexall:
+                # すべて六面体: 四面体メッシュの各要素を 4 つの六面体に分ける（gmsh の細分化）。
+                # 要素数は 4 倍になるので、サイズを 2 倍にして同じくらいの節点数にする
+                gmsh.option.setNumber("Mesh.MeshSizeMax", 2 * h)
+                gmsh.option.setNumber("Mesh.MeshSizeMin", 2 * gmsh.option.getNumber("Mesh.MeshSizeMin"))
+                gmsh.option.setNumber("Mesh.SubdivisionAlgorithm", 2)
+                gmsh.option.setNumber("Mesh.SecondOrderIncomplete", 1)
             gmsh.model.mesh.generate(3)
-            if ms.get("auto_fix", True):
+            if ms.get("auto_fix", True) and not hexall:
                 n0, n1, w0, w1 = _gmsh_quality_fix(gmsh, float(ms.get("min_quality", 0.05)), log)
                 if n0:
                     fix_msgs.append(f"品質 {ms.get('min_quality', 0.05):g} 未満の要素 {n0:,} 個 → 最適化で {n1:,} 個"

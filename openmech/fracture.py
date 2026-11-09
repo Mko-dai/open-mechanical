@@ -156,7 +156,7 @@ def insert_crack(mesh: Mesh, point, normal, inside, tol=None):
     if len(dup) == 0:
         raise ValueError("き裂面の上に節点がありません")
     nc = mesh.elems.shape[1]
-    corner = mesh.elems[:, :4] if nc in (4, 10) else mesh.elems[:, :6]
+    corner = mesh.elems[:, :4] if nc in (4, 10) else mesh.elems[:, :8] if nc in (8, 20) else mesh.elems[:, :6]
     cen = X[corner].mean(axis=1)
     plus = ((cen - p) @ n) > 0
     lut = np.arange(mesh.n_nodes)
