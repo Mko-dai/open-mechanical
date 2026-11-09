@@ -2662,9 +2662,15 @@ class MainWindow(QMainWindow):
             self._row(s, "ねじ山の半角（メートルねじ 30°）", ha)
             pc = dspin(float(th.get("pitch", 1.5)), 0.01, 100.0, 3, 0.25, "mm")
             pc.valueChanged.connect(tset("pitch"))
-            self._row(s, "ピッチ（記録用）", pc)
+            self._row(s, "ピッチ", pc)
+            hc = QComboBox()
+            hc.addItem("右ねじ", "right")
+            hc.addItem("左ねじ", "left")
+            hc.setCurrentIndex(1 if th.get("hand") == "left" else 0)
+            hc.currentIndexChanged.connect(lambda _=None, hc=hc: self._contact_set(i, "thread", dict(c.thread, hand=hc.currentData())))
+            self._row(s, "ねじの向き", hc)
             self._row(s, "", "円筒の接触面を、ねじ山の 2 つの斜面として扱います（軸方向の力がねじ山を通り、"
-                             "tan(半角) 倍の半径方向の力が出ます）。軸は面の形から推定しています。")
+                             "tan(半角) 倍の半径方向の力と、リード角によるゆるめトルクが出ます）。軸は面の形から推定しています。")
         self._row(s, "ターゲットジオメトリ修正", "なし")
 
     def _scope_row_named(self, sec, label, faces, apply_fn):

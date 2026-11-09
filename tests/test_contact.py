@@ -192,3 +192,23 @@ def test_bolt_thread_flank_wedging():
     assert abs(abs(Rx) / (F * np.tan(np.radians(30))) - 1) < 0.02
     # 軸方向は ねじで止まる（ねじがなければ摩擦なし接触では止まらない）
     assert np.abs(r.u[:, 2]).max() < 0.01
+
+
+def test_bolt_thread_lead_angle_gives_torque():
+    """リード角 λ のねじを軸方向に引くと、周方向に F·tan λ の力（ゆるめトルク）が出る"""
+    from openmech.contact import ContactRegion
+    m = stack(structured_box(10, 10, 20, 2, 2, 4, origin=(-10, 0, 0)), structured_box(10, 10, 20, 2, 2, 4))
+    ca, tb = face(m, 0, 0, 1), face(m, 0, 0, -1)
+    lam = np.radians(10.0)
+    R = 1000.0
+    pitch = np.pi * 2 * (R - 0.0) * np.tan(lam)
+    reg = ContactRegion("ねじ", "frictionless", contact_faces=[ca], target_faces=[tb], contact_body=0, target_body=1,
+                        thread={"point": [-R, 5, 0], "axis": [0, 0, 1], "half_angle": 30.0, "pitch": pitch})
+    F = 1000.0
+    y0 = [f["id"] for f in m.face_info() if abs(f["centroid"][1]) < 1e-9 and f["centroid"][0] < 0]
+    bcs = [BC("fixed", [face(m, 0, 10, 1)]), BC("frictionless", [face(m, 0, -10, -1)]), BC("symmetry", y0),
+           BC("force", [f["id"] for f in m.face_info() if abs(f["centroid"][2] - 20) < 1e-9 and f["centroid"][0] < 0],
+              [0, 0, F])]
+    r = solve_static(m, S, bcs, [reg], AnalysisSettings(initial_substeps=2), **quiet)[-1]
+    Ry = abs(r.reactions[2][1])
+    assert abs(Ry / (F * np.tan(lam)) - 1) < 0.05

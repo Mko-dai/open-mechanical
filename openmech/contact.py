@@ -328,7 +328,8 @@ def _thread_flanks(mesh, th, slave, masters, bc, n, g0, area):
     フランクの法線 = ±cos α · 軸方向 + sin α · 半径方向（α = ねじ山の半角。メートルねじは 30°）。
     軸方向に引くと片方のフランクが閉じて軸力を伝え、その tan α 倍の半径方向の力（くさび作用）が生じる。
     もう片方は開く（非線形の接触で自動的に判定）。面積はフランクの実面積（投影 ÷ sin α の半分ずつ）。
-    ※ Ansys のボルトねじ補正のように らせん の位相までは表さない（ねじ山 1 ピッチより粗い要素向けの平均化モデル）
+    ピッチを与えると、らせんのリード角でフランクの向きを周方向に傾ける（軸力から ゆるめトルク F·r·tan λ が出る）。
+    ※ 山 1 つ 1 つの位置（位相）までは表さない（ねじ山 1 ピッチより粗い要素向けの平均化モデル）
     """
     a = np.radians(float(th.get("half_angle", 30.0)))
     e = np.asarray(th["axis"], float)
@@ -339,10 +340,19 @@ def _thread_flanks(mesh, th, slave, masters, bc, n, g0, area):
     r = rv / np.maximum(np.linalg.norm(rv, axis=1, keepdims=True), 1e-300)
     sgn = np.sign(np.einsum("ij,ij->i", n, r))
     sgn[sgn == 0] = 1.0
+    # らせんのリード角 λ = atan(リード / (π d_m))（d_m = 接触面の平均直径）。ねじ山の面の軸方向の向きは
+    # らせんに沿って傾く: cos λ e − (右ねじ +1 / 左ねじ −1) sin λ θ̂（θ̂ = e × r̂、周方向）
+    pitch = float(th.get("pitch", 0.0) or 0.0)
+    lead = pitch * max(1, int(th.get("starts", 1) or 1))
+    dm = 2.0 * float(np.mean(np.linalg.norm(rv, axis=1)))
+    lam = np.arctan(lead / (np.pi * dm)) if (lead > 0 and dm > 0) else 0.0
+    hand = -1.0 if th.get("hand", "right") == "left" else 1.0
+    th_dir = np.cross(e, r)
+    ax_dir = np.cos(lam) * e[None, :] - hand * np.sin(lam) * th_dir
     out = []
     for s_ax in (1.0, -1.0):
-        nf = sgn[:, None] * np.sin(a) * r + s_ax * np.cos(a) * e
-        out.append(nf)
+        nf = sgn[:, None] * np.sin(a) * r + s_ax * np.cos(a) * ax_dir
+        out.append(nf / np.linalg.norm(nf, axis=1, keepdims=True))
     f = 0.5 / max(np.sin(a), 1e-6)
     cat = lambda v: np.concatenate([v, v])  # noqa: E731
     return cat(slave), cat(masters), cat(bc), np.vstack(out), cat(g0), cat(area) * f
