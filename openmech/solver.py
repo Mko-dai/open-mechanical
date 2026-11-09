@@ -590,6 +590,9 @@ def nodal_stress(mesh: Mesh, u: np.ndarray, D: np.ndarray, chunk: int = 50000, e
     nn = mesh.elems.shape[1]
     Lnodes = node_points(nn)
     dNa = [shape_dN_dxi(Lnodes[a], nn) for a in range(nn)]
+    Lc = np.asarray(Lnodes, float).mean(axis=0)
+    dNc = shape_dN_dxi(Lc, nn)
+    dNs = [shape_dN_dxi(0.9 * np.asarray(Lnodes[a], float) + 0.1 * Lc, nn) for a in range(nn)]
     U = u.reshape(-1, 3)
     ne = mesh.n_elems
     eps_all = np.empty((ne, nn, 6))
@@ -601,8 +604,13 @@ def nodal_stress(mesh: Mesh, u: np.ndarray, D: np.ndarray, chunk: int = 50000, e
         X = mesh.nodes[el]
         ue = U[el].reshape(len(el), -1)
         De = _D_of(D, elem_mat, slice(a0, b0))
+        _, det_c = _dN_dx(X, dNc)
         for a in range(nn):
-            dNdx, _ = _dN_dx(X, dNa[a])
+            dNdx, det_a = _dN_dx(X, dNa[a])
+            bad = np.abs(det_a) < 1e-6 * np.abs(det_c)
+            if bad.any():
+                # ヤコビアンが 0 の節点（1/4 点要素のき裂先端）: 要素の中心へ少し寄せた点で評価（理論上は無限大）
+                dNdx[bad], _ = _dN_dx(X[bad], dNs[a])
             eps = np.einsum("eij,ej->ei", _B_matrix(dNdx), ue)
             eps_all[a0:b0, a] = eps
             if eps_th_m is not None:
