@@ -232,6 +232,53 @@ allf = [ff["id"] for ff in mel.face_info()]
                                                         BC("voltage", [top], [100.])], **q))
 add("圧電", "拘束した圧電板に電圧", "厚さ 1 mm、100 V、e33 = 15.1 C/m²", "厚さ方向の応力", 15.1e-3 * 100,
     s.stress[:, 2].mean(), t, 4 * mel.n_nodes, "MPa")
+# ---------------------------------------------------------------- 超弾性・クリープ
+from openmech.hyperelastic import uniaxial_nominal  # noqa: E402
+from openmech.nonlinear import AnalysisSettings, solve_static  # noqa: E402
+
+mh = bar(10, 2, 2, 5, 1, 1)
+Xh = mh.nodes
+onh = lambda ax, v: np.nonzero(np.isclose(Xh[:, ax], v))[0].tolist()  # noqa: E731
+symh = [BC("displacement", [], [0.0, None, None], nodes=onh(0, 0)),
+        BC("displacement", [], [None, 0.0, None], nodes=onh(1, 0)),
+        BC("displacement", [], [None, None, 0.0], nodes=onh(2, 0))]
+for hname, h in [("Neo-Hookean", {"model": "neo_hookean", "mu": 1.0}),
+                 ("Mooney-Rivlin", {"model": "mooney_rivlin", "C10": 0.3, "C01": 0.1}),
+                 ("Yeoh", {"model": "yeoh", "C10": 0.4, "C20": -0.02, "C30": 0.004})]:
+    rub = Material("ゴム", 1.0, 0.49, 1100, hyper=h)
+    st = rub.state()
+    rr, t = timed(lambda: solve_static(mh, rub, symh + [BC("displacement", [], [10.0, None, None], nodes=onh(0, 10))],
+                                       settings=AnalysisSettings(initial_substeps=5, max_substeps=50),
+                                       elem_materials=([st], np.zeros(mh.n_elems, int)), **q)[-1])
+    add("超弾性", f"ゴムの単軸引張（{hname}）", "ストレッチ 2 倍（100 % 伸び）、ほぼ非圧縮（K = 1000 μ）", "公称応力",
+        float(uniaxial_nominal(h, 2.0)), rr.reactions[3][0] / 4, t, 3 * mh.n_nodes, "MPa")
+lam = 1.5
+h = {"model": "mooney_rivlin", "C10": 0.3, "C01": 0.1}
+rub = Material("ゴム", 1.0, 0.49, 1100, hyper=h)
+st = rub.state()
+rr, t = timed(lambda: solve_static(mh, rub, symh + [
+    BC("displacement", [], [10.0 * (lam - 1), None, None], nodes=onh(0, 10)),
+    BC("displacement", [], [None, 2.0 * (lam - 1), None], nodes=onh(1, 2))],
+    settings=AnalysisSettings(initial_substeps=5, max_substeps=50),
+    elem_materials=([st], np.zeros(mh.n_elems, int)), **q)[-1])
+add("超弾性", "ゴムの等二軸引張（Mooney-Rivlin）", "X・Y を 1.5 倍に伸ばす", "X 方向の公称応力",
+    2 * (lam - lam ** -5) * (0.3 + lam ** 2 * 0.1), rr.reactions[3][0] / 4, t, 3 * mh.n_nodes, "MPa")
+Acr, ncr, Tcr = 1e-12, 3.0, 1000.0
+stl = Material("鋼", 200000, 0.3, 7850, creep={"C1": Acr, "C2": ncr})
+fxh = [ff["id"] for ff in mh.face_info() if abs(ff["centroid"][0] - 10) < 1e-9]
+rr, t = timed(lambda: solve_static(mh, stl, symh + [BC("force", fxh, [400.0, 0, 0])],
+                                   settings=AnalysisSettings(n_steps=2, step_end_times=[1e-6, Tcr], initial_substeps=10,
+                                                             auto_time_stepping="on"),
+                                   elem_materials=([stl.state()], np.zeros(mh.n_elems, int)), **q)[-1])
+add("クリープ", "一定応力のクリープ（Norton）", "100 MPa を 1000 s 保持、C1 = 1e-12・C2 = 3", "クリープひずみ",
+    Acr * 100 ** ncr * Tcr, float(rr.fields()["相当クリープひずみ"].mean()), t, 3 * mh.n_nodes, "")
+rr, t = timed(lambda: solve_static(mh, stl, symh + [BC("displacement", [], [0.01, None, None], nodes=onh(0, 10))],
+                                   settings=AnalysisSettings(n_steps=2, step_end_times=[1e-6, Tcr], initial_substeps=200,
+                                                             max_substeps=400, auto_time_stepping="on"),
+                                   elem_materials=([stl.state()], np.zeros(mh.n_elems, int)), **q)[-1])
+add("クリープ", "応力緩和（Norton）", "ひずみ 0.1 % を 1000 s 保持", "1000 s 後の応力",
+    (200.0 ** (1 - ncr) + (ncr - 1) * 200000 * Acr * Tcr) ** (1 / (1 - ncr)), float(rr.stress[:, 0].mean()), t,
+    3 * mh.n_nodes, "MPa")
 
 out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                                          "logs", "verify_analyses.json")

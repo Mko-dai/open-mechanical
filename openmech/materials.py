@@ -52,6 +52,10 @@ class Material:
     piezo: dict = field(default_factory=dict)   # 圧電: {"e": 6×3 の圧電定数 e [C/m²]（応力型）, "eps_s": [ε11,ε22,ε33] 比誘電率（ひずみ一定）}
     # 疲労（S-N 曲線）: [[繰返し数, 応力振幅 MPa], ...]（両対数で補間）
     sn_table: list = field(default_factory=list)
+    # 超弾性（hyperelastic.py）: {"model": "neo_hookean"|"mooney_rivlin"|"yeoh", "mu"/"C10"/"C01"/"C20"/"C30", "d"}
+    hyper: dict = field(default_factory=dict)
+    # クリープ（Ansys の Norton, TBOPT=10）: ε̇cr = C1 σ^C2 exp(−C3/T)  {"C1": [1/s/MPa^C2], "C2": 指数, "C3": [K]}
+    creep: dict = field(default_factory=dict)
 
     @property
     def density_t_mm3(self) -> float:
@@ -68,6 +72,9 @@ class Material:
     # ------------------------------------------------------------------ 計算用
     def E_nu_at(self, T=None):
         """温度 T での E, ν（温度依存の表があれば線形補間。範囲外は端の値＝Ansys と同じ）"""
+        if self.hyper and self.hyper.get("model"):
+            from .hyperelastic import initial_E_nu
+            return initial_E_nu(self.hyper)
         tab = [r for r in (self.temp_table or []) if len(r) >= 3]
         if T is None or not tab:
             return float(self.E), float(self.nu)
@@ -149,11 +156,22 @@ class MaterialState:
 
     @property
     def plastic(self):
-        return self.plasticity != "none"
+        """積分点の状態を持つ材料（塑性・クリープ）"""
+        return self.plasticity != "none" or self.creeping
+
+    @property
+    def creeping(self):
+        return bool(self.base.creep) and float(self.base.creep.get("C1", 0) or 0) > 0
+
+    @property
+    def hyperelastic(self):
+        return bool(self.base.hyper) and bool(self.base.hyper.get("model"))
 
     def hardening(self):
         """(初期降伏応力, 応力-塑性ひずみ表 [(εp, σ)], 移動硬化か)"""
         b = self.base
+        if b.plasticity == "none":
+            return 1e30, [(0.0, 1e30)], False          # クリープのみ（降伏しない）
         kin = b.plasticity.endswith("_kin")
         if b.plasticity.startswith("bilinear"):
             E = self.E

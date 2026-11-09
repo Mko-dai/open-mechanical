@@ -41,6 +41,78 @@ class PlasticModel:
         self.K = self.E / (3 * (1 - 2 * self.nu))
         self.sy0, self.tab, self.kin = mstate.hardening()
         self.D_M = self.K * np.outer(I_VOL, I_VOL) + 2 * self.G * P_DEV    # Mandel 弾性
+        self.yields = mstate.plasticity != "none"
+        self.creep = None
+        if getattr(mstate, "creeping", False):
+            c = mstate.base.creep
+            A = float(c.get("C1", 0.0))
+            c3 = float(c.get("C3", 0.0) or 0.0)
+            if c3:
+                T = mstate.T if mstate.T is not None else float(getattr(mstate.base, "ref_temp", 22.0))
+                A *= np.exp(-c3 / (T + 273.15))
+            self.creep = (A, float(c.get("C2", 1.0)))
+
+    def creep_update(self, eps_M, ep_M, pcr, dt):
+        """Norton クリープ ε̇ = A σ^n の後退オイラー（半径方向への戻しと同じ形）。戻り値: σ_M, ep_M, pcr, C_M"""
+        n_e = len(eps_M)
+        sig_tr = (eps_M - ep_M) @ self.D_M.T
+        xi = sig_tr @ P_DEV.T
+        nxi = np.linalg.norm(xi, axis=1)
+        qt = np.sqrt(1.5) * nxi
+        C = np.broadcast_to(self.D_M, (n_e, 6, 6)).copy()
+        A, nexp = self.creep
+        if dt <= 0 or A <= 0:
+            return sig_tr, ep_M, pcr, C
+        idx = np.nonzero(qt > 1e-12 * max(float(qt.max(initial=0.0)), 1e-30))[0]
+        if len(idx) == 0:
+            return sig_tr, ep_M, pcr, C
+        G = self.G
+        q0 = qt[idx]
+        # r(Δp) = Δp − dt A (q_tr − 3GΔp)^n = 0、0 ≤ Δp < q_tr/3G（単調なので二分法で囲みつつニュートン）
+        lo = np.zeros(len(idx))
+        hi = q0 / (3 * G)
+        dp = np.minimum(dt * A * q0 ** nexp, 0.5 * hi)
+        for _ in range(100):
+            q = np.maximum(q0 - 3 * G * dp, 1e-300)
+            r = dp - dt * A * q ** nexp
+            lo = np.where(r < 0, dp, lo)
+            hi = np.where(r > 0, dp, hi)
+            dr = 1 + dt * A * nexp * q ** (nexp - 1) * 3 * G
+            new = dp - r / dr
+            bad = (new <= lo) | (new >= hi)
+            new = np.where(bad, 0.5 * (lo + hi), new)
+            if np.all(np.abs(new - dp) <= 1e-13 * np.maximum(hi, 1e-30)):
+                dp = new
+                break
+            dp = new
+        q = np.maximum(q0 - 3 * G * dp, 1e-300)
+        h = dt * A * nexp * q ** (nexp - 1)               # dΔp/dq（この増分での粘性の傾き）
+        nvec = xi[idx] / nxi[idx, None]
+        dep = np.sqrt(1.5) * dp[:, None] * nvec
+        sig = sig_tr.copy()
+        sig[idx] = sig_tr[idx] - 2 * G * dep
+        ep_M = ep_M.copy()
+        ep_M[idx] += dep
+        pcr = pcr.copy()
+        pcr[idx] += dp
+        theta = 1 - 3 * G * dp / q0
+        theta_b = 3 * G * h / (1 + 3 * G * h) - (1 - theta)   # 塑性の式 1/(1+H/3G) − (1−θ) で H = 1/h
+        C[idx] = (self.K * np.outer(I_VOL, I_VOL))[None] + 2 * G * theta[:, None, None] * P_DEV[None] \
+            - 2 * G * theta_b[:, None, None] * np.einsum("ei,ej->eij", nvec, nvec)
+        return sig, ep_M, pcr, C
+
+    def update_all(self, eps_M, ep_M, alpha_M, pbar, pcr, dt):
+        """クリープ（あれば）→ 塑性 の順に更新。戻り値: σ_M, ep_M, alpha_M, pbar, pcr, C_M"""
+        Cc = None
+        if self.creep is not None:
+            s_c, ep_M, pcr, Cc = self.creep_update(eps_M, ep_M, pcr, dt)
+            if not self.yields:
+                return s_c, ep_M, alpha_M, pbar, pcr, Cc
+        s, ep2, al2, pb2, C = self.update(eps_M, ep_M, alpha_M, pbar)
+        if Cc is not None:
+            yl = pb2 > pbar
+            C = np.where(yl[:, None, None], C, Cc)
+        return s, ep2, al2, pb2, pcr, C
 
     def radius(self, p):
         """降伏応力（等方: 表の値、移動: 初期値）と硬化係数 (Hiso, Hkin)"""
@@ -108,6 +180,9 @@ class PlasticSolid:
         ng = len(self.wts)
         E = mesh.n_elems
         self.models = {i: PlasticModel(m) for i, m in enumerate(mats) if getattr(m, "plastic", False)}
+        from .hyperelastic import HyperModel
+        self.hyper = {i: HyperModel(m.base.hyper) for i, m in enumerate(mats) if getattr(m, "hyperelastic", False)}
+        self.dt = 0.0                     # クリープの時間増分（ドライバーが各サブステップで設定）
         self.eps_th_m = eps_th_m if eps_th_m is not None else np.zeros((len(mats), 6))
         # 積分点ごとの B・重み（毎回作り直さないよう保存）
         X = mesh.nodes[mesh.elems]
@@ -120,6 +195,7 @@ class PlasticSolid:
         self.ep = np.zeros((ng, E, 6))
         self.alpha = np.zeros((ng, E, 6))
         self.pbar = np.zeros((ng, E))
+        self.pcr = np.zeros((ng, E))      # 相当クリープひずみ
         self.trial = None
         dofs = (3 * mesh.elems[:, :, None] + np.arange(3)).reshape(E, -1)
         self.dofs = dofs
@@ -134,14 +210,14 @@ class PlasticSolid:
         large=True: 大変形（Total Lagrangian）。グリーン・ラグランジュひずみ E = Ee + Ep の加法分解で
         第2ピオラ・キルヒホッフ応力 S にリターンマッピングする（大回転・中程度のひずみ向け）。
         """
-        if large:
+        if large or self.hyper:
             return self._internal_large(u, th_scale)
         mesh = self.mesh
         E = mesh.n_elems
         ue = u[self.dofs]
         fe = np.zeros((E, 3 * self.nn))
         Ke = np.zeros((E, 3 * self.nn, 3 * self.nn))
-        ep_n, al_n, pb_n = self.ep.copy(), self.alpha.copy(), self.pbar.copy()
+        ep_n, al_n, pb_n, pc_n = self.ep.copy(), self.alpha.copy(), self.pbar.copy(), self.pcr.copy()
         sig_all = np.zeros((len(self.wts), E, 6))
         eth = self.eps_th_m[self.elem_mat] * th_scale
         for g in range(len(self.wts)):
@@ -153,15 +229,15 @@ class PlasticSolid:
                 sel = np.nonzero(self.elem_mat == mi)[0]
                 if len(sel) == 0:
                     continue
-                s_M, e_M, a_M, pb, C_M = model.update(eps[sel] * W_EPS, self.ep[g, sel], self.alpha[g, sel],
-                                                      self.pbar[g, sel])
+                s_M, e_M, a_M, pb, pc, C_M = model.update_all(eps[sel] * W_EPS, self.ep[g, sel], self.alpha[g, sel],
+                                                               self.pbar[g, sel], self.pcr[g, sel], self.dt)
                 sig[sel] = s_M / W_SIG
                 Ct[sel] = C_M / W_SIG[None, :, None] * W_EPS[None, None, :]
-                ep_n[g, sel], al_n[g, sel], pb_n[g, sel] = e_M, a_M, pb
+                ep_n[g, sel], al_n[g, sel], pb_n[g, sel], pc_n[g, sel] = e_M, a_M, pb, pc
             sig_all[g] = sig
             fe += np.einsum("e,eki,ek->ei", wd, B, sig)
             Ke += np.einsum("e,eki,ekl,elj->eij", wd, B, Ct, B, optimize=True)
-        self.trial = (ep_n, al_n, pb_n, sig_all)
+        self.trial = (ep_n, al_n, pb_n, sig_all, pc_n)
         f = np.zeros(3 * mesh.n_nodes)
         np.add.at(f, self.dofs.ravel(), fe.ravel())
         K = sp.coo_matrix((Ke.ravel(), (self.rows, self.cols)), shape=(f.size, f.size)).tocsr()
@@ -175,7 +251,7 @@ class PlasticSolid:
         Ue = u.reshape(-1, 3)[mesh.elems]
         fe = np.zeros((E, 3 * nn))
         Ke = np.zeros((E, 3 * nn, 3 * nn))
-        ep_n, al_n, pb_n = self.ep.copy(), self.alpha.copy(), self.pbar.copy()
+        ep_n, al_n, pb_n, pc_n = self.ep.copy(), self.alpha.copy(), self.pbar.copy(), self.pcr.copy()
         sig_all = np.zeros((len(self.wts), E, 6))
         eth = self.eps_th_m[self.elem_mat] * th_scale
         for g in range(len(self.wts)):
@@ -188,11 +264,15 @@ class PlasticSolid:
                 sel = np.nonzero(self.elem_mat == mi)[0]
                 if len(sel) == 0:
                     continue
-                s_M, e_M, a_M, pb, C_M = model.update(Eg[sel] * W_EPS, self.ep[g, sel], self.alpha[g, sel],
-                                                      self.pbar[g, sel])
+                s_M, e_M, a_M, pb, pc, C_M = model.update_all(Eg[sel] * W_EPS, self.ep[g, sel], self.alpha[g, sel],
+                                                               self.pbar[g, sel], self.pcr[g, sel], self.dt)
                 S[sel] = s_M / W_SIG
                 Ct[sel] = C_M / W_SIG[None, :, None] * W_EPS[None, None, :]
-                ep_n[g, sel], al_n[g, sel], pb_n[g, sel] = e_M, a_M, pb
+                ep_n[g, sel], al_n[g, sel], pb_n[g, sel], pc_n[g, sel] = e_M, a_M, pb, pc
+            for mi, hm in self.hyper.items():
+                sel = np.nonzero(self.elem_mat == mi)[0]
+                if len(sel):
+                    S[sel], Ct[sel] = hm.S_C(Eg[sel])
             B = _tl_BL(F, dNdX)
             fe += np.einsum("e,eki,ek->ei", wd, B, S)
             Ke += np.einsum("e,eki,ekl,elj->eij", wd, B, Ct, B, optimize=True)
@@ -204,7 +284,7 @@ class PlasticSolid:
             J = np.linalg.det(F)
             sg = np.einsum("eik,ekl,ejl->eij", F, Sm, F) / J[:, None, None]
             sig_all[g] = np.stack([sg[:, 0, 0], sg[:, 1, 1], sg[:, 2, 2], sg[:, 0, 1], sg[:, 1, 2], sg[:, 0, 2]], 1)
-        self.trial = (ep_n, al_n, pb_n, sig_all)
+        self.trial = (ep_n, al_n, pb_n, sig_all, pc_n)
         f = np.zeros(3 * mesh.n_nodes)
         np.add.at(f, self.dofs.ravel(), fe.ravel())
         K = sp.coo_matrix((Ke.ravel(), (self.rows, self.cols)), shape=(f.size, f.size)).tocsr()
@@ -213,6 +293,21 @@ class PlasticSolid:
     def commit(self):
         if self.trial is not None:
             self.ep, self.alpha, self.pbar = self.trial[0].copy(), self.trial[1].copy(), self.trial[2].copy()
+            self.pcr = self.trial[4].copy()
+
+    def nodal_scalar(self, arr):
+        """積分点のスカラー (ng,E) → 節点（Tet10 は頂点へ外挿、中間節点は平均）"""
+        mesh, nn = self.mesh, self.nn
+        if nn == 10 and len(self.wts) == 4:
+            Ainv = np.linalg.inv(np.asarray(self.pts, float)[:, :4])
+            vp = np.einsum("ag,ge->ea", Ainv, arr)
+            edges = [(0, 1), (1, 2), (0, 2), (0, 3), (1, 3), (2, 3)]
+            vp = np.concatenate([vp, np.stack([(vp[:, i] + vp[:, j]) / 2 for i, j in edges], 1)], 1)
+        else:
+            vp = np.repeat(arr.mean(axis=0)[:, None], nn, axis=1)
+        idx = mesh.elems.ravel()
+        cnt = np.maximum(np.bincount(idx, minlength=mesh.n_nodes), 1)
+        return np.bincount(idx, np.maximum(vp, 0).ravel(), mesh.n_nodes) / cnt
 
     def nodal(self):
         """節点の応力（積分点の値を要素内で外挿せず平均）と相当塑性ひずみ"""

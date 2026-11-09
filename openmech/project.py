@@ -248,7 +248,8 @@ class Project:
         # ボディ同士が節点を共有していない（＝接触でつなぐ必要がある）かどうか
         multi = (mesh is not None and getattr(mesh, "node_origin", None) is not None
                  and len(np.unique(mesh.node_origin)) < mesh.n_nodes)
-        plastic = any(m.plasticity != "none" for m in (list(self.materials.values()) or [self.material]))
+        plastic = any(m.plasticity != "none" or m.hyper or (m.creep and float(m.creep.get("C1", 0) or 0) > 0)
+                      for m in (list(self.materials.values()) or [self.material]))
         return bool(self.contacts or multi or plastic or s.large_deflection or s.n_steps > 1 or s.weak_springs
                     or any(b.step_factors for b in self.bcs))
 

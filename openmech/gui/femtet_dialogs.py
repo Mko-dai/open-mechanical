@@ -354,6 +354,49 @@ class MaterialDialog(QDialog):
         v7.addWidget(self.sntab)
         v7.addWidget(_table_buttons(self.sntab))
         tabs.addTab(t7, "疲労")
+        # --- 超弾性（ゴム）
+        from ..hyperelastic import HYPER_MODELS
+        t8 = QWidget()
+        f8 = QFormLayout(t8)
+        hy = dict(getattr(m, "hyper", None) or {})
+        self.hmodel = QComboBox()
+        self.hmodel.addItem("なし", "")
+        for k, v in HYPER_MODELS.items():
+            self.hmodel.addItem(v, k)
+        self.hmodel.setCurrentIndex(max(0, self.hmodel.findData(hy.get("model", ""))))
+        f8.addRow("モデル", self.hmodel)
+        self.hp = {}
+        for k, lab in [("mu", "初期せん断弾性率 μ"), ("C10", "C10"), ("C01", "C01"), ("C20", "C20"), ("C30", "C30")]:
+            self.hp[k] = _spin(float(hy.get(k, 0.0) or 0.0), -1e6, 1e6, 6, "MPa")
+            f8.addRow(lab, self.hp[k])
+        self.hd = _spin(float(hy.get("d", 0.0) or 0.0), 0.0, 1e6, 6, "1/MPa")
+        f8.addRow("非圧縮性パラメータ d（0 = 非圧縮）", self.hd)
+        f8.addRow(QLabel("試験データ（単軸引張: ストレッチ λ・公称応力 MPa）から定数を求められます（カーブフィット）"))
+        self.htab = _table(["ストレッチ λ", "公称応力 [MPa]"], hy.get("test", []) or [], 6)
+        f8.addRow(self.htab)
+        f8.addRow(_table_buttons(self.htab))
+        bfit = QPushButton("カーブフィット")
+        self.hfit_msg = QLabel("")
+        bfit.clicked.connect(self._hyper_fit)
+        f8.addRow(bfit, self.hfit_msg)
+        f8.addRow(QLabel("超弾性を選ぶと、大変形の非線形静解析で解きます（弾性のヤング率・ポアソン比は使いません）"))
+        self.hmodel.currentIndexChanged.connect(self._hyper_enable)
+        self._hyper_enable()
+        tabs.addTab(t8, "超弾性")
+        # --- クリープ（Norton）
+        t9 = QWidget()
+        f9 = QFormLayout(t9)
+        cr = dict(getattr(m, "creep", None) or {})
+        self.c1 = QLineEdit(f"{float(cr.get('C1', 0.0) or 0.0):g}")
+        self.c1.setPlaceholderText("例: 1e-12")
+        self.c2 = _spin(float(cr.get("C2", 1.0) or 1.0), 0.0, 50.0, 4)
+        self.c3 = _spin(float(cr.get("C3", 0.0) or 0.0), 0.0, 1e7, 2, "K")
+        f9.addRow("C1（係数）", self.c1)
+        f9.addRow("C2（応力の指数 n）", self.c2)
+        f9.addRow("C3（活性化温度 Q/R）", self.c3)
+        f9.addRow(QLabel("Norton 則 ε̇cr = C1 σ^C2 exp(−C3/T)（Ansys の TBOPT=10 と同じ。σ [MPa]、時間 [s]、T [K]）。"
+                         "C1 = 0 ならクリープなし。解析設定のステップ終了時間が実時間になります"))
+        tabs.addTab(t9, "クリープ")
         lay.addWidget(tabs)
         _buttons(self, lay)
 
@@ -399,7 +442,51 @@ class MaterialDialog(QDialog):
                         tangent_modulus=self.et.value(), ml_table=mt,
                         conductivity=self.kc.value(), specific_heat=self.cp.value(),
                         permittivity=self.epsr.value(), piezo=self._piezo(),
-                        sn_table=_table_rows(self.sntab, 2))
+                        sn_table=_table_rows(self.sntab, 2), hyper=self._hyper(), creep=self._creep())
+
+    def _hyper_enable(self):
+        from ..hyperelastic import HYPER_PARAMS
+        used = {k for k, _ in HYPER_PARAMS.get(self.hmodel.currentData() or "", [])}
+        for k, w in self.hp.items():
+            w.setEnabled(k in used)
+        self.hd.setEnabled(bool(used))
+
+    def _hyper_fit(self):
+        from ..hyperelastic import fit_uniaxial
+        model = self.hmodel.currentData()
+        if not model:
+            self.hfit_msg.setText("モデルを選んでください")
+            return
+        try:
+            c, rms = fit_uniaxial(model, _table_rows(self.htab, 2))
+        except ValueError as e:
+            self.hfit_msg.setText(str(e))
+            return
+        for k, v in c.items():
+            self.hp[k].setValue(v)
+        self.hfit_msg.setText("誤差（相対 RMS） " + f"{rms * 100:.2f} %")
+
+    def _hyper(self):
+        from ..hyperelastic import HYPER_PARAMS, coefficients
+        model = self.hmodel.currentData()
+        if not model:
+            return {}
+        h = {"model": model, "d": self.hd.value()}
+        h.update({k: self.hp[k].value() for k, _ in HYPER_PARAMS[model]})
+        tab = _table_rows(self.htab, 2)
+        if tab:
+            h["test"] = tab
+        coefficients(h)            # 定数の確認（初期せん断弾性率 > 0）
+        return h
+
+    def _creep(self):
+        try:
+            c1 = float(self.c1.text().strip() or 0)
+        except ValueError:
+            raise ValueError("クリープの C1 は数値で入力してください（例: 1e-12）")
+        if c1 <= 0:
+            return {}
+        return {"C1": c1, "C2": self.c2.value(), "C3": self.c3.value()}
 
     def _piezo(self):
         e31, e33, e15 = self.e31.value(), self.e33.value(), self.e15.value()

@@ -202,7 +202,8 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
     D = np.stack([material_D(m) for m in mats])
     eps_th_m = np.stack([material_eps_th(m) for m in mats])
     has_th = bool(np.any(eps_th_m))
-    plastic = any(getattr(m, "plastic", False) for m in mats)
+    hyper = any(getattr(m, "hyperelastic", False) for m in mats)
+    plastic = any(getattr(m, "plastic", False) for m in mats) or hyper
     rho_e = np.array([m.density_t_mm3 for m in mats])[elem_mat]
     ndof = 3 * mesh.n_nodes
 
@@ -272,7 +273,9 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
     nonlinear_contact = any(c.nonlinear for c in contacts)
     friction = any(c.type == "frictional" for c in contacts)
     al = any(c.resolved_formulation() == "augmented_lagrange" for c in contacts)
-    LD = settings.large_deflection
+    LD = settings.large_deflection or hyper
+    if hyper and not settings.large_deflection:
+        log("超弾性材料あり: 大変形をオンにして解きます")
     vol = np.abs(mesh.element_volumes())
     h_char = float(np.cbrt(np.median(vol) * 6 * np.sqrt(2))) if len(vol) else 1.0
     pen_tol = settings.penetration_tolerance * h_char
@@ -283,7 +286,10 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
     if plastic:
         from .plasticity import PlasticSolid
         ps = PlasticSolid(mesh, mats, elem_mat, D, eps_th_m)
-        log("塑性材料あり: 弾塑性（ミーゼス）" + ("＋大変形" if LD else "") + "で解きます")
+        kinds = (["弾塑性（ミーゼス）"] if any(m.plasticity != "none" for m in mats) else []) \
+            + (["クリープ（Norton）"] if any(getattr(m, "creeping", False) for m in mats) else []) \
+            + (["超弾性"] if hyper else [])
+        log("非線形材料あり: " + "・".join(kinds) + ("＋大変形" if LD else "") + "で解きます")
     K_lin = None if (LD or plastic) else assemble_stiffness(mesh, D, elem_mat=elem_mat)
     k_weak = 0.0
     if settings.weak_springs:
@@ -493,6 +499,8 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
         while t < t_end - 1e-12:
             t_next = min(t + dt, t_end)
             state = save_pair_state()
+            if ps is not None:
+                ps.dt = t_next - t
             try:
                 u_new, F_now = equilibrium(t_next, u)
             except ConvergenceError as e:
@@ -544,7 +552,10 @@ def _make_result(mesh, mats, elem_mat, D, u, bcs, per_bc, F, pairs, contacts, LD
                   else nodal_stress(mesh, u, D, elem_mat=elem_mat)[1])
         internal(u)
         stress, peeq = ps.nodal()
-        extra["相当塑性ひずみ"] = peeq
+        if any(m.plasticity != "none" for m in mats):
+            extra["相当塑性ひずみ"] = peeq
+        if any(getattr(m, "creeping", False) for m in mats):
+            extra["相当クリープひずみ"] = ps.nodal_scalar(ps.pcr)
     fint, _ = internal(u)
     Rv = fint - F
     if pairs:

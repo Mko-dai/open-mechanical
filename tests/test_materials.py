@@ -1,5 +1,6 @@
 """材料: 温度依存・直交異方性・熱ひずみ・塑性"""
 import numpy as np
+import pytest
 
 from openmech.materials import Material, rotation_xyz
 from openmech.mesh import structured_box
@@ -113,3 +114,54 @@ def test_plastic_large_deflection_cantilever():
         r = solve_static(m, mat, bcs, settings=s, elem_materials=_em(m, mat.state()), log=lambda *a: None)[-1]
         tips.append(-r.u[:, 2].min())
     assert tips[1] < 0.7 * tips[0]
+
+
+@pytest.mark.parametrize("h", [{"model": "neo_hookean", "mu": 1.0},
+                               {"model": "mooney_rivlin", "C10": 0.3, "C01": 0.1},
+                               {"model": "yeoh", "C10": 0.4, "C20": -0.02, "C30": 0.004}])
+def test_hyperelastic_uniaxial(h):
+    """超弾性の単軸引張（ストレッチ 2 倍）: 公称応力が非圧縮の理論式と一致（d=0 → K=1000μ のほぼ非圧縮）"""
+    from openmech.hyperelastic import uniaxial_nominal
+    m, on, sym = _bar()
+    mat = Material("ゴム", 1.0, 0.49, 1100, hyper=dict(h))
+    lam = 2.0
+    pull = BC("displacement", [], [10.0 * (lam - 1), None, None], nodes=on(0, 10))
+    s = AnalysisSettings(initial_substeps=5, max_substeps=50)
+    r = solve_static(m, mat, sym + [pull], settings=s, elem_materials=_em(m, mat.state()), log=lambda *a: None)[-1]
+    P = r.reactions[3][0] / (2 * 2)
+    assert abs(P / uniaxial_nominal(h, lam) - 1) < 0.01
+    # 断面は λ^-1/2 に縮む（非圧縮）
+    assert abs((2 + r.u[on(1, 2)[0], 1]) / 2 - lam ** -0.5) < 0.005
+
+
+def test_norton_creep_constant_stress():
+    """Norton クリープ: 一定応力の棒の伸び = L(σ/E + C1 σ^C2 t)"""
+    m, on, sym = _bar()
+    A, n, sig, T = 1e-12, 3.0, 100.0, 1000.0
+    mat = Material("鋼", 200000, 0.3, 7850, creep={"C1": A, "C2": n})
+    info = m.face_info()
+    fx = [f["id"] for f in info if abs(f["centroid"][0] - 10) < 1e-9]
+    F = BC("force", fx, [sig * 4.0, 0, 0])
+    # ステップ 1（ごく短時間）で荷重をかけ、ステップ 2 で保持（Ansys のクリープ解析と同じ手順）
+    s = AnalysisSettings(n_steps=2, step_end_times=[1e-6, T], initial_substeps=10, auto_time_stepping="on")
+    r = solve_static(m, mat, sym + [F], settings=s, elem_materials=_em(m, mat.state()), log=lambda *a: None)[-1]
+    ux = r.u[on(0, 10), 0].mean()
+    exact = 10 * (sig / 200000 + A * sig ** n * T)
+    assert abs(ux / exact - 1) < 1e-3
+    assert abs(r.fields()["相当クリープひずみ"].mean() / (A * sig ** n * T) - 1) < 1e-3
+
+
+def test_norton_creep_relaxation():
+    """Norton クリープの応力緩和（伸びを保持）: σ(t) = [σ0^(1−n) + (n−1) E A t]^(1/(1−n))"""
+    m, on, sym = _bar()
+    A, n, E, T = 1e-12, 3.0, 200000.0, 1000.0
+    mat = Material("鋼", E, 0.3, 7850, creep={"C1": A, "C2": n})
+    eps0 = 1e-3
+    pull = BC("displacement", [], [10 * eps0, None, None], nodes=on(0, 10))
+    s = AnalysisSettings(n_steps=2, step_end_times=[1e-6, T], initial_substeps=200, max_substeps=400,
+                         auto_time_stepping="on")
+    r = solve_static(m, mat, sym + [pull], settings=s, elem_materials=_em(m, mat.state()), log=lambda *a: None)[-1]
+    s0 = E * eps0
+    exact = (s0 ** (1 - n) + (n - 1) * E * A * T) ** (1 / (1 - n))
+    assert abs(r.stress[:, 0].mean() / exact - 1) < 0.01
+    assert r.stress[:, 0].mean() < 0.8 * s0

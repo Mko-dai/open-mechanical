@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication, QDialog, QMessageBox  # noqa: E402
 from openmech.gui import app as A  # noqa: E402
 from openmech.gui import charts as C  # noqa: E402
 from openmech.gui.femtet_dialogs import FeatureDialog  # noqa: E402
+from openmech.materials import Material  # noqa: E402
 from openmech.solver import BC  # noqa: E402
 
 out = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "gui_analyses")
@@ -171,6 +172,23 @@ try:
     app.processEvents()
     mm = md.material()
     P(f"OK  材料ダイアログ: 熱伝導率 {mm.conductivity} / S-N {len(mm.sn_table)} 点 / 圧電 {bool(mm.piezo)}")
+    md.close()
+    # 超弾性のカーブフィット・クリープ
+    from openmech.hyperelastic import uniaxial_nominal
+    md = MaterialDialog("ゴム", Material("ゴム", 1.0, 0.49, 1100), w)
+    md.hmodel.setCurrentIndex(md.hmodel.findData("mooney_rivlin"))
+    from PySide6.QtWidgets import QTableWidgetItem
+    lams = [1.2, 1.5, 2.0, 2.5, 3.0]
+    md.htab.setRowCount(len(lams))
+    for i, l in enumerate(lams):
+        md.htab.setItem(i, 0, QTableWidgetItem(str(l)))
+        md.htab.setItem(i, 1, QTableWidgetItem(str(float(uniaxial_nominal({"model": "mooney_rivlin", "C10": 0.3,
+                                                                              "C01": 0.1}, l)))))
+    md._hyper_fit()
+    md.c1.setText("1e-12")
+    mm = md.material()
+    P(f"OK  超弾性・クリープ: {mm.hyper.get('model')} C10 {mm.hyper.get('C10'):.4f} C01 {mm.hyper.get('C01'):.4f} "
+      f"（{md.hfit_msg.text()}） / クリープ {mm.creep}")
     md.close()
 except Exception:
     P("NG  材料ダイアログ\n" + traceback.format_exc())
