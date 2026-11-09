@@ -5,6 +5,7 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("QT_MAC_WANTS_LAYER", "1")
+import numpy as np  # noqa: E402
 import pyvista as pv  # noqa: E402
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox  # noqa: E402
 
@@ -147,6 +148,28 @@ try:
     msgs.clear()
 except Exception:
     P("NG  収束ツール\n" + traceback.format_exc())
+# 断面表示とアニメーション
+try:
+    w.select_node(("result", 1))
+    app.processEvents()
+    w.section_combo.setCurrentIndex(3)
+    w.section_pos.setValue(40)
+    app.processEvents()
+    w.grab().save(os.path.join(out, "section.png"))
+    npts = w._anim[0].n_points
+    w.section_combo.setCurrentIndex(0)
+    app.processEvents()
+    w.anim_btn.setChecked(True)
+    w.toggle_animation()
+    p0 = np.array(w._anim[0].points)
+    for _ in range(7):
+        w._anim_step()
+    moved = float(np.abs(np.array(w._anim[0].points) - p0).max())
+    w.anim_btn.setChecked(False)
+    w.toggle_animation()
+    P(f"OK  断面・アニメーション: 断面の点 {npts:,} / アニメーションで動いた量 {moved:.4g} mm")
+except Exception:
+    P("NG  断面・アニメーション\n" + traceback.format_exc())
 # 破壊（き裂を埋め込んで J 積分・K）
 try:
     w.project.mesh_settings = dict(w.project.mesh_settings or {}, cracks=[

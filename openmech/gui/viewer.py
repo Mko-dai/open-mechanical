@@ -92,3 +92,13 @@ def feature_edges(mesh: Mesh, points=None) -> pv.PolyData | None:
         return None
     cells = np.hstack([np.full((len(lines), 1), 2), lines]).ravel()
     return pv.PolyData(pts.copy(), lines=cells)
+
+
+def volume_grid(mesh: Mesh, points=None) -> pv.UnstructuredGrid:
+    """要素（体積）の格子。断面表示（切断）に使う。2 次要素は VTK の 2 次セルのまま"""
+    pts = mesh.nodes if points is None else points
+    nn = mesh.elems.shape[1]
+    ctype = {4: pv.CellType.TETRA, 10: pv.CellType.QUADRATIC_TETRA, 6: pv.CellType.WEDGE,
+             15: pv.CellType.QUADRATIC_WEDGE, 8: pv.CellType.HEXAHEDRON, 20: pv.CellType.QUADRATIC_HEXAHEDRON}[nn]
+    cells = np.hstack([np.full((mesh.n_elems, 1), nn), mesh.elems]).ravel()
+    return pv.UnstructuredGrid(cells, np.full(mesh.n_elems, ctype, dtype=np.uint8), np.asarray(pts, float).copy())

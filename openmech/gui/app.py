@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (QApplication, QProgressDialog, QCheckBox, QComboB
                                QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
                                QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
                                QPushButton, QSplitter, QTabWidget, QToolButton, QTreeWidget,
-                               QListWidget, QListWidgetItem, QTreeWidgetItem, QVBoxLayout, QWidget)
+                               QListWidget, QListWidgetItem, QSlider, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 import pyvista as pv
 from pyvistaqt import QtInteractor
@@ -53,7 +53,7 @@ from ..nonlinear import solve_static
 from ..analyses import ANALYSIS_JP, EXTRA_TYPES
 from ..solver import BC, solve
 from .femtet_dialogs import BCDialog, BodyAttrDialog, FeatureDialog, MaterialDialog
-from .viewer import FIELD_EN, feature_edges, surface_polydata
+from .viewer import FIELD_EN, feature_edges, surface_polydata, volume_grid
 
 # ---------------------------------------------------------------------------- 定義
 
@@ -615,6 +615,21 @@ class MainWindow(QMainWindow):
         self.minmax_chk.setToolTip("コンター上の最大値（赤）・最小値（青）の札を表示します")
         self.minmax_chk.toggled.connect(lambda _: self.refresh_view())
         g.addWidget(self.minmax_chk)
+        self.anim_btn = R.button(g, "アニメーション", make_icon("#c0392b", "▶"), self.toggle_animation, checkable=True,
+                                 big=False)
+        self.section_combo = QComboBox()
+        for label, v in [("断面なし", None), ("断面 X", 0), ("断面 Y", 1), ("断面 Z", 2)]:
+            self.section_combo.addItem(label, v)
+        self.section_combo.setToolTip("断面（切断面）で内部のコンターを表示（Ansys の断面）")
+        self.section_combo.currentIndexChanged.connect(lambda _: self.refresh_view())
+        g.addWidget(self.section_combo)
+        self.section_pos = QSlider(Qt.Horizontal)
+        self.section_pos.setRange(0, 100)
+        self.section_pos.setValue(50)
+        self.section_pos.setFixedWidth(90)
+        self.section_pos.setToolTip("断面の位置（形状の範囲の %）")
+        self.section_pos.valueChanged.connect(lambda _: self.refresh_view() if self.section_combo.currentData() is not None else None)
+        g.addWidget(self.section_pos)
         self.tab_res = R.count() - 1
         # --- 表示
         t = R.add_tab("表示")
@@ -4515,7 +4530,10 @@ class MainWindow(QMainWindow):
         add = bool(QApplication.keyboardModifiers() & (Qt.ControlModifier | Qt.MetaModifier | Qt.ShiftModifier))
         if self.current[0] == "result" and self.result is not None:
             if cell >= 0:
-                self._probe(np.array(picker.GetPickPosition()), self._tri_src[cell])
+                if self._tri_src is None:          # 断面表示: 切り口の点の値
+                    self._probe_section(np.array(picker.GetPickPosition()))
+                else:
+                    self._probe(np.array(picker.GetPickPosition()), self._tri_src[cell])
             return
         if cell < 0:
             if not add:
@@ -4633,6 +4651,37 @@ class MainWindow(QMainWindow):
             self.refresh_view()
 
     # ======================================================================= 描画
+    def toggle_animation(self, *_):
+        """変形のアニメーション（静解析: 0 → 1 → 0、モード: −1 → 1）"""
+        on = self.anim_btn.isChecked()
+        if not on or self.result is None or self.current[0] != "result":
+            self._animating = False
+            if hasattr(self, "_anim_timer"):
+                self._anim_timer.stop()
+            self.anim_btn.setChecked(False)
+            self.refresh_view()
+            return
+        self._animating = True
+        self._anim_t = 0
+        self.refresh_view()            # 輪郭・札なしで描き直す
+        if not hasattr(self, "_anim_timer"):
+            self._anim_timer = QTimer(self)
+            self._anim_timer.timeout.connect(self._anim_step)
+        self._anim_timer.start(50)
+
+    def _anim_step(self):
+        a = getattr(self, "_anim", None)
+        if a is None or not getattr(self, "_animating", False):
+            return
+        poly, X0, u, scale, modal_ = a
+        if scale <= 0 or poly.n_points != len(X0):
+            return
+        self._anim_t = (self._anim_t + 1) % 30
+        ph = 2 * np.pi * self._anim_t / 30
+        f = np.sin(ph) if modal_ else 0.5 * (1 - np.cos(ph))
+        poly.points = X0 + (f * scale) * u
+        self.plotter.render()
+
     def _deform_scale(self):
         v = self.scale_combo.currentData()
         if v is None or self.result is None:
@@ -4939,12 +4988,29 @@ class MainWindow(QMainWindow):
             sub.point_data[en] = vals
             poly = sub
             self._tri_src = src[mask]
+        sec_ax = self.section_combo.currentData() if hasattr(self, "section_combo") else None
+        if sec_ax is not None and not key.startswith("接触:") and not getattr(mesh, "is_shell", False) \
+                and not getattr(mesh, "is_2d", False):
+            # 断面: 要素（体積）を平面で切り、切り口と手前側の外面にコンター
+            grid = volume_grid(mesh, pts)
+            grid.point_data[en] = vals
+            lo_, hi_ = mesh.bounds()
+            org = 0.5 * (lo_ + hi_)
+            org[sec_ax] = lo_[sec_ax] + (hi_[sec_ax] - lo_[sec_ax]) * self.section_pos.value() / 100.0
+            nrm = np.zeros(3)
+            nrm[sec_ax] = 1.0
+            clipped = grid.clip(normal=nrm, origin=org + scale * 0.0, invert=True)
+            poly = clipped.extract_surface(nonlinear_subdivision=2)
+            self._tri_src = None
         self._main_actor = pl.add_mesh(
             poly, scalars=en, cmap=cmap, n_colors=n_colors, clim=[vmin, vmax], show_edges=show_el,
             edge_color="#303030", line_width=0.4, smooth_shading=False, nan_color="#d9d9d9",
             scalar_bar_args={"title": "", "vertical": True, "fmt": "%.4g", "n_labels": min(n_colors + 1, 10),
                              "position_x": 0.015, "position_y": 0.25, "height": 0.5, "width": 0.045,
                              "label_font_size": 13, "title_font_size": 1})
+        self._anim = (poly, mesh.nodes, np.asarray(r.u, float), scale, "モード" in str(getattr(r, "label", "") or ""))
+        if getattr(self, "_animating", False):
+            return
         fe = feature_edges(mesh, pts)
         if fe is not None:
             pl.add_mesh(fe, color="black", line_width=1, pickable=False)
@@ -4989,6 +5055,20 @@ class MainWindow(QMainWindow):
         self.log(f"プローブ 節点{i + 1} ({x[0]:.4g}, {x[1]:.4g}, {x[2]:.4g}) mm: {RESULT_NAME.get(key, key)} = {v:.6g}")
         self.build_details()
         self.refresh_view()
+
+    def _probe_section(self, pos):
+        a = getattr(self, "_anim", None)
+        if a is None:
+            return
+        poly = a[0]
+        key = self.project.results[self.current[1]]
+        en = FIELD_EN.get(key, key)
+        j = int(np.argmin(np.linalg.norm(poly.points - pos, axis=1)))
+        v = float(poly.point_data[en][j])
+        x = poly.points[j]
+        self.probe_text = f"値: {v:.6g}（断面）\nX: {x[0]:.5g} mm\nY: {x[1]:.5g} mm\nZ: {x[2]:.5g} mm"
+        self.log(f"プローブ（断面） ({x[0]:.4g}, {x[1]:.4g}, {x[2]:.4g}) mm: {RESULT_NAME.get(key, key)} = {v:.6g}")
+        self.build_details()
 
     def _set_overlay(self, html):
         if not html:
