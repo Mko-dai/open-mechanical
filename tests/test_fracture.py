@@ -55,3 +55,34 @@ def test_sent_full_model_inserted_crack():
     assert abs(row["K_I（変位）[MPa√mm]"] / K_TADA - 1) < 0.06
     assert abs(row["K_II（変位）[MPa√mm]"]) < 0.02 * K_TADA
     assert row["安全率（K_IC / K）"] > 1
+
+
+def test_quarter_point_improves_displacement_k():
+    """1/4 点要素で変位外挿の K_I が理論に近づく（J は変わらず正確）"""
+    from openmech.fracture import quarter_point
+    nx = 30
+    out = {}
+    for qp in (False, True):
+        m = structured_box(W, 2 * H, t, nx, 2 * nx, 1).to_quadratic()
+        m.face_info()
+        m2, _ = insert_crack(m, [0, H, 0], [0, 1, 0], lambda X: X[:, 0] < a - 1e-6)
+        if qp:
+            assert quarter_point(m2, [a, H, 0], [a, H, t]) > 0
+            m2.quarter_point = True
+        X = m2.nodes
+        info = m2.face_info()
+        top = [f["id"] for f in info if abs(f["centroid"][1] - 2 * H) < 1e-9]
+        bot = [f["id"] for f in info if abs(f["centroid"][1]) < 1e-9]
+        zz = np.nonzero(np.isclose(X[:, 2], 0) | np.isclose(X[:, 2], t))[0]
+        c = np.nonzero(np.isclose(X[:, 0], W) & np.isclose(X[:, 1], H))[0][:1]
+        c2 = np.nonzero(np.isclose(X[:, 0], W) & np.isclose(X[:, 1], 2 * H))[0][:1]
+        r = solve(m2, MAT, [BC("displacement", [], [None, None, 0.0], nodes=zz.tolist()),
+                            BC("displacement", [], [0.0, 0.0, None], nodes=c.tolist()),
+                            BC("displacement", [], [0.0, None, None], nodes=c2.tolist()),
+                            BC("pressure", top, [-SIG]), BC("pressure", bot, [-SIG])], **LOG)
+        out[qp] = evaluate_cracks(m2, r, [{"front0": [a, H, 0], "front1": [a, H, t], "normal": [0, 1, 0],
+                                           "direction": [1, 0, 0], "front_size": W / nx}])[0]
+    e0 = abs(out[False]["K_I（変位）[MPa√mm]"] / K_TADA - 1)
+    e1 = abs(out[True]["K_I（変位）[MPa√mm]"] / K_TADA - 1)
+    assert e1 < e0 and e1 < 0.02
+    assert abs(out[True]["K（J から）[MPa√mm]"] / K_TADA - 1) < 0.02

@@ -79,7 +79,11 @@ def _dN_dx(X: np.ndarray, dNdxi: np.ndarray):
     """X:(E,nn,3) → dN/dx:(E,nn,3), detJ:(E,)"""
     J = np.einsum("enk,nl->ekl", X, dNdxi)
     detJ = np.linalg.det(J)
-    invJ = np.linalg.inv(J)
+    try:
+        invJ = np.linalg.inv(J)
+    except np.linalg.LinAlgError:
+        # ヤコビアンが 0 の点（1/4 点要素のき裂先端の節点など）: そこだけ擬似逆行列（有限の値で表示用）
+        invJ = np.linalg.pinv(J)
     dNdx = np.einsum("nl,elk->enk", dNdxi, invJ)
     return dNdx, detJ
 

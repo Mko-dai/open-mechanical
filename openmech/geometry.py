@@ -2005,6 +2005,15 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
             nfix = straighten_bad_tet10(mesh, log=log)
             if nfix:
                 fix_msgs.append(f"曲がりすぎた 2 次要素 {nfix:,} 個の中間節点を直線化")
+        crk = [c for c in (ms.get("cracks") or []) if not c.get("suppressed")] if not shell else []
+        if crk and order == 2 and hasattr(mesh, "crack_faces"):
+            # き裂前縁の 1/4 点要素（中間節点の直線化のあとで。1/4 点要素はヤコビアン比が低くて当然なので）
+            from .fracture import quarter_point
+            nq = sum(quarter_point(mesh, c["front0"], c["front1"], tol=1e-6 * diag)
+                     for c in crk if c.get("quarter_point", True))
+            if nq:
+                mesh.quarter_point = True
+                log(f"き裂前縁の 1/4 点要素: 中間節点 {nq:,} 個")
         if fix_msgs:
             log("メッシュ自動修正: " + " / ".join(fix_msgs))
         mesh.fix_log = fix_msgs

@@ -74,7 +74,8 @@ def k_from_j(J, E, nu, plane_stress=False):
     return float(np.sqrt(max(J, 0.0) * Ep))
 
 
-def k_displacement(mesh: Mesh, u, E, nu, front0, front1, direction, r_max, symmetric=False, plane_stress=False):
+def k_displacement(mesh: Mesh, u, E, nu, front0, front1, direction, r_max, symmetric=False, plane_stress=False,
+                   quarter=False):
     """変位外挿法: 前縁の後ろ（き裂面上 θ = ±π）の開口・ずれ変位から K_I, K_II, K_III [MPa√mm]
     K_I = G √(2π/r) Δu_2 /(κ+1)（Δu: 上下面の開口量）を r → 0 に直線外挿"""
     p0, p1, L, t, e1, e2 = _frame(front0, front1, direction)
@@ -110,9 +111,14 @@ def k_displacement(mesh: Mesh, u, E, nu, front0, front1, direction, r_max, symme
         sgn = np.sign(np.median(d @ e2)) or 1.0
         d *= sgn
     f = np.sqrt(2 * np.pi / np.maximum(r, 1e-30)) * G / (1 + kappa)     # Δu = K (κ+1)/G √(r/2π)
-    # 先端の 2 要素以内は通常の 2 次要素では √r の変位を表せず低く出るので使わない
     rmin = float(r.min())
-    keep = r >= 4 * rmin - 1e-12
+    if quarter:
+        # 1/4 点要素: 先端の要素の外側（1〜4 要素目）の値がほぼ一定になるので、それを r の 1 次式で外挿する
+        # （1/4 点の節点そのものは要素のゆがみの影響が大きい。実測で 2 点式 KCALC より誤差が小さい）
+        keep = (r >= 4 * rmin * (1 - 1e-6)) & (r <= 16 * rmin * (1 + 1e-6))
+    else:
+        # 先端の 2 要素以内は通常の 2 次要素では √r の変位を表せず低く出るので使わない
+        keep = r >= 4 * rmin - 1e-12
     if keep.sum() >= 2:
         r, d, f = r[keep], d[keep], f[keep]
     out = []
@@ -217,7 +223,8 @@ def evaluate_cracks(mesh: Mesh, result, cracks, h_ref=None):
                "K（J から）[MPa√mm]": k_from_j(J, m0.E, m0.nu)}
         try:
             KI, KII, KIII = k_displacement(mesh, u, m0.E, m0.nu, p0, p1, e1, 10 * hf,
-                                           symmetric=bool(c.get("symmetric")))
+                                           symmetric=bool(c.get("symmetric")),
+                                           quarter=bool(getattr(mesh, "quarter_point", False)))
             row.update({"K_I（変位）[MPa√mm]": KI, "K_II（変位）[MPa√mm]": KII, "K_III（変位）[MPa√mm]": KIII})
         except ValueError as e:
             row["メモ"] = str(e)
@@ -226,3 +233,30 @@ def evaluate_cracks(mesh: Mesh, result, cracks, h_ref=None):
             row["安全率（K_IC / K）"] = float(c["toughness"]) / max(row["K（J から）[MPa√mm]"], 1e-30)
         rows.append(row)
     return rows
+
+
+def quarter_point(mesh: Mesh, front0, front1, tol=None) -> int:
+    """前縁に頂点がある 2 次要素の辺の中間節点を、前縁から 1/4 の位置へ動かす（1/4 点要素、Barsoum 1976）。
+    要素の中で変位が √r、応力が 1/√r になり、き裂先端の特異性を表せる（Ansys のき裂メッシュと同じ）。
+    戻り値: 動かした中間節点の数"""
+    from .solver import _EDGES10
+    if mesh.elems.shape[1] != 10:
+        return 0
+    p0, p1 = np.asarray(front0, float), np.asarray(front1, float)
+    t = p1 - p0
+    L = float(np.linalg.norm(t))
+    t = t / L
+    X = mesh.nodes
+    if tol is None:
+        tol = 1e-6 * float(np.ptp(X, axis=0).max())
+    onf = _dist_to_front(X, p0, p1, t, L) < tol
+    moved = set()
+    for k, (i, j) in enumerate(_EDGES10):
+        a_, b_, m_ = mesh.elems[:, i], mesh.elems[:, j], mesh.elems[:, 4 + k]
+        for f, o in ((a_, b_), (b_, a_)):
+            sel = onf[f] & ~onf[o]
+            for fi, oi, mi in zip(f[sel], o[sel], m_[sel]):
+                if int(mi) not in moved:
+                    X[mi] = 0.75 * X[fi] + 0.25 * X[oi]
+                    moved.add(int(mi))
+    return len(moved)
