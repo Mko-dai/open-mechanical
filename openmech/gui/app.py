@@ -4791,7 +4791,8 @@ class MainWindow(QMainWindow):
             f"<b>B: {self._analysis_label()}</b><br>{RESULT_NAME.get(key, key)}<br>"
             f"タイプ: {RESULT_TYPE_JP.get(key, RESULT_NAME.get(key, key))}<br>"
             + (f"単位: {unit}<br>" if unit else "")
-            + f"時間: {getattr(r, 'time', 1.0):g} s<br>{datetime.datetime.now():%Y/%m/%d %H:%M}<br>"
+            + (f"{r.label}<br>" if getattr(r, "label", "") else f"時間: {getattr(r, 'time', 1.0):g} s<br>")
+            + f"{datetime.datetime.now():%Y/%m/%d %H:%M}<br>"
             f"変形倍率: {'変形なし' if scale == 0 else f'{scale:g} 倍'}<br><br>"
             f"<span style='color:#c00'>最大 {real[1]:.5g}</span>"
             f"<br><span style='color:#c00;font-size:11px'>　位置 ({xmax[0]:.4g}, {xmax[1]:.4g}, {xmax[2]:.4g}) mm</span>"

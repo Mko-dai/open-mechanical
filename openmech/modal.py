@@ -61,25 +61,32 @@ ITERATIVE_DOF = 300_000     # これより大きいモデルは AMG 前処理の
 
 
 def _eig_lobpcg(Kff, Mff, n, sigma, log, coords=None):
-    """大規模モデル向け: (K − σM) の AMG を前処理にした LOBPCG で、小さい方から n 個"""
+    """大規模モデル向け: シフト逆反復ランチョス。(K − σM)⁻¹ は AMG 前処理の共役勾配法で解く
+    （直接法の分解をしないのでメモリが少ない。AMG の準備は 1 回だけ）"""
     import pyamg  # noqa: F401
     from .amg import build as build_amg
-    from .solver import _rigid_modes
+    from .solver import _pcg, _rigid_modes
     nd = Kff.shape[0]
     A = (Kff - sigma * Mff).tocsr() if sigma != 0 else Kff.tocsr()
     t0 = time.time()
     comps = coords[:, 3].astype(int) if coords is not None else None
     B = _rigid_modes(coords, nd) if coords is not None else None
     P = build_amg(A, B, comps=comps)
-    prec = spla.LinearOperator((nd, nd), matvec=lambda r: P(r), dtype=float)
-    k = n + max(4, n // 2)
-    rng = np.random.default_rng(0)
-    X = rng.standard_normal((nd, k))
-    lam, vec = spla.lobpcg(A, X, B=Mff, M=prec, largest=False, tol=1e-8, maxiter=400)
-    lam = lam + sigma
-    log(f"  LOBPCG（AMG 前処理）: {n} 個（{time.time() - t0:.1f} s）")
+    log(f"  AMG 準備 {time.time() - t0:.1f} s")
+    count = [0, 0]
+
+    def solve(b):
+        x, info, it = _pcg(A, b, P, tol=1e-10, maxiter=2000)
+        count[0] += 1
+        count[1] += it
+        return x
+    OPinv = spla.LinearOperator((nd, nd), matvec=solve, dtype=float)
+    ncv = min(nd - 1, max(2 * n + 1, n + 16))
+    lam, vec = spla.eigsh(Kff, k=n, M=Mff, sigma=sigma, which="LM", OPinv=OPinv, ncv=ncv, tol=1e-9)
+    log(f"  シフト逆反復（AMG＋CG）: {n} 個 / 解いた回数 {count[0]}・CG 反復 平均 {count[1] / max(count[0], 1):.0f} 回"
+        f"（{time.time() - t0:.1f} s）")
     o = np.argsort(lam)
-    return lam[o][:n], vec[:, o][:, :n]
+    return lam[o], vec[:, o]
 
 
 def _eig(Kff, Mff, n, sigma, log, label="固有値", coords=None):
