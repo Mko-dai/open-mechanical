@@ -128,6 +128,26 @@ for k in A.BC_SPEC:
 P(f"境界条件の追加 OK: {len(A.BC_SPEC)} 種類")
 w.grab().save(os.path.join(out, "bcs.png"))
 # はり（骨組み）
+# 収束ツール（適応メッシュ）: 結果の詳細から実行
+try:
+    run("収束前の静解析", "static", [fix, BC("force", right, [0, 0, -1000.0])], shot="conv_before")
+    w.project.analysis_opts["convergence"] = {"allowable": 2.0, "max_loops": 2}
+    w.select_node(("result", 1))
+    app.processEvents()
+    w.run_convergence("相当応力（ミーゼス） [MPa]")
+    w.worker.wait()
+    for _ in range(20):
+        app.processEvents()
+    hist = w.project.analysis_opts.get("convergence_history") or []
+    w.select_node(("result", 1))
+    app.processEvents()
+    w.grab().save(os.path.join(out, "convergence.png"))
+    P(f"OK  収束ツール: {len(hist)} 回 / 要素 {[h['要素数'] for h in hist]} / "
+      f"変化 {[h['変化 [%]'] for h in hist]} / 表 {shown[-1] if shown else '-'}"
+      + (f" / メッセージ: {msgs[-1]}" if msgs else ""))
+    msgs.clear()
+except Exception:
+    P("NG  収束ツール\n" + traceback.format_exc())
 try:
     from openmech.gui.frame_dialog import EXAMPLE, FrameDialog
     d = FrameDialog(w, model=EXAMPLE)

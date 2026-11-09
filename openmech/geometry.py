@@ -904,6 +904,7 @@ MESH_DEFAULTS = {
     "min_quality": 0.05,          # 自動修正の目標: 要素品質の下限（Ansys の要素品質と同じ定義）
     # 近接の捕捉（Ansys の Capture Proximity）: 薄肉・狭いすき間に指定の要素数が入るよう要素を小さくする
     "capture_proximity": False,
+    "size_points": [],             # 局所の要素サイズ [[x, y, z, h], ...]（適応メッシュが設定）
     "proximity_cells": 3,         # すき間（板厚）を横切る要素数（Ansys の Num Cells Across Gap、既定 3）
     "proximity_min_size": 0.0,    # 近接の最小サイズ [mm]（0 = 曲率の最小サイズと同じ）
     "proximity_max_elements": 3e6,  # 近接の捕捉で見積もった要素数がこれを超えたら中止
@@ -1587,13 +1588,25 @@ def _apply_proximity(gmsh, h, ms, log):
     from scipy.spatial import cKDTree
     cells = max(1, int(ms.get("proximity_cells", 3)))
     pmin = float(ms.get("proximity_min_size") or 0) or float(ms.get("curvature_min_size") or 0) or h * 0.05
-    gmsh.model.mesh.generate(2)
-    pts, size, rad = _proximity_points(gmsh, h, cells, pmin)
-    gmsh.model.mesh.clear()
+    sp = np.asarray(ms.get("size_points") or [], float).reshape(-1, 4)
+    if ms.get("capture_proximity"):
+        gmsh.model.mesh.generate(2)
+        pts, size, rad = _proximity_points(gmsh, h, cells, pmin)
+        gmsh.model.mesh.clear()
+        if not len(pts):
+            log("近接の捕捉: 薄い部分・狭いすき間は見つかりませんでした")
+    else:
+        pts, size, rad = np.zeros((0, 3)), np.zeros(0), np.zeros(0)
+    est = getattr(_proximity_points, "estimate", 0.0) if ms.get("capture_proximity") else 0.0
+    if len(sp):
+        # 適応メッシュ（adaptive.py）が決めた局所の要素サイズ: 点 (x,y,z) の周り（半径 = そのサイズ）を細かく
+        pts = np.vstack([pts, sp[:, :3]])
+        size = np.r_[size, sp[:, 3]]
+        rad = np.r_[rad, sp[:, 3]]
+        pmin = min(pmin, float(sp[:, 3].min()))
+        log(f"局所の細分化: {len(sp):,} 点（最小 {float(sp[:, 3].min()):.3g} mm）")
     if not len(pts):
-        log("近接の捕捉: 薄い部分・狭いすき間は見つかりませんでした")
         return None
-    est = getattr(_proximity_points, "estimate", 0.0)
     limit = float(ms.get("proximity_max_elements", 3e6))
     if est > limit:
         raise GeometryError(
@@ -1627,7 +1640,8 @@ def _apply_proximity(gmsh, h, ms, log):
         k = min(max(int(round((z - lo[2]) / step[2])), 0), n[2] - 1)
         return min(lc, float(grid[i, j, k]))
     gmsh.model.mesh.setSizeCallback(cb)
-    log(f"近接の捕捉: 薄い部分・すき間 {len(pts):,} か所（最小 {float(size.min()):.3g} mm、すき間に {cells} 要素）")
+    if ms.get("capture_proximity"):
+        log(f"近接の捕捉: 薄い部分・すき間 {len(pts) - len(sp):,} か所（最小 {float(size.min()):.3g} mm、すき間に {cells} 要素）")
     return float(size.min())
 
 
@@ -1757,7 +1771,7 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
             else:
                 mesh = _sweep_mesh(gmsh, sw, order, h, log)
         else:
-            if ms.get("capture_proximity"):
+            if ms.get("capture_proximity") or ms.get("size_points"):
                 pm = _apply_proximity(gmsh, h, ms, log)
                 if pm is not None:
                     gmsh.option.setNumber("Mesh.MeshSizeMin", min(gmsh.option.getNumber("Mesh.MeshSizeMin"), pm))

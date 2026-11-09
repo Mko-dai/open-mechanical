@@ -254,3 +254,23 @@ def test_piezo_rotated_polarization():
                                      BC("voltage", [face(m, 0, 1, 1)], [100.])],
                               elem_materials=([st], np.zeros(m.n_elems, int)), **q)
     assert abs(s.stress[:, 0].mean()) == pytest.approx(15.1e-3 * 100, rel=1e-6)
+
+
+def test_adaptive_error_estimator():
+    """ZZ 誤差推定: 片持ちはりで要素を細かくすると推定誤差が下がり、細分化点は固定端側に集まる"""
+    from openmech.adaptive import _merge, element_errors, refine_points
+    from openmech.solver import material_D
+    D = material_D(S)[None]
+    rels = []
+    for nx in (10, 20, 40):
+        m = bar(nx=nx)
+        r = solve(m, S, [BC("fixed", [face(m, 0, 0, -1)]), BC("force", [face(m, 0, 200, 1)], (0, 0, -100.0))])
+        err, U = element_errors(m, r.u.ravel(), D)
+        rels.append(np.sqrt((err ** 2).sum() / U))
+        assert err.shape == (m.n_elems,) and U > 0
+    assert rels[0] > rels[1] > rels[2]
+    pts = refine_points(m, err, frac=0.2)
+    assert pts.shape[1] == 4 and len(pts) > 0
+    assert np.mean(pts[:, 0]) < 100.0                       # 曲げモーメントが大きい固定端側
+    merged = _merge(pts, pts * [1, 1, 1, 0.5])
+    assert len(merged) >= len(pts) and merged[:, 3].min() <= pts[:, 3].min()

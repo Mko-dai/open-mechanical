@@ -4053,6 +4053,69 @@ class MainWindow(QMainWindow):
         b = QPushButton("パスに沿ったグラフ…")
         b.clicked.connect(lambda: self._path_plot(key))
         self._row(tools, "", b)
+        if not key.startswith(("疲労:", "式:", "接触:")) and self.project.analysis_type in ("static",):
+            s3 = self._section("収束（適応メッシュ）")
+            co = (self.project.analysis_opts or {}).get("convergence", {})
+            w = dspin(float(co.get("allowable", 5.0)), 0.1, 100, 2, 1.0, "%")
+            w.valueChanged.connect(lambda v: self._conv_opt("allowable", float(v)))
+            self._row(s3, "許容変化", w)
+            sp = QSpinBox()
+            sp.setRange(1, 10)
+            sp.setValue(int(co.get("max_loops", 4)))
+            sp.valueChanged.connect(lambda v: self._conv_opt("max_loops", int(v)))
+            self._row(s3, "最大の細分化回数", sp)
+            b = QPushButton("この結果の最大値が収束するまでメッシュを細かくする")
+            b.clicked.connect(lambda: self.run_convergence(key))
+            self._row(s3, "", b)
+            self._row(s3, "", "応力の誤差（ZZ 法）が大きい所だけ要素を半分の大きさにして解き直し、"
+                              "最大値の変化が許容値以下になるまで繰り返します（Ansys の収束ツールと同じ考え方）")
+            hist = (self.project.analysis_opts or {}).get("convergence_history")
+            if hist:
+                hb = QPushButton("収束の履歴…")
+                from .charts import table_dialog as _td
+                hb.clicked.connect(lambda: _td(self, "収束の履歴", hist))
+                self._row(s3, "", hb)
+
+    def _conv_opt(self, k, v):
+        """収束ツールの設定（結果は無効にしない）"""
+        o = dict(self.project.analysis_opts or {})
+        o["convergence"] = dict(o.get("convergence", {}), **{k: v})
+        self.project.analysis_opts = o
+
+    def run_convergence(self, key):
+        """適応メッシュで、結果 key の最大値が収束するまで解き直す（別スレッド）"""
+        from ..adaptive import converge
+        co = (self.project.analysis_opts or {}).get("convergence", {})
+        self._busy(True, "適応メッシュで収束させています…")
+
+        p = self.project
+        body_ls = p.body_local_sizes(self.mesh) if self.mesh is not None else []
+
+        def mesh_fn():
+            return build_mesh(p.geometry, p.mesh_size, p.mesh_order, log=lambda *a: None,
+                              local_sizes=p.local_sizes + body_ls, share=p.share_map(), settings=p.mesh_settings)
+
+        def job(log=print):
+            return converge(p, field=key, stat="max", allowable=float(co.get("allowable", 5.0)),
+                            max_loops=int(co.get("max_loops", 4)), log=log, mesh_fn=mesh_fn)
+        self.worker = Worker(job)
+        self.worker.log.connect(lambda m: (self.solver_log.append(m), self.log(m)))
+
+        def done(out):
+            mesh, res, hist = out
+            self.mesh = mesh
+            self.mesh_dirty = False
+            mesh.face_info()
+            self.project.analysis_opts = dict(self.project.analysis_opts or {}, convergence_history=[
+                {k: (round(v, 6) if isinstance(v, float) else ("-" if v is None else v)) for k, v in h.items()}
+                for h in hist])
+            self._on_solved(res)
+            self.refresh_view()
+            from .charts import table_dialog
+            table_dialog(self, "収束の履歴", self.project.analysis_opts["convergence_history"])
+        self.worker.done.connect(done)
+        self.worker.failed.connect(self._on_solve_failed)
+        self.worker.start()
 
     def open_frame(self):
         """はり要素（骨組み）解析のダイアログ。材料は材料ライブラリとプロジェクトの材料定数"""
