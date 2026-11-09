@@ -165,3 +165,17 @@ def test_norton_creep_relaxation():
     exact = (s0 ** (1 - n) + (n - 1) * E * A * T) ** (1 / (1 - n))
     assert abs(r.stress[:, 0].mean() / exact - 1) < 0.01
     assert r.stress[:, 0].mean() < 0.8 * s0
+
+
+def test_hyperelastic_nearly_incompressible_bending_no_locking():
+    """ほぼ非圧縮（K = 1000 μ）のゴムの片持ちはり: 体積成分の選択的低減積分で体積ロッキングしない
+    （微小荷重なので、はり理論（せん断変形込み、E = 9Kμ/(3K+μ)）と比べる）"""
+    m = structured_box(100, 10, 10, 20, 2, 2).to_quadratic()
+    mat = Material("ゴム", 1.0, 0.49, 1100, hyper={"model": "neo_hookean", "mu": 1.0})
+    P = 0.01
+    r = solve_static(m, mat, [BC("fixed", [0]), BC("force", [1], [0, 0, -P])], settings=AnalysisSettings(),
+                     elem_materials=_em(m, mat.state()), log=lambda *a: None)[-1]
+    K, mu = 1000.0, 1.0
+    E = 9 * K * mu / (3 * K + mu)
+    exact = P * 100 ** 3 / (3 * E * 10 * 10 ** 3 / 12) + P * 100 / (5 / 6 * mu * 100)
+    assert abs(-r.u[:, 2].min() / exact - 1) < 0.03

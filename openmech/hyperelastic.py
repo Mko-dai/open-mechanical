@@ -57,8 +57,8 @@ class HyperModel:
     def __init__(self, h: dict):
         self.c10, self.c01, self.c20, self.c30, self.d = coefficients(h)
 
-    def _S_from_C(self, C):
-        """C (n,3,3)（複素可）→ S (n,3,3)"""
+    def _S_from_C(self, C, part="all"):
+        """C (n,3,3)（複素可）→ S (n,3,3)。part: "all" / "iso"（偏差だけ）/ "vol"（体積だけ）"""
         I = np.eye(3)
         J2 = np.linalg.det(C)
         J = np.sqrt(J2)
@@ -74,9 +74,15 @@ class HyperModel:
         WJ = 2.0 / self.d * (J - 1.0)
         dI1b = Jm23[:, None, None] * (I[None] - (I1 / 3.0)[:, None, None] * Ci)
         dI2b = Jm43[:, None, None] * (I1[:, None, None] * I[None] - C - (2.0 / 3.0 * I2)[:, None, None] * Ci)
-        return 2 * (W1[:, None, None] * dI1b + W2 * dI2b) + (WJ * J)[:, None, None] * Ci
+        iso = 2 * (W1[:, None, None] * dI1b + W2 * dI2b)
+        vol = (WJ * J)[:, None, None] * Ci
+        return iso if part == "iso" else vol if part == "vol" else iso + vol
 
-    def S_C(self, Ev):
+    def pressure(self, J):
+        """コーシー応力の体積成分 σ = U'(J) I の U'(J)（U = (J−1)²/d）"""
+        return 2.0 / self.d * (J - 1.0)
+
+    def S_C(self, Ev, part="all"):
         """グリーン・ラグランジュひずみ Ev (n,6)（工学せん断）→ S (n,6), 接線 D = ∂S/∂E (n,6,6)"""
         n = len(Ev)
         h = 1e-30
@@ -95,7 +101,7 @@ class HyperModel:
             else:
                 Cb[:, k + 1, i, j] += 1j * h
                 Cb[:, k + 1, j, i] += 1j * h
-        Sm = self._S_from_C(Cb.reshape(-1, 3, 3)).reshape(n, 7, 3, 3)
+        Sm = self._S_from_C(Cb.reshape(-1, 3, 3), part).reshape(n, 7, 3, 3)
         Sv = np.stack([Sm[..., i, j] for i, j in VOIGT], axis=-1)       # (n,7,6)
         S = Sv[:, 0].real
         D = (Sv[:, 1:].imag / h).transpose(0, 2, 1)                     # D[:, a, k] = ∂S_a/∂E_k

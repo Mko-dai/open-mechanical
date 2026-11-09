@@ -192,6 +192,13 @@ class PlasticSolid:
             self.B.append(_B_matrix(dNdx))
             self.wd.append(self.wts[g] * detJ)
             self.dNdX.append(dNdx)
+        # 超弾性の選択的低減積分（体積成分は要素中心 1 点）。Tet10 で、ほぼ非圧縮（K/μ > 100）のときだけ。
+        # 圧縮性のある材料では通常の積分の方が正確（低減積分は少し柔らかくなる）
+        self.hyper_sri = nn == 10 and any(2.0 / hm.d / (2 * (hm.c10 + hm.c01)) > 100 for hm in self.hyper.values())
+        if self.hyper_sri:
+            Lc = np.full(4, 0.25)
+            self.dNdX_c, detc = _dN_dx(X, shape_dN_dxi(Lc, nn))
+            self.wd_c = np.sum(self.wts) * detc
         self.ep = np.zeros((ng, E, 6))
         self.alpha = np.zeros((ng, E, 6))
         self.pbar = np.zeros((ng, E))
@@ -272,7 +279,8 @@ class PlasticSolid:
             for mi, hm in self.hyper.items():
                 sel = np.nonzero(self.elem_mat == mi)[0]
                 if len(sel):
-                    S[sel], Ct[sel] = hm.S_C(Eg[sel])
+                    # 偏差成分だけ積分点で。体積成分は要素の中心 1 点で（選択的低減積分: ほぼ非圧縮の体積ロッキング対策）
+                    S[sel], Ct[sel] = hm.S_C(Eg[sel], "iso" if self.hyper_sri else "all")
             B = _tl_BL(F, dNdX)
             fe += np.einsum("e,eki,ek->ei", wd, B, S)
             Ke += np.einsum("e,eki,ekl,elj->eij", wd, B, Ct, B, optimize=True)
@@ -284,6 +292,27 @@ class PlasticSolid:
             J = np.linalg.det(F)
             sg = np.einsum("eik,ekl,ejl->eij", F, Sm, F) / J[:, None, None]
             sig_all[g] = np.stack([sg[:, 0, 0], sg[:, 1, 1], sg[:, 2, 2], sg[:, 0, 1], sg[:, 1, 2], sg[:, 0, 2]], 1)
+        if self.hyper and self.hyper_sri:
+            # 体積成分: 要素の中心で J を評価し、要素の体積で積分（W_vol は 1 点、偏差は 4 点）
+            dNc, wc = self.dNdX_c, self.wd_c
+            Fc = np.eye(3) + np.einsum("eak,eal->ekl", Ue, dNc)
+            Egc = _green(Fc)
+            Bc = _tl_BL(Fc, dNc)
+            for mi, hm in self.hyper.items():
+                sel = np.nonzero(self.elem_mat == mi)[0]
+                if not len(sel):
+                    continue
+                Sv, Cv = hm.S_C(Egc[sel], "vol")
+                ws = wc[sel]
+                Bs = Bc[sel]
+                fe[sel] += np.einsum("e,eki,ek->ei", ws, Bs, Sv)
+                Ke[sel] += np.einsum("e,eki,ekl,elj->eij", ws, Bs, Cv, Bs, optimize=True)
+                Sm = np.stack([Sv[:, [0, 3, 5]], Sv[:, [3, 1, 4]], Sv[:, [5, 4, 2]]], axis=1)
+                Gm = np.einsum("eai,eij,ebj->eab", dNc[sel], Sm, dNc[sel]) * ws[:, None, None]
+                for k in range(3):
+                    Ke[sel, k::3, k::3] += Gm
+                p = hm.pressure(np.linalg.det(Fc[sel]))      # 表示用: コーシー応力に体積成分を足す
+                sig_all[:, sel, :3] += p[None, :, None]
         self.trial = (ep_n, al_n, pb_n, sig_all, pc_n)
         f = np.zeros(3 * mesh.n_nodes)
         np.add.at(f, self.dofs.ravel(), fe.ravel())
