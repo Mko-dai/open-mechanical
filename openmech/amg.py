@@ -53,7 +53,7 @@ class _Level:
         d = self.A.diagonal()
         dinv = 1.0 / np.where(d != 0, d, 1.0)
         self.dinv = dinv
-        self.prec = prec if prec is not None else (lambda v: dinv * v)
+        self.prec = prec if prec is not None else (lambda v: dinv * v if np.ndim(v) == 1 else dinv[:, None] * v)
         lm = _lambda_max(self.mv, self.A.shape[0], self.prec) * 1.15
         self.a, self.b = lm / 30.0, lm
         self.P = P

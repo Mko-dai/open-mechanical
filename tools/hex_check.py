@@ -32,8 +32,10 @@ R, H = 10.0, 50.0
 m = build_mesh({"kind": "cylinder", "r": R, "h": H}, size=2.0, order=2, log=lambda *a: None,
                local_sizes=[{"type": "sweep", "axis": "Z", "element": "hex"}])
 z0, z1 = face_where(m, 2, 0.0, -1), face_where(m, 2, H, 1)
+c0 = int(np.argmin(np.linalg.norm(m.nodes - [0, 0, 0], axis=1)))
+c1 = int(np.argmin(np.linalg.norm(m.nodes - [R, 0, 0], axis=1)))     # z 軸まわりの回転を止める
 r = solve(m, mat, [BC("symmetry", [z0]), BC("pressure", [z1], [-100.0]),
-                   BC("displacement", [], [0.0, 0.0, None], nodes=[int(np.argmin(np.linalg.norm(m.nodes - [0, 0, 0], axis=1)))])],
+                   BC("displacement", [], [0.0, 0.0, None], nodes=[c0]), BC("displacement", [], [None, 0.0, None], nodes=[c1])],
           log=lambda *a: None)
 print(f"円柱 Hex20: 要素 {m.n_elems:,} / 体積 {m.volume():.3f}（理論 {np.pi * R * R * H:.3f}）/ σz 平均 {r.stress[:, 2].mean():.3f}"
       f"（理論 100）/ 伸び {r.u[:, 2].max():.6f}（理論 {100 * H / 200000:.6f}）")

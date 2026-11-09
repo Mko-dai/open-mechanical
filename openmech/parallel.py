@@ -111,7 +111,7 @@ class ParallelMatvec:
     def __call__(self, x):
         if self.blocks is None:
             return self.A @ x
-        out = np.empty(self.shape[0])
+        out = np.empty((self.shape[0],) + np.shape(x)[1:])      # ベクトルでも複数列（ブロック）でも
 
         def run(blk):
             a, b, B = blk

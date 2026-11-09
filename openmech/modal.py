@@ -57,6 +57,7 @@ def _free_dofs(mesh, material, bcs, extra_fixed=None):
     return free
 
 
+EIG_METHOD = "auto"     # 大規模: "auto"（LOBPCG → だめならシフト逆反復）/ "lobpcg" / "shift_invert"
 ITERATIVE_DOF = 300_000     # これより大きいモデルは AMG 前処理の LOBPCG（直接法の分解はメモリを使いすぎる）
 
 
@@ -89,6 +90,90 @@ def _eig_lobpcg(Kff, Mff, n, sigma, log, coords=None):
     return lam[o], vec[:, o]
 
 
+def lobpcg_block(K, M, n, prec, X0=None, tol=1e-6, maxiter=300, guard=None, log=None, mv=None):
+    """LOBPCG（局所最適ブロック前処理付き共役勾配法, Knyazev 2001）で K x = λ M x の小さい方から n 個。
+
+    ブロック（複数列）の行列積と前処理（AMG の V サイクルを列まとめて）だけで解くので、1 本ずつ連立方程式を
+    解くシフト逆反復より速い。収束判定は前処理した残差 ‖P(Kx − λMx)‖ / ‖x‖ ≤ tol（最初の n 個）。
+    """
+    nd = K.shape[0]
+    m = n + (guard if guard is not None else max(4, n // 2))
+    mvK = mv(K) if mv else (lambda X: K @ X)
+    mvM = mv(M) if mv else (lambda X: M @ X)
+    rng = np.random.default_rng(1)
+    X = rng.standard_normal((nd, m)) if X0 is None else np.asarray(X0, float)
+    if X0 is None:
+        X = prec(X)              # 前処理で滑らかにした初期値
+    KX, MX = mvK(X), mvM(X)
+    P = KP = MP = None
+    lam = None
+    hist = []
+
+    def rr(S, KS, MS, k):
+        """Rayleigh-Ritz: 部分空間 S で小さい方から k 個。ほぼ一次従属な方向は落とす"""
+        G = S.T @ MS
+        G = 0.5 * (G + G.T)
+        d, V = np.linalg.eigh(G)
+        keep = d > 1e-12 * d.max()
+        T = V[:, keep] / np.sqrt(d[keep])
+        H = T.T @ (S.T @ KS) @ T
+        H = 0.5 * (H + H.T)
+        w, Y = np.linalg.eigh(H)
+        return w[:k], T @ Y[:, :k]
+
+    w, C = rr(X, KX, MX, m)
+    X, KX, MX = X @ C, KX @ C, MX @ C
+    lam = w
+    for it in range(1, maxiter + 1):
+        R = KX - MX * lam
+        # 収束の目安: 前処理した残差 ‖P(Kx − λMx)‖ / ‖x‖（P ≈ K⁻¹ なので固有ベクトルの誤差に相当）。
+        # 生の残差 ‖Kx − λMx‖/‖Kx‖ は、丸め誤差の高い振動数の成分を K が大きくするため 1e-4 程度で頭打ちになる
+        Wall = prec(R)
+        rel = np.linalg.norm(Wall, axis=0) / np.maximum(np.linalg.norm(X, axis=0), 1e-300)
+        hist.append(float(rel[:n].max()))
+        if rel[:n].max() <= tol:
+            break
+        if len(hist) > 12 and hist[-1] < 1e2 * tol and hist[-1] > 0.7 * min(hist[-12:-1]):
+            break                                       # 丸め誤差の床で停滞（十分小さい）
+        act = np.nonzero(rel > tol * 0.1)[0]          # 収束した列は方向を足さない（ソフトロック）
+        W = Wall[:, act]
+        KW, MW = mvK(W), mvM(W)
+        if P is None:
+            S, KS, MS = np.hstack([X, W]), np.hstack([KX, KW]), np.hstack([MX, MW])
+        else:
+            S, KS, MS = np.hstack([X, W, P]), np.hstack([KX, KW, KP]), np.hstack([MX, MW, MP])
+        w, C = rr(S, KS, MS, m)
+        Xn, KXn, MXn = S @ C, KS @ C, MS @ C
+        # P = 新しい X のうち W・P 方向の成分（次の反復の共役方向）
+        Cp = C.copy()
+        Cp[:m] = 0.0
+        P, KP, MP = S @ Cp, KS @ Cp, MS @ Cp
+        X, KX, MX, lam = Xn, KXn, MXn, w
+        if log and it % 10 == 0:
+            log(f"    LOBPCG {it} 回: 最大相対残差 {hist[-1]:.1e}")
+    nrm = np.sqrt(np.einsum("ij,ij->j", X, MX))
+    return lam[:n], (X / nrm)[:, :n], it, hist
+
+
+def _eig_block(Kff, Mff, n, log, coords=None):
+    """大規模モデル向け（σ = 0）: AMG 前処理の LOBPCG。列をまとめて計算するのでシフト逆反復より速い"""
+    from .amg import build as build_amg
+    from .parallel import ParallelMatvec
+    from .solver import _rigid_modes
+    nd = Kff.shape[0]
+    t0 = time.time()
+    comps = coords[:, 3].astype(int) if coords is not None else None
+    B = _rigid_modes(coords, nd) if coords is not None else None
+    K = Kff.tocsr()
+    P = build_amg(K, B, comps=comps)
+    log(f"  AMG 準備 {time.time() - t0:.1f} s")
+    lam, vec, it, hist = lobpcg_block(K, Mff.tocsr(), n, P, tol=1e-6, log=log, mv=ParallelMatvec)
+    log(f"  LOBPCG（AMG 前処理）: {n} 個 / {it} 回 / 最大相対残差 {hist[-1]:.1e}（{time.time() - t0:.1f} s）")
+    if hist[-1] > 1e-4:
+        raise RuntimeError("LOBPCG が収束しませんでした")
+    return lam, vec
+
+
 def _eig(Kff, Mff, n, sigma, log, label="固有値", coords=None):
     """一般化固有値問題 K x = λ M x の、sigma に近い n 個（シフト逆反復＋ランチョス）。
     大きなモデルで pyamg があれば AMG 前処理の LOBPCG（小さい方から）"""
@@ -96,6 +181,13 @@ def _eig(Kff, Mff, n, sigma, log, label="固有値", coords=None):
     n = max(1, min(n, nd - 2))
     if nd > ITERATIVE_DOF and sigma <= 0:
         try:
+            if sigma == 0 and EIG_METHOD in ("auto", "lobpcg"):
+                try:
+                    return _eig_block(Kff, Mff, n, log, coords)
+                except RuntimeError as e:
+                    if EIG_METHOD == "lobpcg":
+                        raise
+                    log(f"  {e} → シフト逆反復に切り替えます")
             return _eig_lobpcg(Kff, Mff, n, sigma, log, coords)
         except ImportError:
             log("  （pyamg がないため直接法で分解します。大きなモデルはメモリを多く使います）")

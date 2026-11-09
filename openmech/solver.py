@@ -930,8 +930,14 @@ def _linear_solve(A: sp.csc_matrix, b: np.ndarray, log=print, coords=None,
             # 収束が遅い（剛性差の大きい材料・薄い層など）→ 頑健な AMG に作り直して続きから解く
             log(f"  {it} 回で収束しないため、頑健な AMG（平滑化集約）に切り替えます")
             del M
-            M = build_amg(A, B, comps=coords[:, 3].astype(int) if coords is not None else None, robust=True,
-                          lines=lines)
+            try:
+                M = build_amg(A, B, comps=coords[:, 3].astype(int) if coords is not None else None, robust=True,
+                              lines=lines)
+            except RuntimeError as e:
+                if "singular" in str(e):
+                    raise RuntimeError("剛性マトリクスが特異です。拘束が不足しています（剛体移動・回転が止まっていない、"
+                                       "または浮いた部品があります）。支持条件を確認してください。") from None
+                raise
             t3 = time.time()
             xsol, info, it2 = _pcg(A.tocsr(), b, M, tol=1e-10, maxiter=3000, x0=xsol)
             rr = _rel_res(A, xsol, b)

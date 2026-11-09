@@ -274,3 +274,25 @@ def test_adaptive_error_estimator():
     assert np.mean(pts[:, 0]) < 100.0                       # 曲げモーメントが大きい固定端側
     merged = _merge(pts, pts * [1, 1, 1, 0.5])
     assert len(merged) >= len(pts) and merged[:, 3].min() <= pts[:, 3].min()
+
+
+def test_lobpcg_block_matches_shift_invert():
+    """LOBPCG（ブロック）の固有値がシフト逆反復と一致（前処理は分解した K）"""
+    from openmech.dynamics import consistent_mass
+    from openmech.modal import _eig, lobpcg_block
+    from openmech.solver import assemble_stiffness, factorize, material_D
+    m = bar(nx=20)
+    K = assemble_stiffness(m, material_D(S))
+    M = consistent_mass(m, np.full(m.n_elems, S.density_t_mm3))
+    free = np.ones(K.shape[0], bool)
+    fx = np.nonzero(m.nodes[:, 0] < 1e-9)[0]
+    free[(3 * fx[:, None] + np.arange(3)).ravel()] = False
+    Kf, Mf = K[free][:, free].tocsr(), M[free][:, free].tocsr()
+    lam0, _ = _eig(Kf, Mf, 6, 0.0, lambda *a: None)
+    solve = factorize(Kf.tocsc(), lambda *a: None)
+
+    def prec(R):
+        return np.column_stack([solve(R[:, j]) for j in range(R.shape[1])])
+    lam, vec, it, hist = lobpcg_block(Kf, Mf, 6, prec, tol=1e-6)
+    assert np.allclose(lam, lam0, rtol=1e-9) and it < 30
+    assert np.allclose(vec.T @ (Mf @ vec), np.eye(6), atol=1e-8)
