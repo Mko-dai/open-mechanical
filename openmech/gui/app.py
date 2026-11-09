@@ -5009,7 +5009,10 @@ class MainWindow(QMainWindow):
             nrm = np.zeros(3)
             nrm[sec_ax] = 1.0
             clipped = grid.clip(normal=nrm, origin=org + scale * 0.0, invert=True)
-            poly = clipped.extract_surface(nonlinear_subdivision=2)
+            try:
+                poly = clipped.extract_surface(nonlinear_subdivision=2, algorithm="dataset_surface")
+            except TypeError:                     # 古い pyvista
+                poly = clipped.extract_surface(nonlinear_subdivision=2)
             self._tri_src = None
         self._main_actor = pl.add_mesh(
             poly, scalars=en, cmap=cmap, n_colors=n_colors, clim=[vmin, vmax], show_edges=show_el,
