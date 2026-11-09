@@ -95,6 +95,7 @@ def lobpcg_block(K, M, n, prec, X0=None, tol=1e-6, maxiter=300, guard=None, log=
 
     ブロック（複数列）の行列積と前処理（AMG の V サイクルを列まとめて）だけで解くので、1 本ずつ連立方程式を
     解くシフト逆反復より速い。収束判定は前処理した残差 ‖P(Kx − λMx)‖ / ‖x‖ ≤ tol（最初の n 個）。
+    大きなモデルでもメモリを増やさないよう、部分空間 [X, W, P] は連結せずブロックのまま扱う。
     """
     nd = K.shape[0]
     m = n + (guard if guard is not None else max(4, n // 2))
@@ -106,29 +107,42 @@ def lobpcg_block(K, M, n, prec, X0=None, tol=1e-6, maxiter=300, guard=None, log=
         X = prec(X)              # 前処理で滑らかにした初期値
     KX, MX = mvK(X), mvM(X)
     P = KP = MP = None
-    lam = None
     hist = []
 
-    def rr(S, KS, MS, k):
-        """Rayleigh-Ritz: 部分空間 S で小さい方から k 個。ほぼ一次従属な方向は落とす"""
-        G = S.T @ MS
-        G = 0.5 * (G + G.T)
+    def rr(blocks, k):
+        """Rayleigh-Ritz: 部分空間（ブロックの並び (S, KS, MS)）で小さい方から k 個。ほぼ一次従属な方向は落とす"""
+        nb = len(blocks)
+        G = np.block([[blocks[a][0].T @ blocks[b][2] for b in range(nb)] for a in range(nb)])
+        H = np.block([[blocks[a][0].T @ blocks[b][1] for b in range(nb)] for a in range(nb)])
+        G, H = 0.5 * (G + G.T), 0.5 * (H + H.T)
         d, V = np.linalg.eigh(G)
         keep = d > 1e-12 * d.max()
         T = V[:, keep] / np.sqrt(d[keep])
-        H = T.T @ (S.T @ KS) @ T
-        H = 0.5 * (H + H.T)
-        w, Y = np.linalg.eigh(H)
+        w, Y = np.linalg.eigh(T.T @ H @ T)
         return w[:k], T @ Y[:, :k]
 
-    w, C = rr(X, KX, MX, m)
+    def comb(blocks, C, idx):
+        """Σ ブロック[idx] × C の対応する行（新しい配列を 1 つだけ作る）"""
+        out = None
+        r0 = 0
+        for S in blocks:
+            c = C[r0:r0 + S[0].shape[1]]
+            r0 += S[0].shape[1]
+            if not np.any(c):
+                continue
+            t = S[idx] @ c
+            out = t if out is None else out.__iadd__(t)
+        return out
+
+    lam, C = rr([(X, KX, MX)], m)
     X, KX, MX = X @ C, KX @ C, MX @ C
-    lam = w
+    it = 0
     for it in range(1, maxiter + 1):
         R = KX - MX * lam
         # 収束の目安: 前処理した残差 ‖P(Kx − λMx)‖ / ‖x‖（P ≈ K⁻¹ なので固有ベクトルの誤差に相当）。
         # 生の残差 ‖Kx − λMx‖/‖Kx‖ は、丸め誤差の高い振動数の成分を K が大きくするため 1e-4 程度で頭打ちになる
         Wall = prec(R)
+        del R
         rel = np.linalg.norm(Wall, axis=0) / np.maximum(np.linalg.norm(X, axis=0), 1e-300)
         hist.append(float(rel[:n].max()))
         if rel[:n].max() <= tol:
@@ -136,19 +150,18 @@ def lobpcg_block(K, M, n, prec, X0=None, tol=1e-6, maxiter=300, guard=None, log=
         if len(hist) > 12 and hist[-1] < 1e2 * tol and hist[-1] > 0.7 * min(hist[-12:-1]):
             break                                       # 丸め誤差の床で停滞（十分小さい）
         act = np.nonzero(rel > tol * 0.1)[0]          # 収束した列は方向を足さない（ソフトロック）
-        W = Wall[:, act]
+        W = np.ascontiguousarray(Wall[:, act])
+        del Wall
         KW, MW = mvK(W), mvM(W)
-        if P is None:
-            S, KS, MS = np.hstack([X, W]), np.hstack([KX, KW]), np.hstack([MX, MW])
-        else:
-            S, KS, MS = np.hstack([X, W, P]), np.hstack([KX, KW, KP]), np.hstack([MX, MW, MP])
-        w, C = rr(S, KS, MS, m)
-        Xn, KXn, MXn = S @ C, KS @ C, MS @ C
-        # P = 新しい X のうち W・P 方向の成分（次の反復の共役方向）
+        blocks = [(X, KX, MX), (W, KW, MW)] + ([(P, KP, MP)] if P is not None else [])
+        lam, C = rr(blocks, m)
         Cp = C.copy()
-        Cp[:m] = 0.0
-        P, KP, MP = S @ Cp, KS @ Cp, MS @ Cp
-        X, KX, MX, lam = Xn, KXn, MXn, w
+        Cp[:m] = 0.0                                    # 共役方向 = 新しい X のうち W・P の成分
+        newP = [comb(blocks, Cp, k) for k in range(3)]
+        newX = [comb(blocks, C, k) for k in range(3)]
+        del blocks, W, KW, MW
+        X, KX, MX = newX
+        P, KP, MP = newP
         if log and it % 10 == 0:
             log(f"    LOBPCG {it} 回: 最大相対残差 {hist[-1]:.1e}")
     nrm = np.sqrt(np.einsum("ij,ij->j", X, MX))
