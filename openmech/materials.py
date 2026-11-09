@@ -56,6 +56,8 @@ class Material:
     hyper: dict = field(default_factory=dict)
     # クリープ（Ansys の Norton, TBOPT=10）: ε̇cr = C1 σ^C2 exp(−C3/T)  {"C1": [1/s/MPa^C2], "C2": 指数, "C3": [K]}
     creep: dict = field(default_factory=dict)
+    # 複合材の層の強度（composite.py の破損評価）: {"Xt","Xc","Yt","Yc","S"} [MPa]（圧縮も正の値）
+    composite_strength: dict = field(default_factory=dict)
 
     @property
     def density_t_mm3(self) -> float:

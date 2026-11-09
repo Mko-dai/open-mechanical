@@ -87,7 +87,8 @@ RESULT_GROUPS = {
     "速度（過渡）": [("速度 [mm/s]", "速度"), ("速度 X [mm/s]", "方向速度 X"), ("速度 Y [mm/s]", "方向速度 Y"),
                 ("速度 Z [mm/s]", "方向速度 Z")],
     "ひずみ・シェル": [("相当塑性ひずみ", "相当塑性ひずみ"), ("相当応力（上面） [MPa]", "相当応力（シェル上面）"),
-                 ("相当応力（下面） [MPa]", "相当応力（シェル下面）")],
+                 ("相当応力（下面） [MPa]", "相当応力（シェル下面）"), ("相当クリープひずみ", "相当クリープひずみ"),
+                 ("複合材 破損指標", "複合材 破損指標（積層シェル）")],
     "接触ツール": [("接触:接触状態", "接触状態"), ("接触:接触圧 [MPa]", "接触圧"), ("接触:貫通量 [mm]", "貫通量"),
                ("接触:すべり距離 [mm]", "すべり距離"), ("接触:摩擦応力 [MPa]", "摩擦応力"), ("接触:隙間 [mm]", "隙間")],
     "熱": [("温度 [°C]", "温度"), ("全熱流束 [W/m²]", "全熱流束"), ("方向熱流束 X [W/m²]", "方向熱流束 X"),
@@ -588,6 +589,7 @@ class MainWindow(QMainWindow):
                                        grp[0]), menu=m)
         g2 = R.add_group(t, "破壊")
         R.button(g2, "J 積分・K", make_icon("#a61e4d", "J"), self.show_fracture)
+        R.button(g2, "積層の層", make_icon("#5f3dc4", "層"), self.show_plies)
         g = R.add_group(t, "表示")
         self.scale_combo = QComboBox()
         for label, v in [("変形なし", 0.0), ("実寸", 1.0), ("自動（強調）", -1.0), ("×10", 10.0),
@@ -4241,7 +4243,13 @@ class MainWindow(QMainWindow):
                                      elem_materials=em, settings=p.settings, n_cores=p.settings.n_cores)
             else:
                 from ..shell import solve_shell
-                self.worker = Worker(solve_shell, self.mesh, p.material, list(p.bcs), elem_materials=em,
+                try:
+                    lam = p.laminate(self.mesh)
+                except ValueError as e:
+                    self._busy(False)
+                    QMessageBox.warning(self, "積層", str(e))
+                    return
+                self.worker = Worker(solve_shell, self.mesh, p.material, list(p.bcs), elem_materials=em, laminate=lam,
                                      n_cores=p.settings.n_cores, settings=p.settings)
         elif p.needs_nonlinear_solver(self.mesh):
             self._busy(True, "解析を実行しています…")
@@ -4297,6 +4305,16 @@ class MainWindow(QMainWindow):
             return
         table_dialog(self, "破壊パラメータ（J 積分・応力拡大係数）", [
             {k: (round(v, 5) if isinstance(v, float) else v) for k, v in row.items()} for row in rows])
+
+    def show_plies(self):
+        from .charts import table_dialog
+        r = self.results[-1] if self.results else None
+        rows = getattr(r, "plies", None) if r is not None else None
+        if not rows:
+            QMessageBox.information(self, "積層", "積層シェルの結果がありません（ボディ属性の「積層（複合材）」で層を定義して解析してください）。")
+            return
+        table_dialog(self, "積層の層ごとの応力（材料主軸）と破損指標", [
+            {k: (round(v, 4) if isinstance(v, float) else v) for k, v in row.items()} for row in rows])
 
     def edit_cracks(self):
         from .crack_dialog import CrackDialog

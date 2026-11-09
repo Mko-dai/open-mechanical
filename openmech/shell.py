@@ -267,20 +267,33 @@ _DRL = np.array([5, 11, 17])
 _MEMR = np.array([0, 1, 5, 6, 7, 11, 12, 13, 17])   # 膜 + 回転（Allman）
 
 
-def shell_element_K(X, t, Dp, drill=1e-3):
-    """要素剛性（全体座標, (E,18,18)）と 局所座標系 R、局所座標 xy、面積 A"""
+def shell_element_K(X, t, Dp, drill=1e-3, laminate=None):
+    """要素剛性（全体座標, (E,18,18)）と 局所座標系 R、局所座標 xy、面積 A
+    laminate: composite.Laminates（積層の要素は A・B・D マトリクスで膜・曲げ・連成を作る）"""
     E = len(X)
     R, xy, A = _frames(X)
     Dd = np.broadcast_to(Dp, (E, 3, 3)) if Dp.ndim == 2 else Dp
-    Km = _allman_K(xy, A, t, Dd)
-    Db = (t ** 3 / 12)[:, None, None] * (np.broadcast_to(Dp, (E, 3, 3)) if Dp.ndim == 2 else Dp)
+    if laminate is not None and laminate.any:
+        Am, Bc, Db = laminate.element_abd(R, t, Dd)
+        Km = _allman_K(xy, A, np.ones(E), Am)
+    else:
+        Bc = None
+        Km = _allman_K(xy, A, t, Dd)
+        Db = (t ** 3 / 12)[:, None, None] * Dd
     Kb = np.zeros((E, 9, 9))
+    Kmb = np.zeros((E, 9, 9))
     for xi, eta in GP3:
         B = _dkt_B(xy, xi, eta)
         Kb += np.einsum("e,eki,ekl,elj->eij", A / 3, B, Db, B)
+        if Bc is not None:
+            Bm, _, _ = _allman_B(xy, A, (1 - xi - eta, xi, eta))
+            Kmb += np.einsum("e,eki,ekl,elj->eij", A / 3, Bm, Bc, B)    # 膜と曲げの連成（非対称積層）
     Kl = np.zeros((E, 18, 18))
     Kl[:, _MEMR[:, None], _MEMR[None, :]] = Km
     Kl[:, _BEN[:, None], _BEN[None, :]] = Kb
+    if Bc is not None:
+        Kl[:, _MEMR[:, None], _BEN[None, :]] += Kmb
+        Kl[:, _BEN[:, None], _MEMR[None, :]] += Kmb.transpose(0, 2, 1)
     T = np.zeros((E, 18, 18))
     for k in range(6):
         T[:, 3 * k:3 * k + 3, 3 * k:3 * k + 3] = R
@@ -484,7 +497,7 @@ def _layer_to_global(R, s):
 
 
 def solve_shell(mesh: ShellMesh, material, bcs: list[BC], elem_materials=None, log=print, progress=None,
-                method="auto", n_cores=None, settings=None) -> Result:
+                method="auto", n_cores=None, settings=None, laminate=None) -> Result:
     """シェルの静解析（線形、または塑性材料があれば弾塑性）"""
     from .parallel import set_threads
     if n_cores is not None:
@@ -500,7 +513,10 @@ def solve_shell(mesh: ShellMesh, material, bcs: list[BC], elem_materials=None, l
     Dps = np.stack([plane_stress_D(material_D(m)) for m in mats])
     Dp = Dps[elem_mat]
     X = mesh.nodes[mesh.elems]
-    t = mesh.thickness
+    t = mesh.thickness.copy()
+    if laminate is not None and laminate.any:
+        for i, tt in laminate.thickness().items():
+            t[laminate.lay == i] = tt
     R, xy, A = _frames(X)
     normals = R[:, 2]
     nd = 6 * mesh.n_nodes
@@ -509,6 +525,8 @@ def solve_shell(mesh: ShellMesh, material, bcs: list[BC], elem_materials=None, l
     used = np.zeros(nd, bool)
     used[dofs.ravel()] = True
     plastic = any(getattr(m, "plastic", False) for m in mats)
+    if plastic and laminate is not None and laminate.any:
+        raise ValueError("積層シェルと塑性材料の組み合わせにはまだ対応していません")
     log(f"シェル: 節点 {mesh.n_nodes:,}、要素 {mesh.n_elems:,}" + ("（弾塑性）" if plastic else ""))
     extra = {}
     if plastic:
@@ -525,7 +543,7 @@ def solve_shell(mesh: ShellMesh, material, bcs: list[BC], elem_materials=None, l
         extra["相当塑性ひずみ"] = _nodal_avg(mesh, peq[:, None], A)[:, 0]
         R_all = ps.internal(u)[0] - F
     else:
-        Ke, R, xy, A = shell_element_K(X, t, Dp)
+        Ke, R, xy, A = shell_element_K(X, t, Dp, laminate=laminate)
         rows = np.repeat(dofs, 18, axis=1).ravel()
         cols = np.tile(dofs, (1, 18)).ravel()
         K = sp.coo_matrix((Ke.ravel(), (rows, cols)), shape=(nd, nd)).tocsr()
@@ -546,9 +564,17 @@ def solve_shell(mesh: ShellMesh, material, bcs: list[BC], elem_materials=None, l
         em = np.einsum("eij,ej->ei", _allman_B(xy, A, (1 / 3, 1 / 3, 1 / 3))[0], ul[:, _MEMR])
         kap = np.einsum("eij,ej->ei", _dkt_B(xy, 1 / 3, 1 / 3), ul[:, _BEN])
         out = {}
+        lam_info = laminate.info if (laminate is not None and laminate.any) else {}
         for name, z in (("上面", 0.5), ("下面", -0.5)):
             s = np.einsum("eij,ej->ei", Dp, em + (z * t)[:, None] * kap)
+            for e, (zz, Qb, Ts, li) in lam_info.items():       # 積層: 最外層の Q̄ で上下面の応力
+                k = len(Qb) - 1 if z > 0 else 0
+                s[e] = Qb[k] @ (em[e] + (zz[-1] if z > 0 else zz[0]) * kap[e])
             out[name] = _nodal_avg(mesh, _layer_to_global(R, s), A)
+        if lam_info:
+            fi, layer, rows = laminate.ply_results(em, kap, mesh.n_elems)
+            extra["複合材 破損指標"] = _nodal_avg(mesh, fi[:, None], A)[:, 0]
+            ply_rows = rows
         R_all = K @ u - F
     vm = {k: _mises(v) for k, v in out.items()}
     top_bigger = vm["上面"] >= vm["下面"]
@@ -569,6 +595,9 @@ def solve_shell(mesh: ShellMesh, material, bcs: list[BC], elem_materials=None, l
         r.extra[f"応力 {lab}（上面） [MPa]"] = out["上面"][:, k]
         r.extra[f"応力 {lab}（下面） [MPa]"] = out["下面"][:, k]
     r.rotations = U[:, 3:].copy()
+    if laminate is not None and laminate.any and not plastic:
+        r.plies = ply_rows
+        r.info["積層"] = f"{len(laminate.layups)} 種類・{int((laminate.lay >= 0).sum()):,} 要素"
     return r
 
 

@@ -212,6 +212,35 @@ try:
     md.close()
 except Exception:
     P("NG  材料ダイアログ\n" + traceback.format_exc())
+# 積層シェル（複合材）
+try:
+    from openmech.gui.femtet_dialogs import BodyAttrDialog
+    w.new_project()
+    app.processEvents()
+    w.create_body("plate", dialog=True)
+    app.processEvents()
+    pj = w.project
+    pj.materials["CFRP"] = Material("CFRP", 135000, 0.3, 1600, elastic="orthotropic",
+                                    ortho={"Ex": 135000, "Ey": 10000, "Ez": 10000, "nuxy": 0.3, "nuyz": 0.4,
+                                           "nuxz": 0.3, "Gxy": 5000, "Gyz": 3600, "Gxz": 5000},
+                                    composite_strength={"Xt": 1500, "Xc": 1200, "Yt": 50, "Yc": 250, "S": 70})
+    bd = BodyAttrDialog("積層板", {"mesh_size": 0.0, "layup": {"plies": [["CFRP", 0.25, a] for a in (0, 45, -45, 90, 90, -45, 45, 0)]}}, w)
+    nm, props = bd.result()
+    pj.body_attrs[nm] = props
+    pj.assign(w.mesh.body_ids().tolist(), attr=nm, mat="CFRP")
+    info3 = w.mesh.face_info()
+    edges = [f for f in info3 if w.mesh.is_edge(f["id"])]
+    e_lo = min(edges, key=lambda f: f["centroid"][0])["id"]
+    e_hi = max(edges, key=lambda f: f["centroid"][0])["id"]
+    fr = run("積層シェル（[0/45/-45/90]s）", "static", [BC("fixed", [e_lo]), BC("force", [e_hi], [0, 0, -50.0])],
+             results=["全変形 [mm]", "複合材 破損指標"], shot="laminate")
+    n0 = len(shown)
+    w.show_plies()
+    P(f"OK  積層: {w.results[-1].info.get('積層')} / 破損指標 最大 {w.results[-1].extra['複合材 破損指標'].max():.4g} / "
+      f"層の表 {shown[n0:]}" + (f" / メッセージ: {msgs[-1]}" if msgs else ""))
+    msgs.clear()
+except Exception:
+    P("NG  積層シェル\n" + traceback.format_exc())
 P("完了")
 logf.close()
 w.close()

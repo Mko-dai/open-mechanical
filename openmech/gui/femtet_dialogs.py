@@ -397,6 +397,18 @@ class MaterialDialog(QDialog):
         f9.addRow(QLabel("Norton 則 ε̇cr = C1 σ^C2 exp(−C3/T)（Ansys の TBOPT=10 と同じ。σ [MPa]、時間 [s]、T [K]）。"
                          "C1 = 0 ならクリープなし。解析設定のステップ終了時間が実時間になります"))
         tabs.addTab(t9, "クリープ")
+        # --- 複合材の層の強度
+        t10 = QWidget()
+        f10 = QFormLayout(t10)
+        cs_ = dict(getattr(m, "composite_strength", None) or {})
+        self.cst = {}
+        for k, lab in [("Xt", "繊維方向 引張 Xt"), ("Xc", "繊維方向 圧縮 Xc"), ("Yt", "直角方向 引張 Yt"),
+                       ("Yc", "直角方向 圧縮 Yc"), ("S", "面内せん断 S")]:
+            self.cst[k] = _spin(float(cs_.get(k, 0.0) or 0.0), 0.0, 1e6, 2, "MPa")
+            f10.addRow(lab, self.cst[k])
+        f10.addRow(QLabel("積層シェルの層の破損評価（最大応力・Tsai-Hill・Tsai-Wu）に使います。0 なら評価しません。\n"
+                          "繊維方向 = 材料座標の X（直交異方性の Ex の向き）"))
+        tabs.addTab(t10, "複合材強度")
         lay.addWidget(tabs)
         _buttons(self, lay)
 
@@ -442,7 +454,9 @@ class MaterialDialog(QDialog):
                         tangent_modulus=self.et.value(), ml_table=mt,
                         conductivity=self.kc.value(), specific_heat=self.cp.value(),
                         permittivity=self.epsr.value(), piezo=self._piezo(),
-                        sn_table=_table_rows(self.sntab, 2), hyper=self._hyper(), creep=self._creep())
+                        sn_table=_table_rows(self.sntab, 2), hyper=self._hyper(), creep=self._creep(),
+                        composite_strength={k: w.value() for k, w in self.cst.items()}
+                        if all(w.value() > 0 for w in self.cst.values()) else {})
 
     def _hyper_enable(self):
         from ..hyperelastic import HYPER_PARAMS
@@ -534,11 +548,55 @@ class BodyAttrDialog(QDialog):
         f2 = QFormLayout(t2)
         f2.addRow(QLabel("解析領域: このボディを解析に含める（静的構造解析）"))
         tabs.addTab(t2, "解析領域")
+        # --- 積層（複合材・シェル）
+        from ..composite import FAILURE_JP
+        t4 = QWidget()
+        v4 = QVBoxLayout(t4)
+        ly = dict(props.get("layup") or {})
+        v4.addWidget(QLabel("積層シェル（複合材）: 層を下面から上面の順に。材料は「材料定数」で直交異方性と強度を設定した名前"))
+        self.plies = _table(["材料名", "厚さ [mm]", "角度 [°]"], ly.get("plies", []) or [], 4)
+        v4.addWidget(self.plies)
+        v4.addWidget(_table_buttons(self.plies))
+        f4 = QFormLayout()
+        ref = list(ly.get("ref") or [1, 0, 0])
+        w4 = QWidget()
+        h4 = QHBoxLayout(w4)
+        h4.setContentsMargins(0, 0, 0, 0)
+        self.ref = [_spin(ref[i], -1e3, 1e3, 3) for i in range(3)]
+        for sp_ in self.ref:
+            h4.addWidget(sp_)
+        f4.addRow("角度 0° の基準方向（全体座標）", w4)
+        self.crit = QComboBox()
+        for k, v in FAILURE_JP.items():
+            self.crit.addItem(v, k)
+        self.crit.setCurrentIndex(max(0, self.crit.findData(ly.get("criterion", "tsai_wu"))))
+        f4.addRow("破損則", self.crit)
+        v4.addLayout(f4)
+        v4.addWidget(QLabel("層が無ければ均質なシェル（板厚はサーフェスの厚さ）。積層の板厚は層の合計になります"))
+        tabs.addTab(t4, "積層（複合材）")
+        self._props = dict(props)
         lay.addWidget(tabs)
         _buttons(self, lay)
 
+    def _layup(self):
+        rows = []
+        for i in range(self.plies.rowCount()):
+            it = [self.plies.item(i, c) for c in range(3)]
+            txt = [x.text().strip() if x is not None else "" for x in it]
+            if not txt[0]:
+                continue
+            try:
+                rows.append([txt[0], float(txt[1]), float(txt[2] or 0)])
+            except ValueError:
+                raise ValueError(f"積層の {i + 1} 行目の厚さ・角度は数値で入力してください")
+        if not rows:
+            return {}
+        return {"plies": rows, "ref": [sp_.value() for sp_ in self.ref], "criterion": self.crit.currentData()}
+
     def result(self):
-        return self.name.text().strip(), {"mesh_size": self.mesh.value(), "cs": [sp.value() for sp in self.cs]}
+        out = dict(self._props)
+        out.update({"mesh_size": self.mesh.value(), "cs": [sp.value() for sp in self.cs], "layup": self._layup()})
+        return self.name.text().strip(), out
 
 
 # ---------------------------------------------------------------------------- 境界条件

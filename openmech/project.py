@@ -253,6 +253,30 @@ class Project:
         return bool(self.contacts or multi or plastic or s.large_deflection or s.n_steps > 1 or s.weak_springs
                     or any(b.step_factors for b in self.bcs))
 
+    def laminate(self, mesh):
+        """ボディ属性の積層（複合材）→ composite.Laminates。積層が無ければ None"""
+        if mesh is None or not getattr(mesh, "is_shell", False) or mesh.elem_body is None:
+            return None
+        from .composite import Laminates
+        lay = np.full(mesh.n_elems, -1, np.int64)
+        layups, keys = [], {}
+        for b in mesh.body_ids():
+            attr = self.assignment(b).get("attr")
+            ly = (self.body_attrs.get(attr, {}) if attr else {}).get("layup") or {}
+            if not ly.get("plies"):
+                continue
+            if attr not in keys:
+                plies = []
+                for name, th, ang in ly["plies"]:
+                    if name not in self.materials:
+                        raise ValueError(f"積層の材料「{name}」がありません（材料定数で作成してください）")
+                    plies.append((self.materials[name].state(), float(th), float(ang)))
+                keys[attr] = len(layups)
+                layups.append({"plies": plies, "ref": ly.get("ref", [1, 0, 0]),
+                               "criterion": ly.get("criterion", "tsai_wu"), "name": attr})
+            lay[mesh.elem_body == b] = keys[attr]
+        return Laminates(lay, layups) if layups else None
+
     @property
     def cracks(self) -> list:
         """き裂（破壊力学）の定義。メッシュに埋め込むので mesh_settings に置く"""
@@ -289,6 +313,7 @@ class Project:
             from .shell import solve_shell
             self.check_shell_supported()
             return [solve_shell(mesh, self.material, self.bcs, elem_materials=em, log=log, progress=progress,
+                                laminate=self.laminate(mesh),
                                 n_cores=self.settings.n_cores, settings=self.settings)]
         if not self.needs_nonlinear_solver(mesh):
             return [solve(mesh, self.material, self.bcs, progress=progress, log=log, elem_materials=em,
