@@ -68,6 +68,9 @@ class ContactRegion:
     slip_tol: float = 0.0
     pinball_mode: str = "auto"          # ピンボール領域: プログラム制御 / 半径（pinball）/ 自動検出値
     stabilization: float = 0.0          # 安定化減衰係数（0 = なし）: 開いている接触にも弱いばねを入れて浮きを防ぐ
+    # ボルトのねじ（Ansys の「幾何補正: ボルトねじ」）: 円筒の接触面を、ねじ山の斜面として扱う
+    # {"point": 軸上の点, "axis": 軸の向き, "half_angle": ねじ山の半角 [度]（メートルねじ 30）, "pitch": ピッチ [mm]}
+    thread: dict = field(default_factory=dict)
     auto: bool = True                   # 自動検出で作られたか
     suppressed: bool = False
 
@@ -279,6 +282,8 @@ def _region_pairs(mesh, reg: ContactRegion, contact_faces, target_faces, E_of_no
         g0 = np.zeros_like(g0)          # 接触するよう調整（初期の隙間・食い込みを無視）
     elif reg.interface == "offset":
         g0 = g0 + reg.offset
+    if reg.thread and reg.thread.get("axis"):
+        slave, masters, best_bc, n, g0, area = _thread_flanks(mesh, reg.thread, slave, masters, best_bc, n, g0, area)
     # 法線剛性: Ansys と同じく 係数 × E / 要素サイズ（面積あたり）、または絶対値
     form = reg.resolved_formulation()
     Eloc = E_of_node[slave]
@@ -296,7 +301,7 @@ def _region_pairs(mesh, reg: ContactRegion, contact_faces, target_faces, E_of_no
         kt = 0.5 * kn
     M = len(slave)
     pr = Pairs(ridx, slave, masters, best_bc, n, g0, area, kn, kt)
-    pr.ctris = ctris
+    pr.ctris = None if (reg.thread and reg.thread.get("axis")) else ctris
     pr.lam_n = np.zeros(M)
     pr.lam_t = np.zeros((M, 3))
     pr.active = np.ones(M, bool) if reg.type in LINEAR_TYPES else (g0 <= 0)
@@ -315,6 +320,32 @@ def _region_pairs(mesh, reg: ContactRegion, contact_faces, target_faces, E_of_no
         pr.slip_tol = reg.slip_tol if reg.slip_tol_mode == "value" else reg.slip_tol * h_char
     pr.stab = max(float(reg.stabilization), 0.0) if reg.nonlinear else 0.0
     return pr
+
+
+def _thread_flanks(mesh, th, slave, masters, bc, n, g0, area):
+    """ねじの幾何補正: 円筒の接触面の各節点に、ねじ山の 2 つの斜面（フランク）の接触を作る。
+
+    フランクの法線 = ±cos α · 軸方向 + sin α · 半径方向（α = ねじ山の半角。メートルねじは 30°）。
+    軸方向に引くと片方のフランクが閉じて軸力を伝え、その tan α 倍の半径方向の力（くさび作用）が生じる。
+    もう片方は開く（非線形の接触で自動的に判定）。面積はフランクの実面積（投影 ÷ sin α の半分ずつ）。
+    ※ Ansys のボルトねじ補正のように らせん の位相までは表さない（ねじ山 1 ピッチより粗い要素向けの平均化モデル）
+    """
+    a = np.radians(float(th.get("half_angle", 30.0)))
+    e = np.asarray(th["axis"], float)
+    e = e / np.linalg.norm(e)
+    p0 = np.asarray(th.get("point", [0, 0, 0]), float)
+    x = mesh.nodes[slave] - p0
+    rv = x - np.outer(x @ e, e)
+    r = rv / np.maximum(np.linalg.norm(rv, axis=1, keepdims=True), 1e-300)
+    sgn = np.sign(np.einsum("ij,ij->i", n, r))
+    sgn[sgn == 0] = 1.0
+    out = []
+    for s_ax in (1.0, -1.0):
+        nf = sgn[:, None] * np.sin(a) * r + s_ax * np.cos(a) * e
+        out.append(nf)
+    f = 0.5 / max(np.sin(a), 1e-6)
+    cat = lambda v: np.concatenate([v, v])  # noqa: E731
+    return cat(slave), cat(masters), cat(bc), np.vstack(out), cat(g0), cat(area) * f
 
 
 def pinball_radius(reg: ContactRegion, h_char: float, diag: float, det_tol: float = 0.0) -> float:
@@ -542,10 +573,17 @@ def contact_results(pairs: list[Pairs], regions, n_nodes: int) -> dict:
             cm = cnt > 0
             pres[cm] = np.where(pr.active[cm], acc[cm] / cnt[cm], 0.0)
             tau[cm] = acc_t[cm] / cnt[cm]
+        if len(np.unique(s)) < len(s):
+            # ねじ（同じ節点に 2 つのフランク）: 接触圧の大きい方を表示（後に書いた値が残るので昇順に並べる）
+            o = np.argsort(pres, kind="stable")
+            s, status, pres, tau, g = s[o], status[o], pres[o], tau[o], g[o]
+            act, slide = pr.active[o], pr.slide[o]
+        else:
+            act, slide = pr.active, pr.slide
         out["接触状態"][s] = status
         out["接触圧 [MPa]"][s] = pres
-        out["貫通量 [mm]"][s] = np.where(pr.active, np.maximum(-g, 0), 0)
-        out["すべり距離 [mm]"][s] = np.where(status == ST_SLIDING, pr.slide, 0.0)
+        out["貫通量 [mm]"][s] = np.where(act, np.maximum(-g, 0), 0)
+        out["すべり距離 [mm]"][s] = np.where(status == ST_SLIDING, slide, 0.0)
         out["摩擦応力 [MPa]"][s] = tau
-        out["隙間 [mm]"][s] = np.where(pr.active, 0.0, np.maximum(g, 0))
+        out["隙間 [mm]"][s] = np.where(act, 0.0, np.maximum(g, 0))
     return out

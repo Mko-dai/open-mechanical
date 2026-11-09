@@ -173,3 +173,22 @@ def test_contact_roundtrip_old_file():
     assert c.stiffness_mode == "factor" and c.pinball_mode == "radius"
     c2 = ContactRegion.from_dict(c.to_dict())
     assert c2 == c
+
+
+def test_bolt_thread_flank_wedging():
+    """ボルトねじの幾何補正: 軸方向に引くとフランクが軸力を伝え、半径方向に tan α 倍の力（くさび作用）が出る"""
+    from openmech.contact import ContactRegion
+    m = stack(structured_box(10, 10, 20, 2, 2, 4, origin=(-10, 0, 0)), structured_box(10, 10, 20, 2, 2, 4))
+    ca, tb = face(m, 0, 0, 1), face(m, 0, 0, -1)
+    reg = ContactRegion("ねじ", "frictionless", contact_faces=[ca], target_faces=[tb], contact_body=0, target_body=1,
+                        thread={"point": [-1000, 5, 0], "axis": [0, 0, 1], "half_angle": 30.0})
+    F = 1000.0
+    bcs = [BC("fixed", [face(m, 0, 10, 1)]), BC("frictionless", [face(m, 0, -10, -1)]),
+           BC("symmetry", [f["id"] for f in m.face_info() if abs(f["centroid"][1]) < 1e-9]),
+           BC("force", [f["id"] for f in m.face_info() if abs(f["centroid"][2] - 20) < 1e-9 and f["centroid"][0] < 0],
+              [0, 0, F])]
+    r = solve_static(m, S, bcs, [reg], AnalysisSettings(initial_substeps=2), **quiet)[-1]
+    Rx = r.reactions[1][0]
+    assert abs(abs(Rx) / (F * np.tan(np.radians(30))) - 1) < 0.02
+    # 軸方向は ねじで止まる（ねじがなければ摩擦なし接触では止まらない）
+    assert np.abs(r.u[:, 2]).max() < 0.01
