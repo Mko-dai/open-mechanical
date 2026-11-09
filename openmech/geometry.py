@@ -880,6 +880,12 @@ def _extract_mesh(gmsh, share: dict | None = None) -> Mesh:
         # 対応が取れない場合は角度で自動分割
         mesh.group_faces()
         return mesh
+    _surface_face_ids(mesh, fids, n_surf)
+    return mesh
+
+
+def _surface_face_ids(mesh, fids, n_surf):
+    """CAD サーフェスの番号（ソート順）→ 面番号。ボディ境界の両側を分け、詰めて番号を振る"""
     # ボディ境界のサーフェスは両側に現れる: 番号の小さいボディ側はそのまま、もう一方は n_surf + 番号
     tb = mesh.tri_body()
     first_body = {}
@@ -889,6 +895,113 @@ def _extract_mesh(gmsh, share: dict | None = None) -> Mesh:
     fids = np.where(second, fids + n_surf, fids)
     _, fids = np.unique(fids, return_inverse=True)
     mesh.set_face_ids(fids)
+
+
+# ---------------------------------------------------------------------------- き裂（破壊力学）
+
+def crack_frame(c: dict):
+    """き裂の定義 {"front0": [x,y,z], "front1": [...], "direction": [進展方向], "normal": [き裂面の法線],
+    "depth": 前縁から後ろの長さ, "to_surface": 後ろを表面まで延ばすか} → (p0, p1, t, e1, n, L)"""
+    p0, p1 = np.asarray(c["front0"], float), np.asarray(c["front1"], float)
+    t = p1 - p0
+    L = float(np.linalg.norm(t))
+    if L <= 0:
+        raise GeometryError("き裂前縁の 2 点が同じです")
+    t /= L
+    n = np.asarray(c.get("normal", [0, 1, 0]), float)
+    n = n - (n @ t) * t
+    if np.linalg.norm(n) < 1e-9:
+        raise GeometryError("き裂面の法線が前縁と平行です")
+    n /= np.linalg.norm(n)
+    e1 = np.cross(n, t)
+    d = np.asarray(c.get("direction", e1), float)
+    if d @ e1 < 0:
+        e1 = -e1
+    return p0, p1, t, e1, n, L
+
+
+def _surface_reference(gmsh):
+    """き裂を入れる前の境界の面（三角形の重心・法線・サーフェス番号）を、2D メッシュから記録する"""
+    gmsh.model.mesh.generate(2)
+    surfs = sorted(gmsh.model.getEntities(2), key=lambda e: e[1])
+    tags, coords, _ = gmsh.model.mesh.getNodes()
+    P = np.zeros((int(tags.max()) + 1, 3))
+    P[tags.astype(np.int64)] = coords.reshape(-1, 3)
+    cen, nrm, fid = [], [], []
+    for k, (_, stag) in enumerate(surfs):
+        ets, _, ens = gmsh.model.mesh.getElements(2, stag)
+        for t_, en in zip(ets, ens):
+            npe = {2: 3, 9: 6}.get(int(t_))
+            if npe is None:
+                continue
+            tri = P[en.astype(np.int64).reshape(-1, npe)[:, :3]]
+            cen.append(tri.mean(1))
+            v = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+            nrm.append(v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-300))
+            fid.append(np.full(len(tri), k))
+    gmsh.model.mesh.clear()
+    return np.vstack(cen), np.vstack(nrm), np.concatenate(fid), len(surfs)
+
+
+def _embed_cracks(gmsh, cracks, diag):
+    """き裂面（長方形）を形状に埋め込む（OCC の fragment）。体積の外に出た部分は消す"""
+    occ = gmsh.model.occ
+    occ.synchronize()
+    tools = []
+    m = 0.05 * diag
+    for c in cracks:
+        p0, p1, t, e1, n, L = crack_frame(c)
+        back = (float(c.get("depth", 0.0)) + (m if c.get("to_surface", True) else 0.0))
+        if back <= 0:
+            raise GeometryError("き裂の深さ（前縁から後ろの長さ）を入れてください")
+        a0, a1 = p0 - m * t, p1 + m * t
+        corners = [a0, a1, a1 - back * e1, a0 - back * e1]
+        pts = [occ.addPoint(*q) for q in corners]
+        lines = [occ.addLine(pts[i], pts[(i + 1) % 4]) for i in range(4)]
+        tools.append((2, occ.addPlaneSurface([occ.addCurveLoop(lines)])))
+    vols = gmsh.model.getEntities(3)
+    occ.fragment(vols, tools)
+    occ.synchronize()
+    # 体積に付いていない面（外にはみ出した部分）を消す
+    for dim, tag in gmsh.model.getEntities(2):
+        up, _ = gmsh.model.getAdjacencies(2, tag)
+        if len(up) == 0:
+            occ.remove([(2, tag)], recursive=True)
+    occ.synchronize()
+
+
+def _apply_cracks(mesh, ref, cracks, tol):
+    """面番号を元の形状のサーフェスに合わせ直し、き裂面の節点を複製する"""
+    from scipy.spatial import cKDTree
+    from .fracture import insert_crack
+    cen, nrm, fid0, n_surf = ref
+    bt = mesh.boundary_tris
+    X = mesh.nodes
+    c = X[bt].mean(1)
+    v = np.cross(X[bt[:, 1]] - X[bt[:, 0]], X[bt[:, 2]] - X[bt[:, 0]])
+    v /= np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-300)
+    tree = cKDTree(cen)
+    k = min(8, len(cen))
+    d, idx = tree.query(c, k=k)
+    idx = np.asarray(idx).reshape(len(c), -1)
+    dots = np.einsum("ekj,ej->ek", nrm[idx], v)
+    best = np.argmax(dots > 0.5, axis=1)
+    fids = fid0[idx[np.arange(len(c)), best]]
+    _surface_face_ids(mesh, fids, n_surf)
+    crack_faces = []
+    for cr in cracks:
+        p0, p1, t, e1, n, L = crack_frame(cr)
+        a = float(cr.get("depth", 0.0))
+        to_s = cr.get("to_surface", True)
+
+        def inside(P, p0=p0, t=t, e1=e1, L=L, a=a, to_s=to_s):
+            r = P - p0
+            x1, s = r @ e1, r @ t
+            ok = (x1 < -tol) & (s > -tol) & (s < L + tol)
+            return ok & (to_s | (x1 > -a - tol))
+        mesh, fp = insert_crack(mesh, p0, n, inside, tol=tol)
+        crack_faces.append(fp)
+    mesh.crack_faces = crack_faces
     return mesh
 
 
@@ -904,7 +1017,8 @@ MESH_DEFAULTS = {
     "min_quality": 0.05,          # 自動修正の目標: 要素品質の下限（Ansys の要素品質と同じ定義）
     # 近接の捕捉（Ansys の Capture Proximity）: 薄肉・狭いすき間に指定の要素数が入るよう要素を小さくする
     "capture_proximity": False,
-    "size_points": [],             # 局所の要素サイズ [[x, y, z, h], ...]（適応メッシュが設定）
+    "size_points": [],
+    "cracks": [],                 # き裂（破壊力学）: geometry.crack_frame の辞書のリスト             # 局所の要素サイズ [[x, y, z, h], ...]（適応メッシュが設定）
     "proximity_cells": 3,         # すき間（板厚）を横切る要素数（Ansys の Num Cells Across Gap、既定 3）
     "proximity_min_size": 0.0,    # 近接の最小サイズ [mm]（0 = 曲率の最小サイズと同じ）
     "proximity_max_elements": 3e6,  # 近接の捕捉で見積もった要素数がこれを超えたら中止
@@ -1771,6 +1885,20 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
             else:
                 mesh = _sweep_mesh(gmsh, sw, order, h, log)
         else:
+            cracks = [c for c in (ms.get("cracks") or []) if not c.get("suppressed")]
+            ref = None
+            if cracks:
+                ref = _surface_reference(gmsh)
+                _embed_cracks(gmsh, cracks, diag)
+                log(f"き裂 {len(cracks)} 個を形状に埋め込みました")
+                # 前縁の周りを細かく（Ansys のき裂の「前縁の分割数」に相当: 既定は全体サイズの 1/8）
+                sp = list(ms.get("size_points") or [])
+                for c in cracks:
+                    p0, p1, t, e1, n, L = crack_frame(c)
+                    hf = float(c.get("front_size") or 0) or h / 8
+                    for u_ in np.linspace(0, 1, max(2, int(np.ceil(L / hf)) + 1)):
+                        sp.append([*(p0 + u_ * L * t), hf])
+                ms["size_points"] = sp
             if ms.get("capture_proximity") or ms.get("size_points"):
                 pm = _apply_proximity(gmsh, h, ms, log)
                 if pm is not None:
@@ -1785,6 +1913,8 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
                 gmsh.option.setNumber("Mesh.SecondOrderLinear", 0)  # 曲面に沿わせる
                 gmsh.model.mesh.setOrder(2)
             mesh = _extract_mesh(gmsh, share)
+            if ref is not None:
+                mesh = _apply_cracks(mesh, ref, cracks, 1e-6 * diag)
         if order == 2 and ms.get("auto_fix", True):
             nfix = straighten_bad_tet10(mesh, log=log)
             if nfix:

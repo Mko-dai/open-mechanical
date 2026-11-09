@@ -569,6 +569,8 @@ class MainWindow(QMainWindow):
                                      "heat_generation"]))
         g = R.add_group(t, "電気")
         R.button(g, "電極", make_icon(BC_COLORS["voltage"], "電"), menu=self._bc_menu(["voltage", "ground", "charge"]))
+        g = R.add_group(t, "破壊")
+        R.button(g, "き裂", make_icon("#a61e4d", "裂"), self.edit_cracks)
         g = R.add_group(t, "解析")
         R.button(g, "解析", make_icon("#2e9d3a", "⚡"), self.run_solve)
         R.button(g, "はり（骨組み）", make_icon("#4a78c2", "梁"), self.open_frame)
@@ -584,6 +586,8 @@ class MainWindow(QMainWindow):
                 menu_action(m, "ユーザー定義結果（式）", lambda: self.add_result("式:SEQV"))
             R.button(g, grp, make_icon("#c0392b" if grp == "応力" else "#2c7fb8" if grp == "変形" else "#8e6c2e",
                                        grp[0]), menu=m)
+        g2 = R.add_group(t, "破壊")
+        R.button(g2, "J 積分・K", make_icon("#a61e4d", "J"), self.show_fracture)
         g = R.add_group(t, "表示")
         self.scale_combo = QComboBox()
         for label, v in [("変形なし", 0.0), ("実寸", 1.0), ("自動（強調）", -1.0), ("×10", 10.0),
@@ -4083,11 +4087,10 @@ class MainWindow(QMainWindow):
         self.project.analysis_opts = o
 
     def run_convergence(self, key):
-        """適応メッシュで、結果 key の最大値が収束するまで解き直す（別スレッド）"""
+        """適応メッシュで、結果 key の最大値が収束するまで解き直す。
+        gmsh はスレッドセーフでなく macOS で落ちるため、メッシュ作成と同じくメインスレッドで実行する"""
         from ..adaptive import converge
         co = (self.project.analysis_opts or {}).get("convergence", {})
-        self._busy(True, "適応メッシュで収束させています…")
-
         p = self.project
         body_ls = p.body_local_sizes(self.mesh) if self.mesh is not None else []
 
@@ -4095,27 +4098,29 @@ class MainWindow(QMainWindow):
             return build_mesh(p.geometry, p.mesh_size, p.mesh_order, log=lambda *a: None,
                               local_sizes=p.local_sizes + body_ls, share=p.share_map(), settings=p.mesh_settings)
 
-        def job(log=print):
-            return converge(p, field=key, stat="max", allowable=float(co.get("allowable", 5.0)),
-                            max_loops=int(co.get("max_loops", 4)), log=log, mesh_fn=mesh_fn)
-        self.worker = Worker(job)
-        self.worker.log.connect(lambda m: (self.solver_log.append(m), self.log(m)))
-
-        def done(out):
-            mesh, res, hist = out
-            self.mesh = mesh
-            self.mesh_dirty = False
-            mesh.face_info()
-            self.project.analysis_opts = dict(self.project.analysis_opts or {}, convergence_history=[
-                {k: (round(v, 6) if isinstance(v, float) else ("-" if v is None else v)) for k, v in h.items()}
-                for h in hist])
-            self._on_solved(res)
-            self.refresh_view()
-            from .charts import table_dialog
-            table_dialog(self, "収束の履歴", self.project.analysis_opts["convergence_history"])
-        self.worker.done.connect(done)
-        self.worker.failed.connect(self._on_solve_failed)
-        self.worker.start()
+        def log(m):
+            self.solver_log.append(str(m))
+            self.log(str(m))
+            QApplication.processEvents()
+        self._busy(True, "適応メッシュで収束させています…")
+        QApplication.processEvents()
+        try:
+            mesh, res, hist = converge(p, field=key, stat="max", allowable=float(co.get("allowable", 5.0)),
+                                       max_loops=int(co.get("max_loops", 4)), log=log, mesh_fn=mesh_fn)
+        except Exception as e:
+            self._on_solve_failed(str(e) if isinstance(e, (GeometryError, ValueError, RuntimeError))
+                                  else traceback.format_exc())
+            return
+        self.mesh = mesh
+        self.mesh_dirty = False
+        mesh.face_info()
+        self.project.analysis_opts = dict(self.project.analysis_opts or {}, convergence_history=[
+            {k: (round(v, 6) if isinstance(v, float) else ("-" if v is None else v)) for k, v in h.items()}
+            for h in hist])
+        self._on_solved(res)
+        self.refresh_view()
+        from .charts import table_dialog
+        table_dialog(self, "収束の履歴", self.project.analysis_opts["convergence_history"])
 
     def open_frame(self):
         """はり要素（骨組み）解析のダイアログ。材料は材料ライブラリとプロジェクトの材料定数"""
@@ -4258,11 +4263,51 @@ class MainWindow(QMainWindow):
         result = self.results[-1]
         self.result = result
         self.solve_error = ""
+        if self.project.cracks and hasattr(self.mesh, "crack_faces"):
+            for row in self._fracture_rows():
+                self.log(f"{row['き裂']}: J = {row['J [N/mm]']:.4g} N/mm、K = {row['K（J から）[MPa√mm]']:.4g} MPa√mm")
         self.log("解析が完了しました（" + ", ".join(f"{k} {v}" for k, v in result.info.items()
                                                if k in ("自由度数", "合計時間 [s]", "解析", "ステップ数", "計算時間 [s]")) + "）")
         self.rebuild_tree()
         if self.project.results:
             self.select_node(("result", min(1, len(self.project.results) - 1)))
+
+    def _fracture_rows(self):
+        r = self.results[-1] if self.results else None
+        if r is None or self.mesh is None:
+            return []
+        rows = getattr(r, "fracture", None)
+        if rows is None:
+            try:
+                rows = self.project.fracture(self.mesh, r)
+            except Exception as e:      # 破壊の評価が失敗しても解析結果は使えるようにする
+                self.log("破壊パラメータ: " + str(e))
+                rows = []
+            r.fracture = rows
+        return rows
+
+    def show_fracture(self):
+        from .charts import table_dialog
+        if not self.project.cracks:
+            QMessageBox.information(self, "破壊", "き裂がありません。環境タブの「き裂」で定義してください。")
+            return
+        rows = self._fracture_rows()
+        if not rows:
+            QMessageBox.information(self, "破壊", "解析結果がありません（き裂を入れてメッシュを作り直し、解析してください）。")
+            return
+        table_dialog(self, "破壊パラメータ（J 積分・応力拡大係数）", [
+            {k: (round(v, 5) if isinstance(v, float) else v) for k, v in row.items()} for row in rows])
+
+    def edit_cracks(self):
+        from .crack_dialog import CrackDialog
+        lo, hi = (self.mesh.bounds() if self.mesh is not None else (np.zeros(3), np.ones(3) * 100))
+        d = CrackDialog(self, list((self.project.mesh_settings or {}).get("cracks", [])), lo, hi)
+        if d.exec():
+            ms = dict(self.project.mesh_settings or {})
+            ms["cracks"] = d.cracks()
+            self.project.mesh_settings = ms
+            self.invalidate(mesh=True)
+            self.log(f"き裂 {len(ms['cracks'])} 個（メッシュを作り直すと形状に埋め込みます）")
 
     def _on_solve_failed(self, msg):
         self._busy(False)

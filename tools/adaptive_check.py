@@ -16,8 +16,9 @@ L, W, t, d, F = 200.0, 50.0, 5.0, 10.0, 5000.0
 spec = {"kind": "plate_hole", "lx": L, "ly": W, "t": t, "d": d}
 p = Project(geometry=spec, mesh_size=5.0, mesh_order=2, material=Material("steel", 200000.0, 0.3, 7850.0))
 m0 = build_mesh(spec, size=5.0, order=2, log=lambda *a: None)
-# 左端は固定（穴から 100 mm 離れているのでポアソン拘束の影響は無視できる）、右端に引張
-p.bcs = [BC("fixed", [face_where(m0, 0, 0.0, -1)]), BC("force", [face_where(m0, 0, L, 1)], [F, 0.0, 0.0])]
+# 左端は法線方向だけ拘束（固定にすると角が特異点になり、最大値が収束しない）、剛体移動は弱いばねで止める
+p.bcs = [BC("frictionless", [face_where(m0, 0, 0.0, -1)]), BC("force", [face_where(m0, 0, L, 1)], [F, 0.0, 0.0])]
+p.settings.weak_springs = True
 q = d / W
 kt = 3 - 3.14 * q + 3.667 * q ** 2 - 1.527 * q ** 3
 target = kt * F / ((W - d) * t)

@@ -136,9 +136,7 @@ try:
     w.select_node(("result", 1))
     app.processEvents()
     w.run_convergence("相当応力（ミーゼス） [MPa]")
-    w.worker.wait()
-    for _ in range(20):
-        app.processEvents()
+    app.processEvents()
     hist = w.project.analysis_opts.get("convergence_history") or []
     w.select_node(("result", 1))
     app.processEvents()
@@ -149,6 +147,28 @@ try:
     msgs.clear()
 except Exception:
     P("NG  収束ツール\n" + traceback.format_exc())
+# 破壊（き裂を埋め込んで J 積分・K）
+try:
+    w.project.mesh_settings = dict(w.project.mesh_settings or {}, cracks=[
+        {"name": "縁き裂", "front0": [25.0, 25.0, 0.0], "front1": [25.0, 25.0, 20.0], "normal": [0, 1, 0],
+         "direction": [1, 0, 0], "depth": 25.0, "to_surface": True, "toughness": 3000.0}])
+    w.remesh()
+    app.processEvents()
+    info2 = w.mesh.face_info()
+    ylo = [f["id"] for f in info2 if f["flat"] and abs(f["centroid"][1]) < 1e-6]
+    yhi = [f["id"] for f in info2 if f["flat"] and abs(f["centroid"][1] - 50) < 1e-6]
+    fr = run("き裂（縁き裂の引張）", "static", [BC("fixed", ylo), BC("pressure", yhi, [-10.0])], shot="crack")
+    n0 = len(shown)
+    w.show_fracture()
+    row = (w.results[-1].fracture or [{}])[0]
+    P(f"OK  破壊: き裂面 {getattr(w.mesh, 'crack_faces', None)} / 節点 {w.mesh.n_nodes:,} / "
+      f"J {row.get('J [N/mm]', float('nan')):.4g} / K {row.get('K（J から）[MPa√mm]', float('nan')):.4g} / "
+      f"K_I(変位) {row.get('K_I（変位）[MPa√mm]', float('nan')):.4g} / 表 {shown[n0:] }"
+      + (f" / メッセージ: {msgs[-1]}" if msgs else ""))
+    msgs.clear()
+    w.project.mesh_settings = dict(w.project.mesh_settings, cracks=[])
+except Exception:
+    P("NG  破壊\n" + traceback.format_exc())
 try:
     from openmech.gui.frame_dialog import EXAMPLE, FrameDialog
     d = FrameDialog(w, model=EXAMPLE)

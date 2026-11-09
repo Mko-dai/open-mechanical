@@ -253,6 +253,18 @@ class Project:
         return bool(self.contacts or multi or plastic or s.large_deflection or s.n_steps > 1 or s.weak_springs
                     or any(b.step_factors for b in self.bcs))
 
+    @property
+    def cracks(self) -> list:
+        """き裂（破壊力学）の定義。メッシュに埋め込むので mesh_settings に置く"""
+        return [c for c in (self.mesh_settings or {}).get("cracks", []) if not c.get("suppressed")]
+
+    def fracture(self, mesh, result) -> list:
+        """き裂ごとの J・K（Ansys の破壊ツール）。き裂が無ければ空"""
+        if not self.cracks or getattr(result, "u", None) is None or not hasattr(mesh, "crack_faces"):
+            return []
+        from .fracture import evaluate_cracks
+        return evaluate_cracks(mesh, result, self.cracks)
+
     def run(self, mesh=None, log=print, progress=None):
         """解析を実行して最終時点の結果を返す（全ステップは run_all）"""
         return self.run_all(mesh, log, progress)[-1]
