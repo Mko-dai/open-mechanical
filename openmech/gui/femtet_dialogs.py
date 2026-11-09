@@ -160,7 +160,7 @@ def _table(headers, rows, n_min=3):
     t.setHorizontalHeaderLabels(headers)
     for i, r in enumerate(rows):
         for j, v in enumerate(r):
-            t.setItem(i, j, QTableWidgetItem(f"{float(v):g}"))
+            t.setItem(i, j, QTableWidgetItem(v if isinstance(v, str) else f"{float(v):g}"))
     t.horizontalHeader().setStretchLastSection(True)
     t.setMinimumHeight(140)
     return t
