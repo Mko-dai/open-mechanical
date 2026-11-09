@@ -192,3 +192,109 @@ def quad_load_weights(nodes, quads):
             wn += wa * wb * N[None, :, None] * nv[:, None, :]
             area += wa * wb * dA
     return idx, w, wn, area
+
+
+# ============================================================================ 六面体（Hex8 / Hex20）
+# Ansys の SOLID185 / SOLID186（六面体）に相当。自然座標 (ξ, η, ζ) ∈ [-1, 1]³
+# 節点の順序（VTK と同じ）: 0-3 下面（ζ=-1、反時計回り）、4-7 上面、
+#   Hex20 の中間節点 8:(0,1) 9:(1,2) 10:(2,3) 11:(3,0) 12:(4,5) 13:(5,6) 14:(6,7) 15:(7,4) 16:(0,4) 17:(1,5) 18:(2,6) 19:(3,7)
+HEX_CORNERS = np.array([[-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
+                        [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]], float)
+HEX20_EDGES = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)]
+HEX_QUAD_FACES = np.array([[0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]])  # 外向き
+HEX20_QUAD_LOOP = np.array([[0, 11, 3, 10, 2, 9, 1, 8], [4, 12, 5, 13, 6, 14, 7, 15], [0, 8, 1, 17, 5, 12, 4, 16],
+                            [1, 9, 2, 18, 6, 13, 5, 17], [2, 10, 3, 19, 7, 14, 6, 18], [3, 11, 0, 16, 4, 15, 7, 19]])
+_HEX20_MID = np.array([0.5 * (HEX_CORNERS[i] + HEX_CORNERS[j]) for i, j in HEX20_EDGES])
+
+
+def is_hex(nn: int) -> bool:
+    return nn in (8, 20)
+
+
+def hex_N(p, nn):
+    x, y, z = p
+    C = HEX_CORNERS
+    if nn == 8:
+        return 0.125 * (1 + C[:, 0] * x) * (1 + C[:, 1] * y) * (1 + C[:, 2] * z)
+    N = np.empty(20)
+    a, b, c = C[:, 0], C[:, 1], C[:, 2]
+    N[:8] = 0.125 * (1 + a * x) * (1 + b * y) * (1 + c * z) * (a * x + b * y + c * z - 2)
+    M = _HEX20_MID
+    for k in range(12):
+        mx, my, mz = M[k]
+        if mx == 0:
+            N[8 + k] = 0.25 * (1 - x * x) * (1 + my * y) * (1 + mz * z)
+        elif my == 0:
+            N[8 + k] = 0.25 * (1 + mx * x) * (1 - y * y) * (1 + mz * z)
+        else:
+            N[8 + k] = 0.25 * (1 + mx * x) * (1 + my * y) * (1 - z * z)
+    return N
+
+
+def hex_dN(p, nn):
+    """(nn,3) 自然座標での微分"""
+    x, y, z = p
+    C = HEX_CORNERS
+    a, b, c = C[:, 0], C[:, 1], C[:, 2]
+    out = np.zeros((nn, 3))
+    if nn == 8:
+        out[:, 0] = 0.125 * a * (1 + b * y) * (1 + c * z)
+        out[:, 1] = 0.125 * b * (1 + a * x) * (1 + c * z)
+        out[:, 2] = 0.125 * c * (1 + a * x) * (1 + b * y)
+        return out
+    s = a * x + b * y + c * z - 2
+    fx, fy, fz = (1 + a * x), (1 + b * y), (1 + c * z)
+    out[:8, 0] = 0.125 * a * fy * fz * (s + fx)
+    out[:8, 1] = 0.125 * b * fx * fz * (s + fy)
+    out[:8, 2] = 0.125 * c * fx * fy * (s + fz)
+    M = _HEX20_MID
+    for k in range(12):
+        mx, my, mz = M[k]
+        i = 8 + k
+        if mx == 0:
+            out[i] = [-0.5 * x * (1 + my * y) * (1 + mz * z), 0.25 * (1 - x * x) * my * (1 + mz * z),
+                      0.25 * (1 - x * x) * (1 + my * y) * mz]
+        elif my == 0:
+            out[i] = [0.25 * mx * (1 - y * y) * (1 + mz * z), -0.5 * y * (1 + mx * x) * (1 + mz * z),
+                      0.25 * (1 + mx * x) * (1 - y * y) * mz]
+        else:
+            out[i] = [0.25 * mx * (1 + my * y) * (1 - z * z), 0.25 * (1 + mx * x) * my * (1 - z * z),
+                      -0.5 * z * (1 + mx * x) * (1 + my * y)]
+    return out
+
+
+def _gauss_cube(n):
+    g = {2: _G2, 3: _G3}[n]
+    pts = np.array([[a, b, c] for a in g[0] for b in g[0] for c in g[0]])
+    wts = np.array([wa * wb * wc for wa in g[1] for wb in g[1] for wc in g[1]])
+    return pts, wts
+
+
+def hex_quadrature(nn, full=False):
+    """剛性用: Hex20 は 2×2×2 の低減積分（Ansys の SOLID186 の既定と同じ）、Hex8 は 2×2×2。
+    full=True は質量・体積力用の 3×3×3"""
+    return _gauss_cube(3 if full else 2)
+
+
+def hex_node_points(nn):
+    return HEX_CORNERS.copy() if nn == 8 else np.vstack([HEX_CORNERS, _HEX20_MID])
+
+
+def hex_mass_ref(nn):
+    pts, wts = hex_quadrature(nn, full=True)
+    C = np.zeros((nn, nn))
+    for p, w in zip(pts, wts):
+        N = hex_N(p, nn)
+        C += w * np.outer(N, N)
+    return C / wts.sum()
+
+
+def hex_volumes(nodes, elems):
+    nn = elems.shape[1]
+    pts, wts = hex_quadrature(nn, full=True)
+    X = nodes[elems]
+    V = np.zeros(len(elems))
+    for p, w in zip(pts, wts):
+        J = np.einsum("enk,nl->ekl", X, hex_dN(p, nn))
+        V += w * np.linalg.det(J)
+    return V

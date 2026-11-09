@@ -43,8 +43,8 @@ class Mesh:
     def __post_init__(self):
         self.nodes = np.asarray(self.nodes, dtype=float)
         self.elems = np.asarray(self.elems, dtype=np.int64)
-        if self.elems.shape[1] not in (4, 10, 6, 15):
-            raise ValueError("Tet4 / Tet10 / Wedge6 / Wedge15 のみ対応しています")
+        if self.elems.shape[1] not in (4, 10, 6, 15, 8, 20):
+            raise ValueError("Tet4 / Tet10 / Wedge6 / Wedge15 / Hex8 / Hex20 のみ対応しています")
         self._fix_orientation()
 
     # ------------------------------------------------------------------ 基本情報
@@ -59,6 +59,17 @@ class Mesh:
                 and not getattr(self, "is_2d", False))
 
     @property
+    def is_hex(self) -> bool:
+        """六面体（ソリッド）要素か"""
+        return (self.elems.shape[1] in (8, 20) and not getattr(self, "is_shell", False)
+                and not getattr(self, "is_2d", False))
+
+    @property
+    def has_quads(self) -> bool:
+        """境界に四角形の面がある要素（三角柱・六面体）"""
+        return self.is_wedge or self.is_hex
+
+    @property
     def n_nodes(self) -> int:
         return len(self.nodes)
 
@@ -70,6 +81,9 @@ class Mesh:
         return self.nodes.min(axis=0), self.nodes.max(axis=0)
 
     def element_volumes(self) -> np.ndarray:
+        if self.is_hex:
+            from .elements import hex_volumes
+            return hex_volumes(self.nodes, self.elems)
         if self.is_wedge:
             from .elements import wedge_volumes
             return wedge_volumes(self.nodes, self.elems)
@@ -82,6 +96,17 @@ class Mesh:
 
     # ------------------------------------------------------------------ 前処理
     def _fix_orientation(self):
+        if self.is_hex:
+            # 体積が負（左手系）なら 1↔3・5↔7 を入れ替えて鏡映
+            from .elements import hex_volumes
+            bad = hex_volumes(self.nodes, self.elems[:, :8]) < 0
+            if bad.any():
+                perm = [0, 3, 2, 1, 4, 7, 6, 5]
+                if self.elems.shape[1] == 20:
+                    # 8:(0,1)↔11:(3,0) 9:(1,2)↔10:(2,3) 12:(4,5)↔15:(7,4) 13:(5,6)↔14:(6,7) 17:(1,5)↔19:(3,7)
+                    perm += [11, 10, 9, 8, 15, 14, 13, 12, 16, 19, 18, 17]
+                self.elems[bad] = self.elems[bad][:, perm]
+            return
         if self.is_wedge:
             # 下面の三角形の法線が上面の方を向くように（逆なら 1↔2・4↔5 を入れ替え）
             p = self.nodes[self.elems[:, :6]]
@@ -111,7 +136,10 @@ class Mesh:
         if self.order == 2:
             return self
         e = self.elems
-        if self.is_wedge:
+        if self.is_hex:
+            from .elements import HEX20_EDGES
+            elist = np.array(HEX20_EDGES)
+        elif self.is_wedge:
             from .elements import WEDGE15_EDGES
             elist = np.array(WEDGE15_EDGES)
         else:
@@ -182,6 +210,8 @@ class Mesh:
 
     # ------------------------------------------------------------------ 境界
     def _compute_boundary(self):
+        if self.is_hex:
+            return self._compute_boundary_hex()
         if self.is_wedge:
             return self._compute_boundary_wedge()
         e = self.elems
@@ -232,6 +262,31 @@ class Mesh:
         self._btri_owner = np.concatenate([t_once % ne, np.tile(q_once % ne, 2)])
         self._bquad_full = qloop
         self._bquad_of = np.concatenate([np.full(len(t_once), -1), np.tile(np.arange(nq), 2)])
+
+    def _compute_boundary_hex(self):
+        from .elements import HEX20_QUAD_LOOP, HEX_QUAD_FACES
+        e = self.elems
+        ne = len(e)
+        quad2 = e.shape[1] == 20
+        qf = np.concatenate([e[:, HEX_QUAD_FACES[k]] for k in range(6)])
+        _, qi, qc = np.unique(np.sort(qf, axis=1), axis=0, return_index=True, return_counts=True)
+        q_once = qi[qc == 1]
+        quads = qf[q_once]
+        qloop = np.concatenate([e[:, HEX20_QUAD_LOOP[k]] for k in range(6)])[q_once] if quad2 else quads
+        a, b, c, d = quads.T
+        tri_q = np.concatenate([np.column_stack([a, b, c]), np.column_stack([a, c, d])])
+        if quad2:
+            L = qloop
+            full_q = np.concatenate([np.column_stack([L[:, 0], L[:, 2], L[:, 4], L[:, 1], L[:, 3], L[:, 5]]),
+                                     np.column_stack([L[:, 0], L[:, 4], L[:, 6], L[:, 5], L[:, 7], L[:, 1]])])
+        else:
+            full_q = tri_q
+        nq = len(quads)
+        self._btri = tri_q
+        self._btri_full = full_q
+        self._btri_owner = np.tile(q_once % ne, 2)
+        self._bquad_full = qloop
+        self._bquad_of = np.tile(np.arange(nq), 2)
 
     def sweep_lines(self):
         """三角柱メッシュの節点を、スイープ方向に並ぶ列（柱）ごとに番号付けする（反復法の線平滑化用）。
@@ -420,6 +475,29 @@ def structured_box(lx, ly, lz, nx, ny, nz, origin=(0.0, 0.0, 0.0)) -> Mesh:
     elems = np.concatenate([v[:, t] for t in kuhn])
     mesh = Mesh(nodes, elems)
     # 面番号を gmsh の直方体と同じ順にする: x=0, x=lx, y=0, y=ly, z=0, z=lz
+    n, _ = mesh.tri_normals_areas()
+    axis = np.argmax(np.abs(n), axis=1)
+    mesh.set_face_ids(2 * axis + (n[np.arange(len(n)), axis] > 0))
+    return mesh
+
+
+def structured_hex_box(lx, ly, lz, nx, ny, nz, origin=(0.0, 0.0, 0.0), quadratic=True) -> Mesh:
+    """直方体の六面体メッシュ（Hex8、quadratic=True なら Hex20）。面番号は structured_box と同じ順"""
+    xs = np.linspace(0, lx, nx + 1) + origin[0]
+    ys = np.linspace(0, ly, ny + 1) + origin[1]
+    zs = np.linspace(0, lz, nz + 1) + origin[2]
+    X, Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
+    nodes = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
+
+    def nid(i, j, k):
+        return (i * (ny + 1) + j) * (nz + 1) + k
+    i, j, k = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing="ij")
+    i, j, k = i.ravel(), j.ravel(), k.ravel()
+    elems = np.stack([nid(i + a, j + b, k + c) for (a, b, c) in
+                      [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]], 1)
+    mesh = Mesh(nodes, elems)
+    if quadratic:
+        mesh = mesh.to_quadratic()
     n, _ = mesh.tri_normals_areas()
     axis = np.argmax(np.abs(n), axis=1)
     mesh.set_face_ids(2 * axis + (n[np.arange(len(n)), axis] > 0))

@@ -35,8 +35,8 @@ def surface_polydata(mesh: Mesh, points: np.ndarray | None = None) -> tuple[pv.P
     """
     pts = mesh.nodes if points is None else points
     t = mesh.boundary_tris_full
-    if getattr(mesh, "is_wedge", False):
-        # 三角柱: 上下の三角形はそのまま（Tri6 は 4 分割）、側面の四角形は周の節点をつないだ多角形で描く
+    if getattr(mesh, "has_quads", False):
+        # 三角柱・六面体: 上下の三角形はそのまま（Tri6 は 4 分割）、側面の四角形は周の節点をつないだ多角形で描く
         qof = mesh.boundary_quad_of
         trow = np.nonzero(qof < 0)[0]
         cells, src = [], []

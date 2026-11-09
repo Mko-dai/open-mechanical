@@ -2994,7 +2994,8 @@ class MainWindow(QMainWindow):
             dv.valueChanged.connect(lambda v: self._ls_set(i, "divs", int(v), True))
             self._row(s2, "スイープ分割数（層ごと）", dv)
             self._row(s2, "要素の形", self._combo(
-                [("三角柱（Wedge15、薄い層向き）", "wedge"), ("四面体（三角柱を 3 分割）", "tet")],
+                [("三角柱（Wedge15、薄い層向き）", "wedge"), ("六面体（Hex20、断面を四角形で切る）", "hex"),
+                 ("四面体（三角柱を 3 分割）", "tet")],
                 ls.get("element", "wedge"), lambda v: self._ls_set(i, "element", v, True)))
             ly = dspin(float(ls.get("layer_size", 0) or 0), 0.0, 1e6, 3, 0.1, "mm")
             ly.setSpecialValueText("既定（要素サイズ）")

@@ -68,6 +68,9 @@ def _tet_mass_ref(nn):
     if nn in (6, 15):
         from .elements import wedge_mass_ref
         return wedge_mass_ref(nn)
+    if nn in (8, 20):           # 六面体（ゆがみが小さい要素では厳密。スイープ・写像メッシュ向け）
+        from .elements import hex_mass_ref
+        return hex_mass_ref(nn)
     if nn == 4:
         return (np.ones((4, 4)) + np.eye(4)) / 20.0
     e = lambda *idx: tuple(1 if i in idx else 0 for i in range(4))  # noqa: E731

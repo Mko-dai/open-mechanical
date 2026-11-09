@@ -1152,13 +1152,28 @@ def _sweep_mesh(gmsh, ls, order, h, log):
         raise GeometryError("このボディはスイープできません（座標軸方向に同じ断面が続く形状が必要です）")
     L, ax, src = min(cands) if want == "auto" else cands[0]    # 自動: 薄い方向（Ansys の Automatic Thin と同じ考え）
     n = int(ls.get("divs", 0)) or max(1, int(round(L / h)))
-    log(f"スイープ: {'XYZ'[ax]} 方向に {n} 分割（長さ {L:.4g} mm）")
-    gmsh.model.mesh.generate(2)
+    hexa = ls.get("element") == "hex"
+    log(f"スイープ: {'XYZ'[ax]} 方向に {n} 分割（長さ {L:.4g} mm）" + ("・六面体" if hexa else ""))
+    if hexa:
+        # ソース面を四角形だけで切る（Ansys の六面体スイープ: Blossom で全四角形化）
+        gmsh.model.mesh.setRecombine(2, src)
+        gmsh.option.setNumber("Mesh.RecombinationAlgorithm", 2)
+        gmsh.option.setNumber("Mesh.Algorithm", 8)
+        gmsh.model.mesh.generate(2)
+        gmsh.model.mesh.recombine()
+    else:
+        gmsh.model.mesh.generate(2)
     ets, _, ens = gmsh.model.mesh.getElements(2, src)
-    tri = None
+    tri = quad = None
     for t, en in zip(ets, ens):
         if int(t) == 2:
             tri = en.astype(np.int64).reshape(-1, 3)
+        elif int(t) == 3:
+            quad = en.astype(np.int64).reshape(-1, 4)
+    if hexa:
+        if quad is None or tri is not None:
+            raise GeometryError("ソース面を四角形だけで切れませんでした（六面体スイープ）。要素の形を三角柱にしてください")
+        return _hex_sweep(gmsh, quad, ax, blo, L, n, order, h, info, surfs, vtag)
     if tri is None:
         raise GeometryError("ソース面を三角形でメッシュできませんでした")
     used = np.unique(tri)
@@ -1205,6 +1220,50 @@ def _sweep_mesh(gmsh, ls, order, h, log):
     m.elem_body = np.full(m.n_elems, int(phys[0]) - 1 if len(phys) else 0, dtype=np.int64)
     m.node_origin = np.arange(m.n_nodes)
     # 面番号 = CAD のサーフェス番号（四面体メッシュと同じ番号になるので境界条件がそのまま使える）
+    cen = m.nodes[m.boundary_tris].mean(axis=1)
+    best = np.full(len(cen), np.inf)
+    fid = np.zeros(len(cen), dtype=np.int64)
+    for i, st in enumerate(surfs):
+        cp = np.array(gmsh.model.getClosestPoint(2, st, cen.ravel().tolist())[0]).reshape(-1, 3)
+        d = np.linalg.norm(cp - cen, axis=1)
+        better = d < best
+        best[better], fid[better] = d[better], i
+    m.set_face_ids(fid)
+    return m
+
+
+def _hex_sweep(gmsh, quad, ax, blo, L, n, order, h, info, surfs, vtag):
+    """四角形のソース面を押し出して六面体（Hex8 → Hex20）にする"""
+    used = np.unique(quad)
+    ntag, ncoord, _ = gmsh.model.mesh.getNodes()
+    cmap = dict(zip(ntag.astype(np.int64).tolist(), ncoord.reshape(-1, 3)))
+    P = np.array([cmap[int(t)] for t in used])
+    q = np.searchsorted(used, quad)
+    P[:, ax] = blo[ax]
+    nb = len(P)
+    nodes = np.vstack([P + np.eye(3)[ax] * (L * k / n) for k in range(n + 1)])
+    el = np.vstack([np.column_stack([q + k * nb, q + (k + 1) * nb]) for k in range(n)])
+    m = Mesh(nodes, el)              # 向きは Mesh が直す（体積が負なら鏡映）
+    if order == 2:
+        m = m.to_quadratic()
+        bq = m.boundary_quads_full
+        mids = np.unique(bq[:, 1::2]) if len(bq) else np.zeros(0, int)
+        curved = [st for st, typ, *_ in info if typ != "Plane"]
+        if curved and len(mids):
+            Xm = m.nodes[mids]
+            best = np.full(len(mids), np.inf)
+            proj = Xm.copy()
+            for st in curved:
+                cp = np.array(gmsh.model.getClosestPoint(2, st, Xm.ravel().tolist())[0]).reshape(-1, 3)
+                d = np.linalg.norm(cp - Xm, axis=1)
+                better = d < best
+                best[better], proj[better] = d[better], cp[better]
+            ok = best < 0.05 * h
+            m.nodes[mids[ok]] = proj[ok]
+    phys = gmsh.model.getPhysicalGroupsForEntity(3, vtag)
+    m.elem_body = np.full(m.n_elems, int(phys[0]) - 1 if len(phys) else 0, dtype=np.int64)
+    m.node_origin = np.arange(m.n_nodes)
+    m._btri = None
     cen = m.nodes[m.boundary_tris].mean(axis=1)
     best = np.full(len(cen), np.inf)
     fid = np.zeros(len(cen), dtype=np.int64)
@@ -1491,6 +1550,8 @@ def mesh_quality(mesh) -> dict:
     アスペクト比: 最長辺 / 最短の高さ × √(2/3)（正四面体 = 1）
     三角柱は _wedge_quality（要素品質は Ansys と同じ定義、歪度は角度基準）
     """
+    if getattr(mesh, "is_hex", False):
+        return _hex_quality(mesh)
     if getattr(mesh, "is_wedge", False):
         return _wedge_quality(mesh)
     X = mesh.nodes[mesh.elems[:, :4]]
@@ -1544,6 +1605,27 @@ def _wedge_quality(mesh) -> dict:
     for f in WEDGE_QUAD_FACES:
         a = angles(X, list(f))
         sk.append(np.maximum((a.max(1) - 90) / 90, (90 - a.min(1)) / 90))
+    skew = np.clip(np.max(np.stack(sk, 1), axis=1), 0, 1)
+    ar = np.sqrt(l2.max(1) / np.maximum(l2.min(1), 1e-300))
+    st = lambda v: {"最小": float(v.min()), "最大": float(v.max()), "平均": float(v.mean())}  # noqa: E731
+    return {"要素品質": st(q), "歪度": st(skew), "アスペクト比": st(ar), "_quality": q, "_skew": skew, "_ar": ar}
+
+
+def _hex_quality(mesh) -> dict:
+    """六面体の品質（頂点 8 点）: 要素品質 = C·V / √(Σ辺²)³（立方体で 1、C = 41.569219）、歪度 = 面の内角の 90° からの
+    ずれ（等角歪度）、アスペクト比 = 最長辺 / 最短辺"""
+    from .elements import HEX20_EDGES, HEX_QUAD_FACES, hex_volumes
+    X = mesh.nodes[mesh.elems[:, :8]]
+    l2 = np.stack([np.einsum("ij,ij->i", X[:, j] - X[:, i], X[:, j] - X[:, i]) for i, j in HEX20_EDGES], 1)
+    V = np.abs(hex_volumes(mesh.nodes, mesh.elems[:, :8]))
+    q = np.clip(41.569219 * V / np.sqrt(l2.sum(1)) ** 3, 0, 1)
+    sk = []
+    for f in HEX_QUAD_FACES:
+        for k in range(4):
+            a, b, c = X[:, f[k - 1]], X[:, f[k]], X[:, f[(k + 1) % 4]]
+            u, v = a - b, c - b
+            cosv = np.einsum("ij,ij->i", u, v) / np.maximum(np.linalg.norm(u, axis=1) * np.linalg.norm(v, axis=1), 1e-300)
+            sk.append(np.abs(np.degrees(np.arccos(np.clip(cosv, -1, 1))) - 90) / 90)
     skew = np.clip(np.max(np.stack(sk, 1), axis=1), 0, 1)
     ar = np.sqrt(l2.max(1) / np.maximum(l2.min(1), 1e-300))
     st = lambda v: {"最小": float(v.min()), "最大": float(v.max()), "平均": float(v.mean())}  # noqa: E731
@@ -1879,7 +1961,11 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
         fix_msgs = []
         if sweeps:
             sw = sweeps[-1]
-            if len(gmsh.model.getEntities(3)) > 1 or sw.get("layered") or sw.get("element", "wedge") == "wedge":
+            if sw.get("element") == "hex":
+                if len(gmsh.model.getEntities(3)) > 1:
+                    raise GeometryError("六面体スイープは、ボディが 1 つのモデルで使えます")
+                mesh = _sweep_mesh(gmsh, sw, order, h, log)
+            elif len(gmsh.model.getEntities(3)) > 1 or sw.get("layered") or sw.get("element", "wedge") == "wedge":
                 mesh = _layered_sweep_mesh(gmsh, sw, order, h, log, share=share,
                                            wedge=sw.get("element", "wedge") == "wedge")
             else:

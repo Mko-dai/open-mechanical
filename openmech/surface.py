@@ -99,7 +99,7 @@ def surface_sets(mesh, faces) -> list[SurfaceSet]:
     if not faces:
         return []
     rows = np.concatenate([np.nonzero(mesh.face_ids == f)[0] for f in faces])
-    qof = mesh.boundary_quad_of[rows] if getattr(mesh, "is_wedge", False) else np.full(len(rows), -1)
+    qof = mesh.boundary_quad_of[rows] if getattr(mesh, "has_quads", False) else np.full(len(rows), -1)
     out = []
     tri_rows = rows[qof < 0]
     if len(tri_rows):

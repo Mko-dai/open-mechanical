@@ -34,6 +34,9 @@ def shape_N(L: np.ndarray, nn: int) -> np.ndarray:
     if nn in (6, 15):
         from .elements import wedge_N
         return wedge_N(L, nn)
+    if nn in (8, 20):
+        from .elements import hex_N
+        return hex_N(L, nn)
     if nn == 4:
         return L.copy()
     N = np.empty(10)
@@ -48,6 +51,9 @@ def shape_dN_dxi(L: np.ndarray, nn: int) -> np.ndarray:
     if nn in (6, 15):
         from .elements import wedge_dN
         return wedge_dN(L, nn)
+    if nn in (8, 20):
+        from .elements import hex_dN
+        return hex_dN(L, nn)
     if nn == 4:
         return _DL_DXI.copy()
     dNdL = np.zeros((10, 4))
@@ -99,6 +105,9 @@ def _quadrature(nn):
     if nn in (6, 15):
         from .elements import wedge_quadrature
         return wedge_quadrature(nn)
+    if nn in (8, 20):
+        from .elements import hex_quadrature
+        return hex_quadrature(nn)
     return (GAUSS4, GAUSS4_W) if nn == 10 else (GAUSS1, GAUSS1_W)
 
 
@@ -107,6 +116,9 @@ def _quadrature_full(nn):
     if nn in (6, 15):
         from .elements import wedge_quadrature
         return wedge_quadrature(nn, full=True)
+    if nn in (8, 20):
+        from .elements import hex_quadrature
+        return hex_quadrature(nn, full=True)
     return GAUSS4, GAUSS4_W
 
 
@@ -115,6 +127,9 @@ def node_points(nn):
     if nn in (6, 15):
         from .elements import wedge_node_points
         return wedge_node_points(nn)
+    if nn in (8, 20):
+        from .elements import hex_node_points
+        return hex_node_points(nn)
     return NODE_L10 if nn == 10 else NODE_L4
 
 
@@ -292,7 +307,7 @@ def face_load_weights(mesh: Mesh, faces):
     四面体の面（Tri3/Tri6）に加え、三角柱の側面（Quad4/Quad8）も正しく積分する。
     """
     rows = np.concatenate([np.nonzero(mesh.face_ids == int(f))[0] for f in faces]) if len(faces) else np.zeros(0, int)
-    qof = mesh.boundary_quad_of if getattr(mesh, "is_wedge", False) else None
+    qof = mesh.boundary_quad_of if getattr(mesh, "has_quads", False) else None
     qof = qof[rows] if qof is not None else np.full(len(rows), -1)
     tri_rows = rows[qof < 0]
     tris = mesh.boundary_tris_full[tri_rows]
