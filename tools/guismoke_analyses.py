@@ -170,6 +170,21 @@ try:
     P(f"OK  断面・アニメーション: 断面の点 {npts:,} / アニメーションで動いた量 {moved:.4g} mm")
 except Exception:
     P("NG  断面・アニメーション\n" + traceback.format_exc())
+# すべて六面体のメッシュ
+try:
+    w.project.mesh_settings = dict(w.project.mesh_settings or {}, element_shape="hex")
+    w.remesh()
+    app.processEvents()
+    info4 = w.mesh.face_info()
+    xl = [f["id"] for f in info4 if f["flat"] and abs(f["centroid"][0] - lo[0]) < 1e-6]
+    xh = [f["id"] for f in info4 if f["flat"] and abs(f["centroid"][0] - hi[0]) < 1e-6]
+    fr = run("六面体メッシュの静解析", "static", [BC("fixed", xl), BC("force", xh, [0, 0, -1000.0])], shot="hexmesh")
+    P(f"OK  六面体: 要素 {w.mesh.n_elems:,}（{w.mesh.elems.shape[1]} 節点）/ 面 {w.mesh.n_faces}")
+    w.project.mesh_settings = dict(w.project.mesh_settings, element_shape="tet")
+    w.remesh()
+    app.processEvents()
+except Exception:
+    P("NG  六面体\n" + traceback.format_exc())
 # 破壊（き裂を埋め込んで J 積分・K）
 try:
     w.project.mesh_settings = dict(w.project.mesh_settings or {}, cracks=[
