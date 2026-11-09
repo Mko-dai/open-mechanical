@@ -76,13 +76,13 @@ def _eig_lobpcg(Kff, Mff, n, sigma, log, coords=None):
     count = [0, 0]
 
     def solve(b):
-        x, info, it = _pcg(A, b, P, tol=1e-10, maxiter=2000)
+        x, info, it = _pcg(A, b, P, tol=1e-9, maxiter=2000)
         count[0] += 1
         count[1] += it
         return x
     OPinv = spla.LinearOperator((nd, nd), matvec=solve, dtype=float)
     ncv = min(nd - 1, max(2 * n + 1, n + 16))
-    lam, vec = spla.eigsh(Kff, k=n, M=Mff, sigma=sigma, which="LM", OPinv=OPinv, ncv=ncv, tol=1e-9)
+    lam, vec = spla.eigsh(Kff, k=n, M=Mff, sigma=sigma, which="LM", OPinv=OPinv, ncv=ncv, tol=1e-7)
     log(f"  シフト逆反復（AMG＋CG）: {n} 個 / 解いた回数 {count[0]}・CG 反復 平均 {count[1] / max(count[0], 1):.0f} 回"
         f"（{time.time() - t0:.1f} s）")
     o = np.argsort(lam)
@@ -96,8 +96,7 @@ def _eig(Kff, Mff, n, sigma, log, label="固有値", coords=None):
     n = max(1, min(n, nd - 2))
     if nd > ITERATIVE_DOF and sigma <= 0:
         try:
-            return _eig_lobpcg(Kff, Mff, n, sigma if sigma < 0 else -1e-6 * float(
-                Kff.diagonal().mean() / max(Mff.diagonal().mean(), 1e-300)), log, coords)
+            return _eig_lobpcg(Kff, Mff, n, sigma, log, coords)
         except ImportError:
             log("  （pyamg がないため直接法で分解します。大きなモデルはメモリを多く使います）")
     A = (Kff - sigma * Mff).tocsc() if sigma != 0 else Kff.tocsc()
@@ -203,14 +202,17 @@ def solve_modal(mesh: Mesh, material: Material, bcs: list[BC], n_modes: int = 6,
     free = np.ones(K.shape[0], bool)
     if fixed:
         free[np.fromiter(fixed.keys(), dtype=np.int64)] = False
-    Kff, Mff = K[free][:, free], M[free][:, free]
+    Kff, Mff = K[free][:, free].tocsr(), M[free][:, free].tocsr()
+    n_all = K.shape[0]
+    del K, M          # 大きなモデルでメモリを空ける（質量は刺激係数の計算でもう一度作る）
     t_asm = time.time() - t0
     nfree_body = not any(b.kind in SUPPORT_KINDS + ("remote_displacement", "elastic_support", "cylindrical_support",
                                                     "spring") for b in bcs)
     # シフト: 支持なし（剛体モード 0 Hz）でも分解できるよう負の値に
     lam_ref = float(Kff.diagonal().mean() / max(Mff.diagonal().mean(), 1e-300))
     w_min = 2 * np.pi * f_min
-    sigma = w_min ** 2 if f_min > 0 else -1e-6 * lam_ref
+    # シフト: 支持があれば 0（K をそのまま分解・前処理できてメモリが少ない）、支持なしは剛体モードがあるので負に
+    sigma = w_min ** 2 if f_min > 0 else (-1e-6 * lam_ref if nfree_body else 0.0)
     if progress:
         progress(0.3, "固有値を計算中…")
     log(f"モーダル解析: 自由度 {int(free.sum()):,}" + ("（支持なし: 剛体モードを含む）" if nfree_body else ""))
@@ -230,7 +232,7 @@ def solve_modal(mesh: Mesh, material: Material, bcs: list[BC], n_modes: int = 6,
     # 質量正規化
     nrm = np.sqrt(np.einsum("ij,ij->j", vec, Mff @ vec))
     vec = vec / nrm
-    full = np.zeros((K.shape[0], vec.shape[1]))
+    full = np.zeros((n_all, vec.shape[1]))
     full[free] = vec
     if T is not None:
         full = T @ full

@@ -133,12 +133,21 @@ def solve_electrostatic(mesh, material, bcs, elem_materials=None, log=print) -> 
 # ---------------------------------------------------------------------------- 圧電
 
 def _piezo_mats(m):
+    """圧電定数 e (6×3) と誘電率 (3×3) を全体座標で。材料座標系（ボディの向き）があれば回転する:
+    e_g = Tᵀ e_m R、 ε_g = Rᵀ ε_m R（R の行 = 材料軸、T = ひずみの座標変換）"""
     pz = getattr(m, "piezo", None) or {}
     if not pz:
         return None, None
     e = np.asarray(pz["e"], float).reshape(6, 3) * 1e-3          # C/m² → N/(V·mm)
     epsr = np.asarray(pz.get("eps_s", [m.permittivity] * 3), float)
-    return e, np.diag(epsr) * EPS0
+    ep = np.diag(epsr) * EPS0
+    R = getattr(m, "R", None)
+    if R is not None:
+        from .materials import strain_rotation
+        T = strain_rotation(R)
+        e = T.T @ e @ R
+        ep = R.T @ ep @ R
+    return e, ep
 
 
 def piezo_matrices(mesh, mats, elem_mat):

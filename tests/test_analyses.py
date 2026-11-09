@@ -237,3 +237,20 @@ def test_nonlinear_with_supports_and_remote():
         assert rn.u[tipn, 2].mean() == pytest.approx(rl.u[tipn, 2].mean(), rel=1e-6)
     rL = solve_static(m, S, cases[1], None, AnalysisSettings(large_deflection=True), **q)[-1]
     assert rL.u[tipn, 2].mean() == pytest.approx(-1.0, abs=1e-6)
+
+
+def test_piezo_rotated_polarization():
+    """分極を Z から X に回したボディ: X 方向に電圧 → X 方向の拘束応力 = e33 × E"""
+    from openmech.electric import solve_piezo_static
+    from openmech.materials import rotation_xyz
+    e = np.zeros((6, 3))
+    e[2, 2] = 15.1
+    P = Material("pz", 60000, 0.3, 7500, permittivity=1000, piezo={"e": e.tolist(), "eps_s": [1000] * 3})
+    m = structured_box(1, 20, 20, 2, 10, 10).to_quadratic()
+    m.group_faces()
+    st = P.state(None, rotation_xyz(0, 90, 0))      # 材料の 3 軸 → 全体の X
+    allf = [f["id"] for f in m.face_info()]
+    s, _ = solve_piezo_static(m, P, [BC("fixed", allf), BC("ground", [face(m, 0, 0, -1)]),
+                                     BC("voltage", [face(m, 0, 1, 1)], [100.])],
+                              elem_materials=([st], np.zeros(m.n_elems, int)), **q)
+    assert abs(s.stress[:, 0].mean()) == pytest.approx(15.1e-3 * 100, rel=1e-6)

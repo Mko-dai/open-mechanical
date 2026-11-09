@@ -121,7 +121,9 @@ class Material:
         if self.elastic != "isotropic":
             # 接触剛性・表示用の代表値
             E = float(np.mean(np.diag(np.linalg.inv(D))[:3] ** -1))
-        return MaterialState(self, D, eps, E, nu, T)
+        st = MaterialState(self, D, eps, E, nu, T)
+        st.R = None if R is None else np.asarray(R, float)
+        return st
 
 
 class MaterialState:
@@ -133,6 +135,7 @@ class MaterialState:
         self.density, self.yield_strength = base.density, base.yield_strength
         self.tensile_strength = base.tensile_strength
         self.plasticity = base.plasticity
+        self.R = None
 
     @property
     def density_t_mm3(self):
