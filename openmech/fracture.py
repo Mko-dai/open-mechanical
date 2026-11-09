@@ -205,6 +205,9 @@ def evaluate_cracks(mesh: Mesh, result, cracks, h_ref=None):
     for i, c in enumerate(cracks):
         if c.get("suppressed"):
             continue
+        if c.get("shape") == "ellipse":
+            rows += _evaluate_ellipse(mesh, u, D, em, mats, vol, c, i)
+            continue
         p0, p1, t, e1, n, L = crack_frame(c)
         # 前縁の近くの要素の大きさ
         X = mesh.nodes
@@ -235,21 +238,30 @@ def evaluate_cracks(mesh: Mesh, result, cracks, h_ref=None):
     return rows
 
 
-def quarter_point(mesh: Mesh, front0, front1, tol=None) -> int:
+def quarter_point(mesh: Mesh, front0, front1=None, tol=None) -> int:
     """前縁に頂点がある 2 次要素の辺の中間節点を、前縁から 1/4 の位置へ動かす（1/4 点要素、Barsoum 1976）。
     要素の中で変位が √r、応力が 1/√r になり、き裂先端の特異性を表せる（Ansys のき裂メッシュと同じ）。
     戻り値: 動かした中間節点の数"""
     from .solver import _EDGES10
     if mesh.elems.shape[1] != 10:
         return 0
-    p0, p1 = np.asarray(front0, float), np.asarray(front1, float)
-    t = p1 - p0
-    L = float(np.linalg.norm(t))
-    t = t / L
     X = mesh.nodes
     if tol is None:
         tol = 1e-6 * float(np.ptp(X, axis=0).max())
-    onf = _dist_to_front(X, p0, p1, t, L) < tol
+    if front1 is None:                       # 折れ線の前縁（曲がった前縁）
+        P = np.asarray(front0, float)
+        cand = np.nonzero(np.linalg.norm(X - P.mean(0), axis=1) <= np.linalg.norm(np.ptp(P, axis=0)) + 10 * tol)[0]
+        onf = np.zeros(len(X), bool)
+        d = _project_polyline(X[cand], P)[0]
+        # 折れ線は楕円の弦なので、弦と弧の差（中央で最大 L²/8R）まで許す
+        seg = np.linalg.norm(np.diff(P, axis=0), axis=1).max()
+        onf[cand] = d < max(tol, 0.02 * seg)
+    else:
+        p0, p1 = np.asarray(front0, float), np.asarray(front1, float)
+        t = p1 - p0
+        L = float(np.linalg.norm(t))
+        t = t / L
+        onf = _dist_to_front(X, p0, p1, t, L) < tol
     moved = set()
     for k, (i, j) in enumerate(_EDGES10):
         a_, b_, m_ = mesh.elems[:, i], mesh.elems[:, j], mesh.elems[:, 4 + k]
@@ -260,3 +272,200 @@ def quarter_point(mesh: Mesh, front0, front1, tol=None) -> int:
                     X[mi] = 0.75 * X[fi] + 0.25 * X[oi]
                     moved.add(int(mi))
     return len(moved)
+
+
+# ============================================================================ 曲がった前縁（半楕円の表面き裂など）
+
+class CrackGeom:
+    """き裂の形。kind="straight"（直線の前縁・長方形のき裂面）/ "ellipse"（楕円・半楕円の前縁、き裂面は楕円の内側）
+
+    楕円: {"shape": "ellipse", "center": 中心, "normal": き裂面の法線, "axis_a": 深さ方向（a の向き）,
+           "a": 深さ方向の半径, "c": 長さ方向の半径}。中心を表面に置けば半楕円の表面き裂、内部なら楕円の埋没き裂
+    """
+
+    def __init__(self, c: dict):
+        self.c = c
+        self.kind = c.get("shape", "straight")
+        if self.kind == "ellipse":
+            self.center = np.asarray(c["center"], float)
+            n = np.asarray(c.get("normal", [0, 1, 0]), float)
+            self.n = n / np.linalg.norm(n)
+            ua = np.asarray(c.get("axis_a", [0, 0, -1]), float)
+            ua = ua - (ua @ self.n) * self.n
+            self.ua = ua / np.linalg.norm(ua)
+            self.uc = np.cross(self.n, self.ua)
+            self.a, self.cc = float(c["a"]), float(c["c"])
+            th = np.linspace(0.0, 2 * np.pi, 361)
+            self.ring = self.center + np.outer(self.cc * np.cos(th), self.uc) + np.outer(self.a * np.sin(th), self.ua)
+            self.p0 = self.center
+        else:
+            from .geometry import crack_frame
+            p0, p1, t, e1, n, L = crack_frame(c)
+            self.n, self.p0, self.p1, self.t, self.e1, self.L = n, p0, p1, t, e1, L
+            self.ring = np.vstack([p0, p1])
+
+    def front(self, inside_body=None):
+        """前縁の折れ線（物体の中の部分だけ。inside_body(X)→bool で判定）"""
+        if self.kind != "ellipse":
+            return self.ring
+        P = self.ring
+        if inside_body is not None:
+            keep = inside_body(P)
+            if not keep.all() and keep.any():
+                # 物体の中の連続した区間（半楕円なら 0〜π の側）を取り出す
+                k0 = int(np.argmin(keep))                # 外の点から始めて一周
+                rolled = np.roll(np.arange(len(P) - 1), -k0)
+                inn = keep[rolled]
+                idx = rolled[inn]
+                P = P[idx]
+        return P
+
+    def inside(self, X, tol):
+        """き裂面の内側（前縁を除く）の点"""
+        h = (X - self.p0) @ self.n
+        on = np.abs(h) < tol
+        if self.kind == "ellipse":
+            r = X - self.center
+            xc, xa = r @ self.uc, r @ self.ua
+            rho = (xc / self.cc) ** 2 + (xa / self.a) ** 2
+            return on & (rho < 1 - 1e-5 - 4 * tol / min(self.a, self.cc))
+        r = X - self.p0
+        x1, s = r @ self.e1, r @ self.t
+        a = float(self.c.get("depth", 0.0))
+        ok = on & (x1 < -tol) & (s > -tol) & (s < self.L + tol)
+        return ok & (bool(self.c.get("to_surface", True)) | (x1 > -a - tol))
+
+
+def _project_polyline(X, P):
+    """点 X から折れ線 P への最近点: 距離、弧長、接線、最近点"""
+    A, B = P[:-1], P[1:]
+    seg = B - A
+    ls = np.linalg.norm(seg, axis=1)
+    cum = np.r_[0.0, np.cumsum(ls)]
+    best = np.full(len(X), np.inf)
+    s_out = np.zeros(len(X))
+    t_out = np.zeros((len(X), 3))
+    f_out = np.zeros((len(X), 3))
+    for k in range(len(A)):
+        u = np.clip(((X - A[k]) @ seg[k]) / max(ls[k] ** 2, 1e-300), 0.0, 1.0)
+        F = A[k] + np.outer(u, seg[k])
+        d = np.linalg.norm(X - F, axis=1)
+        b = d < best
+        best[b], s_out[b], f_out[b] = d[b], cum[k] + u[b] * ls[k], F[b]
+        t_out[b] = seg[k] / max(ls[k], 1e-300)
+    return best, s_out, t_out, f_out, cum[-1]
+
+
+def j_front(mesh: Mesh, u, D, geom: CrackGeom, P, stations, width, r_in, r_out, elem_mat=None, symmetric=False):
+    """曲がった前縁に沿った J（局所の値）。仮想き裂進展の向きのベクトル場 Q = q_r(r)·q_s(s)·e1 を節点で作り、
+    J(s0) = ∫ (σ_ij ∂u_j/∂x_k − W δ_ik) ∂Q_k/∂x_i dV / ∫ q_s ds（Shih–Moran–Nakamura の 3 次元の領域積分）"""
+    X = mesh.nodes
+    U = np.asarray(u, float).reshape(-1, 3)
+    near = np.nonzero(np.linalg.norm(X - P.mean(0), axis=1) <= np.linalg.norm(np.ptp(P, axis=0)) + 2 * r_out)[0]
+    r = np.full(len(X), np.inf)
+    s = np.zeros(len(X))
+    tt = np.zeros((len(X), 3))
+    F = np.zeros((len(X), 3))
+    r[near], s[near], tt[near], F[near], Ltot = _project_polyline(X[near], P)
+    qr = np.clip((r_out - r) / max(r_out - r_in, 1e-30), 0.0, 1.0)
+    e1 = np.cross(geom.n[None, :], tt)
+    e1 /= np.maximum(np.linalg.norm(e1, axis=1, keepdims=True), 1e-300)
+    # e1 は き裂の外（進む向き）: 最近点から e1 の逆へ少し入った点が き裂面の内側になる向き
+    eps = 0.25 * max(r_in, r_out * 0.1)
+    tol = 1e-6 * float(np.ptp(X, axis=0).max())
+    flip = ~geom.inside(F - eps * e1, max(tol, 1e-9)) & geom.inside(F + eps * e1, max(tol, 1e-9))
+    e1[flip] *= -1
+    nn = mesh.elems.shape[1]
+    pts, wts = _quadrature(nn)
+    De_all = np.asarray(D, float)
+    out = []
+    for s0 in stations:
+        qs = np.clip(1 - np.abs(s - s0) / width, 0.0, 1.0)
+        q = qr * qs
+        Q = q[:, None] * e1
+        act = np.nonzero((q[mesh.elems] > 0).any(1))[0]
+        if not len(act):
+            out.append(np.nan)
+            continue
+        el = mesh.elems[act]
+        Xe, Ue, Qe = X[el], U[el], Q[el]
+        De = (De_all[np.asarray(elem_mat)[act]] if (De_all.ndim == 3 and elem_mat is not None) else
+              (De_all[0] if De_all.ndim == 3 else De_all))
+        tot = 0.0
+        for L_, w in zip(pts, wts):
+            dNdx, detJ = _dN_dx(Xe, shape_dN_dxi(L_, nn))
+            gu = np.einsum("eaj,eak->ejk", Ue, dNdx)          # ∂u_j/∂x_k
+            gQ = np.einsum("eak,eai->eki", Qe, dNdx)          # ∂Q_k/∂x_i
+            eps_ = np.einsum("eij,ej->ei", _B_matrix(dNdx), Ue.reshape(len(act), -1))
+            sig = eps_ @ De.T if De.ndim == 2 else np.einsum("eij,ej->ei", De, eps_)
+            W = 0.5 * np.einsum("ei,ei->e", sig, eps_)
+            S = np.stack([sig[:, [0, 3, 5]], sig[:, [3, 1, 4]], sig[:, [5, 4, 2]]], axis=1)
+            val = np.einsum("eij,ejk,eki->e", S, gu, gQ) - W * np.trace(gQ, axis1=1, axis2=2)
+            tot += float(np.sum(val * w * detJ))
+        # 分母 ∫ q_s ds（前縁の端で切れる分も正しく）
+        ss = np.linspace(0, Ltot, 2001)
+        den = float(np.trapezoid(np.clip(1 - np.abs(ss - s0) / width, 0, 1), ss)) if hasattr(np, "trapezoid") else \
+            float(np.trapz(np.clip(1 - np.abs(ss - s0) / width, 0, 1), ss))
+        out.append((2.0 if symmetric else 1.0) * tot / max(den, 1e-300))
+    return np.array(out), Ltot
+
+
+def raju_newman(sig, a, c, t, b, phi):
+    """半楕円の表面き裂（有限幅の板・引張）の K（Raju–Newman 1981、a/c ≤ 1、精度 ±5 %）。b = 板の幅の半分、φ: 前縁の角度"""
+    ac, at = a / c, a / t
+    Q = 1 + 1.464 * ac ** 1.65
+    M1 = 1.13 - 0.09 * ac
+    M2 = -0.54 + 0.89 / (0.2 + ac)
+    M3 = 0.5 - 1 / (0.65 + ac) + 14 * (1 - ac) ** 24
+    g = 1 + (0.1 + 0.35 * at ** 2) * (1 - np.sin(phi)) ** 2
+    fphi = (ac ** 2 * np.cos(phi) ** 2 + np.sin(phi) ** 2) ** 0.25
+    fw = np.sqrt(1 / np.cos(np.pi * c / (2 * b) * np.sqrt(at)))
+    F = (M1 + M2 * at ** 2 + M3 * at ** 4) * g * fphi * fw
+    return sig * np.sqrt(np.pi * a / Q) * F
+
+
+def ellipse_front_nodes_range(mesh: Mesh, g: CrackGeom):
+    """メッシュにある楕円の前縁の節点から、前縁の角度 θ の範囲（物体の中の部分）を求める"""
+    X = mesh.nodes
+    tol = 1e-6 * float(np.ptp(X, axis=0).max())
+    r = X - g.center
+    h = r @ g.n
+    xc, xa = r @ g.uc, r @ g.ua
+    rho = np.sqrt((xc / g.cc) ** 2 + (xa / g.a) ** 2)
+    on = (np.abs(h) < 1e3 * tol) & (np.abs(rho - 1) < 0.02)
+    if not on.any():
+        raise ValueError("楕円の前縁の節点が見つかりません")
+    th = np.arctan2(xa[on] / g.a, xc[on] / g.cc)
+    return float(th.min()), float(th.max())
+
+
+def _evaluate_ellipse(mesh, u, D, em, mats, vol, c, i):
+    g = CrackGeom(c)
+    t0, t1 = ellipse_front_nodes_range(mesh, g)
+    th = np.linspace(t0, t1, 121)
+    P = g.center + np.outer(g.cc * np.cos(th), g.uc) + np.outer(g.a * np.sin(th), g.ua)
+    X = mesh.nodes
+    cen = X[mesh.elems[:, :4]].mean(1)
+    rr = _project_polyline(cen, P)[0]
+    near = np.argsort(rr)[:max(8, min(64, len(rr)))]
+    hf = float(c.get("front_size") or 0) or float(np.cbrt(np.median(vol[near]) * 6 * np.sqrt(2)))
+    m0 = mats[int(np.bincount(em[near]).argmax())]
+    seg = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))]
+    Ltot = seg[-1]
+    nst = int(c.get("stations", 9))
+    st = np.linspace(0.04 * Ltot, 0.96 * Ltot, nst)
+    width = max(Ltot / (nst - 1), 3 * hf)
+    J1, _ = j_front(mesh, u, D, g, P, st, width, hf, 3 * hf, elem_mat=em, symmetric=bool(c.get("symmetric")))
+    J2, _ = j_front(mesh, u, D, g, P, st, width, 2 * hf, 5 * hf, elem_mat=em, symmetric=bool(c.get("symmetric")))
+    rows = []
+    for k, s0 in enumerate(st):
+        thk = float(np.interp(s0, seg, th))
+        J = 0.5 * (J1[k] + J2[k])
+        row = {"き裂": c.get("name") or f"き裂 {i + 1}", "位置 φ [°]": round(np.degrees(thk), 2),
+               "J [N/mm]": float(J), "J 積分路 1": float(J1[k]), "J 積分路 2": float(J2[k]),
+               "K（J から）[MPa√mm]": k_from_j(J, m0.E, m0.nu)}
+        if c.get("toughness"):
+            row["破壊靭性 K_IC [MPa√mm]"] = float(c["toughness"])
+            row["安全率（K_IC / K）"] = float(c["toughness"]) / max(row["K（J から）[MPa√mm]"], 1e-30)
+        rows.append(row)
+    return rows

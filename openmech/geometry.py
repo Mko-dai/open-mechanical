@@ -966,6 +966,16 @@ def _embed_cracks(gmsh, cracks, diag):
     tools = []
     m = 0.05 * diag
     for c in cracks:
+        if c.get("shape") == "ellipse":
+            from .fracture import CrackGeom
+            g = CrackGeom(c)
+            ax1, ax2, r1, r2 = (g.uc, g.ua, g.cc, g.a) if g.cc >= g.a else (g.ua, -g.uc, g.a, g.cc)
+            d = occ.addDisk(0, 0, 0, r1, r2)
+            n3 = np.cross(ax1, ax2)
+            Rm = np.column_stack([ax1, ax2, n3])               # 局所 (X, Y, Z) → 全体
+            occ.affineTransform([(2, d)], [*Rm[0], g.center[0], *Rm[1], g.center[1], *Rm[2], g.center[2]])
+            tools.append((2, d))
+            continue
         p0, p1, t, e1, n, L = crack_frame(c)
         back = (float(c.get("depth", 0.0)) + (m if c.get("to_surface", True) else 0.0))
         if back <= 0:
@@ -1006,6 +1016,12 @@ def _apply_cracks(mesh, ref, cracks, tol):
     _surface_face_ids(mesh, fids, n_surf)
     crack_faces = []
     for cr in cracks:
+        if cr.get("shape") == "ellipse":
+            from .fracture import CrackGeom
+            g = CrackGeom(cr)
+            mesh, fp = insert_crack(mesh, g.center, g.n, lambda P, g=g: g.inside(P, tol), tol=tol)
+            crack_faces.append(fp)
+            continue
         p0, p1, t, e1, n, L = crack_frame(cr)
         a = float(cr.get("depth", 0.0))
         to_s = cr.get("to_surface", True)
@@ -2000,8 +2016,15 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
                 # 前縁の周りを細かく（Ansys のき裂の「前縁の分割数」に相当: 既定は全体サイズの 1/8）
                 sp = list(ms.get("size_points") or [])
                 for c in cracks:
-                    p0, p1, t, e1, n, L = crack_frame(c)
                     hf = float(c.get("front_size") or 0) or h / 8
+                    if c.get("shape") == "ellipse":
+                        from .fracture import CrackGeom
+                        ring = CrackGeom(c).ring
+                        per = float(np.linalg.norm(np.diff(ring, axis=0), axis=1).sum())
+                        idx = np.linspace(0, len(ring) - 1, max(8, int(np.ceil(per / hf)) + 1)).astype(int)
+                        sp += [[*ring[k], hf] for k in idx]
+                        continue
+                    p0, p1, t, e1, n, L = crack_frame(c)
                     for u_ in np.linspace(0, 1, max(2, int(np.ceil(L / hf)) + 1)):
                         sp.append([*(p0 + u_ * L * t), hf])
                 ms["size_points"] = sp
@@ -2037,8 +2060,15 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
         if crk and order == 2 and hasattr(mesh, "crack_faces"):
             # き裂前縁の 1/4 点要素（中間節点の直線化のあとで。1/4 点要素はヤコビアン比が低くて当然なので）
             from .fracture import quarter_point
-            nq = sum(quarter_point(mesh, c["front0"], c["front1"], tol=1e-6 * diag)
-                     for c in crk if c.get("quarter_point", True))
+            nq = 0
+            for c in crk:
+                if not c.get("quarter_point", True):
+                    continue
+                if c.get("shape") == "ellipse":
+                    from .fracture import CrackGeom
+                    nq += quarter_point(mesh, CrackGeom(c).ring, tol=1e-6 * diag)
+                else:
+                    nq += quarter_point(mesh, c["front0"], c["front1"], tol=1e-6 * diag)
             if nq:
                 mesh.quarter_point = True
                 log(f"き裂前縁の 1/4 点要素: 中間節点 {nq:,} 個")

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QHBoxLayout,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QHBoxLayout,
                                QLabel, QLineEdit, QListWidget, QPushButton, QVBoxLayout, QWidget)
 
 
@@ -44,6 +44,24 @@ class CrackDialog(QDialog):
         f = QFormLayout()
         self.name = QLineEdit()
         f.addRow("名前", self.name)
+        self.shape = QComboBox()
+        self.shape.addItem("直線の前縁（板厚を貫く き裂・縁き裂）", "straight")
+        self.shape.addItem("楕円の前縁（中心を表面に置くと半楕円の表面き裂）", "ellipse")
+        f.addRow("き裂の形", self.shape)
+        w, self.ctr = _vec_edit([0, 0, 0])
+        f.addRow("楕円の中心 [mm]", w)
+        w, self.ua = _vec_edit([0, 0, -1])
+        f.addRow("深さ a の向き（物体の中へ）", w)
+        self.ea = QDoubleSpinBox()
+        self.ea.setRange(0, 1e6)
+        self.ea.setDecimals(4)
+        self.ea.setSuffix(" mm")
+        f.addRow("深さ a", self.ea)
+        self.ec = QDoubleSpinBox()
+        self.ec.setRange(0, 1e6)
+        self.ec.setDecimals(4)
+        self.ec.setSuffix(" mm")
+        f.addRow("長さの半分 c", self.ec)
         w, self.f0 = _vec_edit([0, 0, 0])
         f.addRow("前縁の始点 [mm]", w)
         w, self.f1 = _vec_edit([0, 0, 0])
@@ -74,8 +92,9 @@ class CrackDialog(QDialog):
         f.addRow("", self.sym)
         right.addLayout(f)
         right.addWidget(QLabel(
-            "前縁（直線）の両端は物体の表面に置いてください（板厚を貫く前縁）。き裂面は「深さ」だけ前縁の後ろに\n"
-            "広がる長方形で、メッシュを作るときに形状へ埋め込み、き裂面の節点を分けます。\n"
+            "直線: 前縁の両端は物体の表面に置いてください（板厚を貫く前縁）。き裂面は「深さ」だけ前縁の後ろに\n"
+            "広がる長方形です。楕円: 中心・法線・深さ a の向きと a・c で決まる楕円の内側がき裂面です。\n"
+            "メッシュを作るときに形状へ埋め込み、き裂面の節点を分け、前縁は 1/4 点要素にします。\n"
             "結果は 解析結果タブ →「J 積分・K」。J は 5 つの積分路で求め、2〜5 番目の平均を使います。"))
         right.addStretch(1)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -100,7 +119,9 @@ class CrackDialog(QDialog):
     def _store(self):
         if 0 <= self._cur < len(self._cracks):
             self._cracks[self._cur] = {
-                "name": self.name.text().strip() or f"き裂 {self._cur + 1}",
+                "name": self.name.text().strip() or f"き裂 {self._cur + 1}", "shape": self.shape.currentData(),
+                "center": [s.value() for s in self.ctr], "axis_a": [s.value() for s in self.ua],
+                "a": self.ea.value(), "c": self.ec.value(),
                 "front0": [s.value() for s in self.f0], "front1": [s.value() for s in self.f1],
                 "normal": [s.value() for s in self.nrm], "direction": [s.value() for s in self.dir],
                 "depth": self.depth.value(), "to_surface": self.to_surf.isChecked(),
@@ -113,6 +134,12 @@ class CrackDialog(QDialog):
             return
         c = self._cracks[i]
         self.name.setText(c.get("name", ""))
+        self.shape.setCurrentIndex(max(0, self.shape.findData(c.get("shape", "straight"))))
+        for sp, key, d in [(self.ctr, "center", [0, 0, 0]), (self.ua, "axis_a", [0, 0, -1])]:
+            for s_, v in zip(sp, c.get(key, d)):
+                s_.setValue(float(v))
+        self.ea.setValue(float(c.get("a", 0.0) or 0.0))
+        self.ec.setValue(float(c.get("c", 0.0) or 0.0))
         for sp, key, d in [(self.f0, "front0", [0, 0, 0]), (self.f1, "front1", [0, 0, 0]),
                            (self.nrm, "normal", [0, 1, 0]), (self.dir, "direction", [1, 0, 0])]:
             for s, v in zip(sp, c.get(key, d)):
