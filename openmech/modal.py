@@ -296,11 +296,12 @@ def solve_modal(mesh: Mesh, material: Material, bcs: list[BC], n_modes: int = 6,
         K = K + K_sigma
     M = consistent_mass(mesh, rho_e)
     nb = 3 * mesh.n_nodes
-    _, fixed = build_load_and_constraints(mesh, mats[0], _supports_only(bcs))
+    _, fixed = build_load_and_constraints(mesh, mats[0], _supports_only(bcs), allow_oblique=True)
     T = None
     pilots = []
     from .remote import REMOTE_KINDS, extra_terms, pad, reduce_system
-    if any(b.kind in REMOTE_KINDS for b in bcs):
+    from .solver import oblique_support_faces
+    if any(b.kind in REMOTE_KINDS for b in bcs) or oblique_support_faces(mesh, bcs):
         ex = extra_terms(mesh, [b if b.kind != "remote_displacement" else
                                 BC(b.kind, b.faces, [None if v is None else 0.0 for v in b.values], b.name, b.nodes,
                                    point=b.point, options=b.options) for b in bcs],

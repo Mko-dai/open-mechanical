@@ -3738,10 +3738,10 @@ class MainWindow(QMainWindow):
             self._row(s2, "拘束", "X, Y, Z 方向すべて固定" + ("（シェルは回転も固定）" if getattr(self.mesh, "is_shell", False) else ""))
         elif bc.kind == "symmetry":
             self._row(s2, "拘束", "面（2D は辺）の法線方向の変位を 0（シェルは面内軸まわりの回転も 0）")
-            self._row(s2, "", "対称面は座標軸に垂直な平面にしてください（Ansys の「対称領域」と同じ。結果は対称モデル側の値）")
+            self._row(s2, "", "斜めの平面・曲面でも設定できます（静解析・モーダル。法線方向だけ拘束）。結果は対称モデル側の値")
         elif bc.kind == "frictionless":
             self._row(s2, "拘束", "面（2D は辺）の法線方向の変位を 0、接線方向は自由")
-            self._row(s2, "", "現在は座標軸に垂直な平らな面に対応しています")
+            self._row(s2, "", "斜めの平面や円筒面にも設定できます（静解析・モーダル。座屈・陽解法などは座標軸に垂直な平面だけ）")
         elif bc.kind == "thermal":
             sp = dspin(float(bc.values[0] or 0), -273, 1e5, 3, 10.0, "°C")
             sp.valueChanged.connect(lambda v: self._bc_value(i, 0, v))

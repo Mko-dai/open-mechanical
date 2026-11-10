@@ -44,6 +44,7 @@ class Extra:
     F_by: dict = field(default_factory=dict)       # 境界条件の番号 → {dof: 力}（非線形のステップ倍率用）
     fixed_by: dict = field(default_factory=dict)   # 境界条件の番号 → {dof: 値}
     joints: dict = field(default_factory=dict)     # 境界条件の番号 → ジョイントの情報（結果の集計用）
+    normal_sup: dict = field(default_factory=dict)  # 境界条件の番号 → [(節点, 法線 (m,3), ペナルティ)]（斜め・曲面の摩擦なし支持）
     beams: dict = field(default_factory=dict)      # 境界条件の番号 → ビーム接続の情報（断面力の計算用）
 
     def Fvec_of(self, i):
@@ -404,6 +405,24 @@ def extra_terms(mesh, bcs, kref: float, acc=None) -> Extra:
         del low_set
         ex.notes.append(f"{b.label()}: {nsec} セクタ（1 セクタ {360 / nsec:g}°）、高い側の節点 {len(hn):,} を低い側に結合")
 
+    # 斜めの平面・曲面の対称領域 / 摩擦なし支持: 面の法線方向だけをペナルティで止める（節点ごとの法線）
+    from .solver import oblique_support_faces
+    for i, faces in oblique_support_faces(mesh, bcs).items():
+        for f in faces:
+            tris = mesh.face_tris(int(f))
+            c3 = mesh.nodes[tris[:, :3]]
+            tn = np.cross(c3[:, 1] - c3[:, 0], c3[:, 2] - c3[:, 0])        # 面積 × 2 の重みつき法線
+            nodes, inv = np.unique(tris.ravel(), return_inverse=True)
+            nn = np.zeros((len(nodes), 3))
+            for c in range(3):
+                nn[:, c] = np.bincount(inv, weights=np.repeat(tn[:, c], tris.shape[1]), minlength=len(nodes))
+            nn /= np.maximum(np.linalg.norm(nn, axis=1, keepdims=True), 1e-300)
+            for nd, e in zip(nodes, nn):
+                ex.add_block(3 * int(nd) + np.arange(3), 3 * int(nd) + np.arange(3), kp * np.outer(e, e))
+            ex.normal_sup.setdefault(i, []).append((nodes, nn, kp))
+        ex.direct = True
+        ex.notes.append(f"{bcs[i].label()}: 斜め・曲面の {len(faces)} 面は、節点ごとの法線方向を拘束します")
+
     for i, b in enumerate(bcs):
         if b.kind not in REMOTE_KINDS:
             continue
@@ -516,6 +535,18 @@ def extra_terms(mesh, bcs, kref: float, acc=None) -> Extra:
                 for kk in range(3):
                     addF(d0 + kk, f[kk])
     return ex
+
+
+def normal_support_reactions(ex: Extra, u: np.ndarray) -> dict:
+    """斜め・曲面の摩擦なし支持の反力（支持がボディを押す力）: −k (n·u) n の合計"""
+    U = u[:ex.n_base].reshape(-1, 3)
+    out = {}
+    for i, lst in ex.normal_sup.items():
+        r = np.zeros(3)
+        for nodes, nn, kp in lst:
+            r -= (kp * np.einsum("ij,ij->i", U[nodes], nn)[:, None] * nn).sum(0)
+        out[i] = r
+    return out
 
 
 def beam_results(ex: Extra, u: np.ndarray) -> dict:

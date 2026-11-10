@@ -413,20 +413,48 @@ def symmetry_axis(mesh: Mesh, faces) -> int:
     for f in faces:
         n = np.asarray(info[int(f)]["normal"], float)
         if not info[int(f)].get("flat", False) or np.max(np.abs(n)) < 0.999:
-            raise ValueError("対称領域・摩擦なし支持は、座標軸に垂直な平らな面に設定してください"
+            raise ValueError("この解析では、対称領域・摩擦なし支持は座標軸に垂直な平らな面に設定してください"
                              f"（面{int(f) + 1} は法線 ({n[0]:.2f}, {n[1]:.2f}, {n[2]:.2f})）")
         axes.add(int(np.argmax(np.abs(n))))
     return axes
 
 
-def build_load_and_constraints(mesh: Mesh, material: Material, bcs: list[BC], rho_e=None):
+def oblique_support_faces(mesh: Mesh, bcs) -> dict:
+    """対称領域・摩擦なし支持のうち、座標軸に垂直な平面ではない面（斜めの平面・円筒などの曲面）。
+    戻り値: {境界条件の番号: [面番号]}。 これらは節点ごとの法線方向の拘束として remote.extra_terms が扱う
+    （Ansys の摩擦なし支持と同じく、面の法線方向だけ止めて面に沿っては自由）"""
+    out = {}
+    info = None
+    for i, bc in enumerate(bcs):
+        if bc.kind not in ("symmetry", "frictionless") or not bc.faces:
+            continue
+        if getattr(mesh, "is_shell", False) or getattr(mesh, "is_2d", False):
+            continue
+        if info is None:
+            info = {f["id"]: f for f in mesh.face_info()}
+        fs = []
+        for f in bc.faces:
+            n = np.asarray(info[int(f)]["normal"], float)
+            if not info[int(f)].get("flat", False) or np.max(np.abs(n)) < 0.999:
+                fs.append(int(f))
+        if fs:
+            out[i] = fs
+    return out
+
+
+def build_load_and_constraints(mesh: Mesh, material: Material, bcs: list[BC], rho_e=None, allow_oblique=False):
+    """allow_oblique: 斜め・曲面の対称領域 / 摩擦なし支持を、呼び出し側が remote.extra_terms で扱うか
+    （扱えない解析では、これまでどおりエラーで知らせる）"""
     ndof = 3 * mesh.n_nodes
     F = np.zeros(ndof)
     fixed = {}  # dof -> value
     for bc in bcs:
         if bc.kind in ("symmetry", "frictionless"):
             # 対称領域 / 摩擦なし支持: 面に垂直な方向の変位 = 0（面に沿っては自由）
+            skip = set(oblique_support_faces(mesh, [bc]).get(0, [])) if allow_oblique else set()
             for f in bc.faces:
+                if int(f) in skip:
+                    continue          # 斜め・曲面: 法線方向の拘束として remote.extra_terms が扱う
                 ax = symmetry_axis(mesh, [f]).pop()
                 for d in 3 * mesh.face_nodes(f) + ax:
                     fixed[int(d)] = 0.0
@@ -669,12 +697,12 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
     K = assemble_stiffness(mesh, D, progress=lambda x: prog(0.02 + 0.4 * x, "剛性マトリクスを組み立て中…"),
                            elem_mat=elem_mat)
     t_asm = time.time() - t0
-    F, fixed = build_load_and_constraints(mesh, material, bcs, rho_e=rho_e)
+    F, fixed = build_load_and_constraints(mesh, material, bcs, rho_e=rho_e, allow_oblique=True)
     if eps_th_m is not None:
         F = F + thermal_load_vector(mesh, D, elem_mat, eps_th_m)
     from .remote import REMOTE_KINDS, extra_terms, pad
     ex = None
-    if any(b.kind in REMOTE_KINDS for b in bcs):
+    if any(b.kind in REMOTE_KINDS for b in bcs) or oblique_support_faces(mesh, bcs):
         acc = next((np.asarray(b.values, float) for b in bcs if b.kind == "gravity"), None)
         ex = extra_terms(mesh, bcs, float(np.mean(np.abs(K.diagonal()))), acc=acc)
         for note in ex.notes:
@@ -753,6 +781,10 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
                 rel[k] = u[jd["dof"] + j]
             joints[i] = {"力（全体）": Fj, "モーメント（全体）": Mj, "力（局所）": E @ Fj, "モーメント（局所）": E @ Mj,
                          "相対変位（局所）": rel[:3], "相対回転（局所） [rad]": rel[3:], "type": jd["type"]}
+    normal_reac = {}
+    if ex is not None and ex.normal_sup:
+        from .remote import normal_support_reactions
+        normal_reac = normal_support_reactions(ex, u)
     beams = {}
     if ex is not None and ex.beams:
         from .remote import beam_results
@@ -765,6 +797,8 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
         if bc.kind in ("fixed", "displacement", "symmetry", "frictionless", "submodel"):
             nodes = mesh.face_nodes(bc.faces) if bc.faces else np.asarray(bc.nodes, dtype=np.int64)
             reactions[i] = R[:nb].reshape(-1, 3)[nodes].sum(0)
+            if i in normal_reac:
+                reactions[i] = reactions[i] + normal_reac[i]
     reaction_moments = {}
     if ex is not None:
         for i, dofs in ex.reaction_dofs.items():

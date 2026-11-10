@@ -226,10 +226,11 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
 
     # 荷重・拘束（境界条件ごと）
     from .remote import REMOTE_KINDS
-    per_bc = [build_load_and_constraints(mesh, mats[0], [bc], rho_e=rho_e) for bc in bcs]
+    per_bc = [build_load_and_constraints(mesh, mats[0], [bc], rho_e=rho_e, allow_oblique=True) for bc in bcs]
     nb = ndof
     ex = None
-    if any(b.kind in REMOTE_KINDS for b in bcs):
+    from .solver import oblique_support_faces
+    if any(b.kind in REMOTE_KINDS for b in bcs) or oblique_support_faces(mesh, bcs):
         # リモートポイント・ばね・弾性支持・円筒支持など: パイロットの 6 自由度を後ろに足し、
         # 多点拘束（剛体・RBE3）は各反復の連立方程式で消去する（remote.reduce_system）
         from .remote import extra_terms
@@ -733,6 +734,10 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
             if ex is not None and ex.beams:
                 from .remote import beam_results
                 results[-1].beams = beam_results(ex, u)
+            if ex is not None and ex.normal_sup:
+                from .remote import normal_support_reactions
+                for i_, r_ in normal_support_reactions(ex, u).items():
+                    results[-1].reactions[i_] = results[-1].reactions.get(i_, 0) + r_
     info_common = {"自由度数": int(free.sum()), "節点数": mesh.n_nodes, "要素数": mesh.n_elems,
                    "要素タイプ": "Tet10（2次）" if mesh.order == 2 else "Tet4（1次）",
                    "大変形": "オン" if LD else "オフ", "接触領域数": len(contacts),
