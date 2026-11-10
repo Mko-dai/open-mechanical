@@ -295,3 +295,52 @@ def test_contact_face_wider_than_target():
     assert np.nanmax(np.nan_to_num(p)[(x < 22) | (x > 38)]) == 0.0
     inside = (x > 26) & (x < 34) & np.isfinite(p)
     assert np.median(p[inside]) == pytest.approx(10.0, rel=0.15)
+
+
+def test_finite_sliding_on_curved_surface():
+    """曲面での有限すべり: リングの内面（r = 10）に押し付けたパッドを、軸まわりに 30° 回す。
+    回転対称なので、接触力の大きさは変わらず、向きと面圧の重心だけが 30° 回る（大変形オン）"""
+    from openmech.contact import ContactRegion
+    from openmech.mesh import Mesh
+
+    def arc_block(r0, r1, t0, t1, nr, nt):
+        b = structured_box(r1 - r0, 1.0, 4.0, nr, nt, 1).to_quadratic()
+        r, th = r0 + b.nodes[:, 0], np.radians(t0 + b.nodes[:, 1] * (t1 - t0))
+        return Mesh(np.c_[r * np.cos(th), r * np.sin(th), b.nodes[:, 2]], b.elems)
+    ring, pad = arc_block(10, 14, 0, 90, 2, 18), arc_block(7, 10, 30, 50, 2, 4)
+    m = Mesh(np.vstack([ring.nodes, pad.nodes]), np.vstack([ring.elems, pad.elems + ring.n_nodes]))
+    m.elem_body = np.r_[np.zeros(ring.n_elems, int), np.ones(pad.n_elems, int)]
+    m.group_faces()
+    R = np.hypot(m.nodes[:, 0], m.nodes[:, 1])
+
+    def fid(body, rad):
+        return [f["id"] for f in m.face_info() if np.allclose(R[m.face_nodes(f["id"])], rad, atol=1e-6)
+                and bool((m.face_nodes(f["id"]) >= ring.n_nodes).all()) == bool(body)]
+    c = ContactRegion(type="frictionless", contact_faces=fid(0, 10), target_faces=fid(1, 10), interface="none",
+                      auto=False)
+    bcs = [BC("fixed", fid(0, 14)),
+           BC("symmetry", [f["id"] for f in m.face_info() if abs(abs(f["normal"][2]) - 1) < 1e-6])]
+    nsteps, rot, delta = 6, 30.0, 0.02
+    ang = np.r_[0.0, np.radians(np.linspace(0, rot, nsteps + 1))]      # ステップ 1 は押し付けだけ
+    for i in m.face_nodes(fid(1, 7)[0]):
+        x, y = m.nodes[i, :2]
+        r, t = np.hypot(x, y), np.arctan2(y, x)
+        bx = BC("displacement", [], [1.0, None, None], nodes=[int(i)])
+        by = BC("displacement", [], [None, 1.0, None], nodes=[int(i)])
+        bx.step_factors = list((r + delta) * np.cos(t + ang[1:]) - x)
+        by.step_factors = list((r + delta) * np.sin(t + ang[1:]) - y)
+        bcs += [bx, by]
+    st = AnalysisSettings(large_deflection=True, n_steps=nsteps + 1, step_end_times=list(range(1, nsteps + 2)),
+                          initial_substeps=2, max_substeps=100)
+    rs = solve_static(m, S, bcs, [c], st, **quiet)
+    th = np.degrees(np.arctan2(m.nodes[:, 1], m.nodes[:, 0]))
+
+    def summary(r):
+        F, p = r.reactions[0], np.nan_to_num(r.contact["接触圧 [MPa]"])
+        return np.hypot(F[0], F[1]), np.degrees(np.arctan2(-F[1], -F[0])), (th * p).sum() / p.sum()
+    f0, d0, c0 = summary(rs[0])
+    f1, d1, c1 = summary(rs[-1])
+    assert f0 > 1000
+    assert f1 == pytest.approx(f0, rel=0.02)
+    assert d1 - d0 == pytest.approx(rot, abs=0.5)
+    assert c1 - c0 == pytest.approx(rot, abs=0.5)

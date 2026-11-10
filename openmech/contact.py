@@ -207,6 +207,7 @@ class Pairs:
     finite: bool = False
     X: np.ndarray = None        # 節点座標（変形前）
     ttris: np.ndarray = None    # Target 側の三角形
+    ttris6: np.ndarray = None   # Target 側の 6 節点三角形（2 次要素の面。ttris と同じ並び）
     adj: np.ndarray = None      # 「接触するよう調整」「オフセット」で動かした隙間の量
     h: float = 1.0
     pin: float = 1e30
@@ -293,6 +294,16 @@ def _project(xs, tp, tree, kq):
     return best_t, best_bc, best_d
 
 
+def _tri6(xi, et):
+    """6 節点三角形（a,b,c, ab,bc,ca）の形状関数と ξ・η での微分。 L = (1−ξ−η, ξ, η)"""
+    L0 = 1.0 - xi - et
+    N = np.stack([L0 * (2 * L0 - 1), xi * (2 * xi - 1), et * (2 * et - 1), 4 * L0 * xi, 4 * xi * et, 4 * et * L0], 1)
+    z = np.zeros_like(xi)
+    dNx = np.stack([1 - 4 * L0, 4 * xi - 1, z, 4 * (L0 - xi), 4 * et, -4 * et], 1)
+    dNe = np.stack([1 - 4 * L0, z, 4 * et - 1, -4 * xi, 4 * xi, 4 * (L0 - et)], 1)
+    return N, dNx, dNe
+
+
 def repair_pairs(pr: Pairs, u: np.ndarray):
     """有限すべり: 変形後の位置で接触相手（Target の三角形・内挿の重み・法線）を決め直す。
 
@@ -309,6 +320,31 @@ def repair_pairs(pr: Pairs, u: np.ndarray):
     bt, bc, _d = _project(xs, tp, tree, min(8, len(pr.ttris)))
     masters = pr.ttris[bt]
     n = pr.n if pr.n_fixed else tn[bt]
+    if pr.ttris6 is not None:
+        # 2 次要素の面: 中間節点まで使った曲面（6 節点三角形）に射影する。平らな三角形で近似すると、
+        # 曲面をすべるときに「面の粗さ」（弦と弧の差）がそのまま隙間・食い込みの誤差になる
+        masters = pr.ttris6[bt]
+        xm = x[masters]                                    # (M,6,3)
+        xi, et = bc[:, 1].copy(), bc[:, 2].copy()
+        for _ in range(6):
+            N, dNx, dNe = _tri6(xi, et)
+            r = np.einsum("ma,mak->mk", N, xm) - xs
+            tx = np.einsum("ma,mak->mk", dNx, xm)
+            te = np.einsum("ma,mak->mk", dNe, xm)
+            a11, a12, a22 = (tx * tx).sum(1), (tx * te).sum(1), (te * te).sum(1)
+            b1, b2 = (r * tx).sum(1), (r * te).sum(1)
+            det = np.maximum(a11 * a22 - a12 * a12, 1e-300)
+            xi = xi - (a22 * b1 - a12 * b2) / det
+            et = et - (a11 * b2 - a12 * b1) / det
+            # 三角形の中に収める
+            xi, et = np.maximum(xi, 0.0), np.maximum(et, 0.0)
+            over = np.maximum(xi + et, 1.0)
+            xi, et = xi / over, et / over
+        N, dNx, dNe = _tri6(xi, et)
+        bc = N
+        if not pr.n_fixed:
+            n = np.cross(np.einsum("ma,mak->mk", dNx, xm), np.einsum("ma,mak->mk", dNe, xm))
+            n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-300)
     q = np.einsum("ij,ijk->ik", bc, x[masters])
     off = xs - q
     gn = np.einsum("ij,ij->i", off, n)
@@ -460,6 +496,9 @@ def _region_pairs(mesh, reg: ContactRegion, contact_faces, target_faces, E_of_no
     if finite:
         pr.finite, pr.X, pr.ttris, pr.adj, pr.h = True, mesh.nodes, ttris, adj, float(h_char)
         pr.pin = float(pin)
+        t6 = np.concatenate([mesh.face_tris(f) for f in target_faces])
+        if t6.shape[1] == 6 and len(t6) == len(ttris) and np.array_equal(t6[:, :3], ttris):
+            pr.ttris6 = t6
         pr.n_fixed = reg.detection == "nodal_contact"
     pr.lam_n = np.zeros(M)
     pr.lam_t = np.zeros((M, 3))
@@ -563,7 +602,7 @@ def build_pairs(mesh, regions: list[ContactRegion], E_of_node: np.ndarray, det_t
 def _B_rows(pr: Pairs, ndof: int):
     """相対変位 d = u_s - Σ w u_m を作る疎行列（成分ごと）。 戻り値 [Bx, By, Bz] (M, ndof)"""
     M = len(pr.slave)
-    rows = np.repeat(np.arange(M), 4)
+    rows = np.repeat(np.arange(M), 1 + pr.masters.shape[1])
     out = []
     for c in range(3):
         cols = np.column_stack([3 * pr.slave + c, 3 * pr.masters + c]).ravel()
