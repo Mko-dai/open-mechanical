@@ -562,6 +562,32 @@ try:
     w.project.settings.weak_springs = False
 except Exception:
     P("NG  パイプ（摩擦なし支持・回転速度）\n" + traceback.format_exc())
+# 六面体優勢メッシュ: 内側は六面体、表面の近くは四面体。 四面体メッシュと同じ答えになる
+try:
+    w.new_project()
+    app.processEvents()
+    w.project.geometry = {"kind": "model", "features": [new_feature("box", dx=100.0, dy=20.0, dz=20.0)]}
+    w.project.mesh_size = 4.0
+    out_hd = {}
+    for shape in ("tet", "hexdom"):
+        w._ms_set("element_shape", shape)
+        w.remesh(reset_camera=True)
+        app.processEvents()
+        w.select_node(("mesh",))
+        app.processEvents()
+        inf = w.mesh.face_info()
+        lo = min(inf, key=lambda f: f["centroid"][0])["id"]
+        hi = max(inf, key=lambda f: f["centroid"][0])["id"]
+        fr = run(f"片持ちはり（要素の形 {shape}）", "static", [BC("fixed", [lo]), BC("force", [hi], [0.0, 0.0, -1000.0])],
+                 results=["全変形 [mm]", "相当応力 [MPa]"], shot="hexdom_" + shape)
+        out_hd[shape] = (float(np.abs(fr[-1].u).max()), w.mesh.n_nodes, getattr(w.mesh, "hexdom_counts", None))
+    P(f"OK  六面体優勢メッシュ: {out_hd['hexdom'][2]} / 節点 {out_hd['hexdom'][1]:,}（四面体 {out_hd['tet'][1]:,}）/ "
+      f"最大変位 {out_hd['hexdom'][0]:.5g} mm（四面体 {out_hd['tet'][0]:.5g}）")
+    assert out_hd["hexdom"][2] and out_hd["hexdom"][2]["六面体"] > 100, "六面体ができていません"
+    assert abs(out_hd["hexdom"][0] / out_hd["tet"][0] - 1) < 0.01, "四面体メッシュと答えが合いません"
+    w._ms_set("element_shape", "tet")
+except Exception:
+    P("NG  六面体優勢メッシュ\n" + traceback.format_exc())
 P("完了")
 logf.close()
 w.close()

@@ -1086,7 +1086,7 @@ MESH_DEFAULTS = {
     "capture_proximity": False,
     "size_points": [],
     "cracks": [],                 # き裂（破壊力学）: geometry.crack_frame の辞書のリスト
-    "element_shape": "tet",       # 要素の形: "tet"（四面体）/ "hex"（すべて六面体: 四面体を 4 つの六面体に分割）             # 局所の要素サイズ [[x, y, z, h], ...]（適応メッシュが設定）
+    "element_shape": "tet",       # 要素の形: "tet"（四面体）/ "hex"（すべて六面体: 四面体を 4 つの六面体に分割）/ "hexdom"（六面体優勢）             # 局所の要素サイズ [[x, y, z, h], ...]（適応メッシュが設定）
     "proximity_cells": 3,         # すき間（板厚）を横切る要素数（Ansys の Num Cells Across Gap、既定 3）
     "proximity_min_size": 0.0,    # 近接の最小サイズ [mm]（0 = 曲率の最小サイズと同じ）
     "proximity_max_elements": 3e6,  # 近接の捕捉で見積もった要素数がこれを超えたら中止
@@ -2084,16 +2084,35 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
                 gmsh.option.setNumber("Mesh.MeshSizeMin", 2 * gmsh.option.getNumber("Mesh.MeshSizeMin"))
                 gmsh.option.setNumber("Mesh.SubdivisionAlgorithm", 2)
                 gmsh.option.setNumber("Mesh.SecondOrderIncomplete", 1)
-            gmsh.model.mesh.generate(3)
-            if ms.get("auto_fix", True) and not hexall:
+            hexdom_mesh = None
+            if ms.get("element_shape") == "hexdom":
+                # 六面体優勢: 内側に六面体の格子、表面とのすき間を四面体で埋める（hexdom.py）
+                if len(gmsh.model.getEntities(3)) != 1:
+                    raise GeometryError("六面体優勢メッシュは、ボディが 1 つのモデルで使えます")
+                if ref is not None:
+                    raise GeometryError("六面体優勢メッシュは、き裂と一緒には使えません")
+                from .hexdom import gmsh_hexdom
+                try:
+                    hexdom_mesh = gmsh_hexdom(gmsh, h, order, log)
+                except GeometryError:
+                    raise
+                except Exception as e:      # すき間を切れなかったときは四面体に戻す
+                    log(f"六面体優勢メッシュを作れませんでした（{type(e).__name__}: {e}）。四面体で切ります")
+                    gmsh.model.mesh.clear()
+                    gmsh.model.mesh.setOrder(1)
+            if hexdom_mesh is None:
+                gmsh.model.mesh.generate(3)
+            if hexdom_mesh is not None:
+                pass
+            elif ms.get("auto_fix", True) and not hexall:
                 n0, n1, w0, w1 = _gmsh_quality_fix(gmsh, float(ms.get("min_quality", 0.05)), log)
                 if n0:
                     fix_msgs.append(f"品質 {ms.get('min_quality', 0.05):g} 未満の要素 {n0:,} 個 → 最適化で {n1:,} 個"
                                     f"（最小品質 {w0:.3f} → {w1:.3f}）")
-            if order == 2:
+            if order == 2 and hexdom_mesh is None:
                 gmsh.option.setNumber("Mesh.SecondOrderLinear", 0)  # 曲面に沿わせる
                 gmsh.model.mesh.setOrder(2)
-            mesh = _extract_mesh(gmsh, share)
+            mesh = hexdom_mesh if hexdom_mesh is not None else _extract_mesh(gmsh, share)
             if ref is not None:
                 mesh = _apply_cracks(mesh, ref, cracks, 1e-6 * diag)
         if order == 2 and ms.get("auto_fix", True):
