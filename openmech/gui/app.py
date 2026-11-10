@@ -96,7 +96,9 @@ RESULT_GROUPS = {
     "電気": [("電位 [V]", "電位"), ("電界の大きさ [V/mm]", "電界の大きさ"), ("電界 X [V/mm]", "電界 X"),
            ("電界 Y [V/mm]", "電界 Y"), ("電界 Z [V/mm]", "電界 Z"), ("電束密度の大きさ [C/m²]", "電束密度")],
     "振動": [("変位振幅 [mm]", "変位振幅（調和応答）"), ("変位 1σ（相対） [mm]", "変位 1σ（ランダム振動）"),
-           ("相当応力 1σ（Segalman） [MPa]", "相当応力 1σ（ランダム振動）")],
+           ("相当応力 1σ（Segalman） [MPa]", "相当応力 1σ（ランダム振動）"),
+           ("変位（応答スペクトル） [mm]", "変位（応答スペクトル）"),
+           ("相当応力（応答スペクトル） [MPa]", "相当応力（応答スペクトル）")],
     "疲労ツール": [("疲労:寿命 [回]", "寿命"), ("疲労:損傷度", "損傷度"), ("疲労:安全率（疲労）", "安全率（疲労）"),
                ("疲労:応力振幅（補正後） [MPa]", "等価応力振幅")],
 }
@@ -104,6 +106,7 @@ RESULT_GROUPS = {
 DEFAULT_RESULTS = {"thermal": ["温度 [°C]", "全熱流束 [W/m²]"], "electrostatic": ["電位 [V]", "電界の大きさ [V/mm]"],
                    "harmonic": ["変位振幅 [mm]", "相当応力（ミーゼス） [MPa]"],
                    "random": ["変位 1σ（相対） [mm]", "相当応力 1σ（Segalman） [MPa]"],
+                   "spectrum": ["変位（応答スペクトル） [mm]", "相当応力（応答スペクトル） [MPa]"],
                    "modal": ["全変形 [mm]"], "buckling": ["全変形 [mm]"],
                    "piezo": ["全変形 [mm]", "電位 [V]", "相当応力（ミーゼス） [MPa]"]}
 # 追加の境界条件: 種類 → (値の欄 [(ラベル, 単位, 既定値, 自由にできるか)], オプション)
@@ -3148,6 +3151,7 @@ class MainWindow(QMainWindow):
              ("過渡構造（陽解法・LS-DYNA 方式）", "explicit"), ("モーダル（固有振動数）", "modal"),
              ("固有値座屈", "buckling"), ("定常熱", "thermal"), ("過渡熱", "thermal_t"),
              ("調和応答（モード重ね合わせ）", "harmonic"), ("ランダム振動（PSD）", "random"),
+             ("応答スペクトル", "spectrum"),
              ("静電場", "electrostatic"), ("圧電（静解析）", "piezo")], cur, self._set_analysis_type))
         if t in EXTRA_TYPES or t == "static":
             self._details_analysis_opts(s)
@@ -3200,7 +3204,7 @@ class MainWindow(QMainWindow):
             chk.setChecked(bool(o.get("thermal_import")))
             chk.toggled.connect(lambda v: self._opt("thermal_import", bool(v)))
             self._row(s, "熱応力の連成", chk)
-        if t in ("modal", "harmonic", "random"):
+        if t in ("modal", "harmonic", "random", "spectrum"):
             ispin("n_modes", o.get("n_modes", 6 if t == "modal" else 20), 1, 500, "モード数")
         if t == "modal":
             fspin("f_min", o.get("f_min", 0.0), 0, 1e9, 3, 10, "Hz", "探す範囲の下限")
@@ -3221,6 +3225,30 @@ class MainWindow(QMainWindow):
             self._row(s, "", "材料の熱伝導率（過渡は密度・比熱も）が必要です。荷重は［環境］→［熱］から")
         if t in ("harmonic", "random"):
             fspin("zeta", o.get("zeta", 0.02), 0, 1, 4, 0.005, "", "減衰比")
+        if t == "spectrum":
+            spec = o.get("spectrum") or [[1, 0.5], [10, 1.0], [100, 1.0], [1000, 0.5]]
+            ed2 = QLineEdit("; ".join(f"{a:g}, {b:g}" for a, b in spec))
+            ed2.setToolTip("周波数 Hz, 加速度 を ; で区切る（例: 1, 0.5; 10, 1; 100, 1; 1000, 0.5）。範囲外は端の値")
+
+            def set_spec():
+                try:
+                    rows = [[float(x) for x in r.split(",")] for r in ed2.text().split(";") if r.strip()]
+                    assert len(rows) >= 2 and all(len(r) == 2 for r in rows)
+                    self._opt("spectrum", rows)
+                except Exception:  # noqa: BLE001
+                    QMessageBox.warning(self, "応答スペクトル", "「周波数, 値; 周波数, 値; …」の形で入力してください")
+            ed2.editingFinished.connect(set_spec)
+            self._row(s, "加速度スペクトル [Hz, 加速度]", ed2)
+            self._row(s, "加速度の単位", self._combo([("G", "G"), ("mm/s²", "mm/s2")], o.get("spec_unit", "G"),
+                                               lambda v: self._opt("spec_unit", v)))
+            d = list(o.get("spec_dir", [0, 0, 1]))
+            self._row(s, "入力の方向", self._combo([("X", "X"), ("Y", "Y"), ("Z", "Z")], "XYZ"[int(np.argmax(np.abs(d)))],
+                                               lambda v: self._opt("spec_dir", [float(v == a) for a in "XYZ"])))
+            self._row(s, "モードの組み合わせ", self._combo([("SRSS", "srss"), ("CQC", "cqc")], o.get("spec_method", "srss"),
+                                                    lambda v: self._opt("spec_method", v)))
+            fspin("zeta", o.get("zeta", 0.05), 0, 1, 4, 0.005, "", "減衰比（CQC）")
+            self._row(s, "", "モードの応答を組み合わせた最大値（符号なし）です。入力方向の有効質量の比が 90 % 以上に"
+                             "なるようにモード数を増やしてください（結果の情報に出ます）")
         if t == "harmonic":
             fspin("f_min_h", o.get("f_min_h", 1.0), 0, 1e9, 3, 10, "Hz", "周波数の下限")
             fspin("f_max_h", o.get("f_max_h", 1000.0), 0, 1e9, 3, 10, "Hz", "周波数の上限")

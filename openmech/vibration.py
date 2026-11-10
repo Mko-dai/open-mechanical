@@ -162,3 +162,75 @@ def solve_random(modal: ModalResult, mesh, material, psd_table, direction=(0, 0,
     log(f"ランダム振動: 入力 {r.info['入力の加速度 rms [G]']:.4g} Grms → 最大変位 1σ {r.extra['変位 1σ（相対） [mm]'].max():.4g} mm、"
         f"相当応力 1σ {r.extra['相当応力 1σ（Segalman） [MPa]'].max():.4g} MPa")
     return r
+
+
+# ---------------------------------------------------------------------------- 応答スペクトル解析
+
+def spectrum_interp(table, f, log_interp=True):
+    """応答スペクトルの表 [[f Hz, 加速度], ...] を補間（範囲外は端の値。Ansys と同じ）"""
+    tab = sorted(([float(a), float(b)] for a, b in table), key=lambda r: r[0])
+    fs = np.array([r[0] for r in tab])
+    vs = np.array([r[1] for r in tab])
+    if log_interp and np.all(fs > 0) and np.all(vs > 0):
+        return 10 ** np.interp(np.log10(np.maximum(f, 1e-300)), np.log10(fs), np.log10(vs))
+    return np.interp(f, fs, vs)
+
+
+def cqc_coeff(w, zeta):
+    """CQC の相関係数 ρ_ij（Der Kiureghian、減衰比が同じ）"""
+    r = w[None, :] / np.maximum(w[:, None], 1e-300)
+    z = zeta
+    return 8 * z * z * (1 + r) * r ** 1.5 / ((1 - r * r) ** 2 + 4 * z * z * r * (1 + r) ** 2)
+
+
+def solve_spectrum(modal: ModalResult, mesh, material, spectrum, direction=(0, 0, 1), unit="G", method="srss",
+                   zeta=0.02, elem_materials=None, log=print) -> Result:
+    """単一点の応答スペクトル解析（Ansys の Response Spectrum、加速度スペクトル）。
+
+    モード i の応答 = Γ_i S_a(f_i) / ω_i² × φ_i（Γ_i: 入力方向の刺激係数）。モードの組み合わせ:
+      SRSS  R = √(Σ R_i²)、 CQC  R = √(Σ_i Σ_j ρ_ij R_i R_j)、 ROSE（Rosenblueth と同じ式の閉じた近似）は CQC で代用。
+    応力は成分ごとに組み合わせ、相当応力はその成分から求める（Ansys と同じ）。
+    含めなかった高次モードの寄与（欠落質量）は入れていないので、入力方向の有効質量の比が 90 % 以上になる
+    モード数を使うこと（結果の info に比を出す）
+    """
+    import time
+    t0 = time.time()
+    d = np.asarray(direction, float)
+    d = d / np.linalg.norm(d)
+    sc = G if unit == "G" else 1.0                   # 入力が G なら mm/s² に
+    f = np.asarray(modal.freqs, float)
+    w = 2 * np.pi * f
+    ok = f > 1e-6
+    Sa = spectrum_interp(spectrum, f) * sc
+    gam = modal.participation[:, :3] @ d
+    amp = np.where(ok, gam * Sa / np.maximum(w, 1e-300) ** 2, 0.0)       # モード座標の最大値
+    phi = modal.modes
+    Rd = amp[:, None, None] * phi                                         # (m,N,3)
+    if elem_materials is not None:
+        mats, em = elem_materials
+        D = np.stack([material_D(m) for m in mats])
+    else:
+        D, em = material_D(material), None
+    Sm = np.stack([nodal_stress(mesh, phi[i].ravel(), D, elem_mat=em)[0] for i in range(modal.n_modes)])
+    Rs = amp[:, None, None] * Sm                                          # (m,N,6)
+    if method == "srss":
+        rho = np.eye(len(f))
+    else:
+        rho = cqc_coeff(w, zeta)
+    comb = lambda R: np.sqrt(np.maximum(np.einsum("ij,ink,jnk->nk", rho, R, R), 0.0))  # noqa: E731
+    U = comb(Rd)
+    St = comb(Rs)
+    info = {"解析": "応答スペクトル", "組み合わせ": {"srss": "SRSS", "cqc": "CQC"}.get(method, method),
+            "入力の方向": d.round(4).tolist(), "使ったモード数": int(ok.sum()),
+            "有効質量の比（入力方向）": float((modal.eff_mass[:, :3] @ (d * d)).sum() / max(modal.total_mass, 1e-300)),
+            "合計時間 [s]": round(time.time() - t0, 3)}
+    r = Result(mesh, material, U, St, np.zeros_like(St), {}, info)
+    s = St
+    vm = np.sqrt(0.5 * ((s[:, 0] - s[:, 1]) ** 2 + (s[:, 1] - s[:, 2]) ** 2 + (s[:, 2] - s[:, 0]) ** 2)
+                 + 3 * (s[:, 3] ** 2 + s[:, 4] ** 2 + s[:, 5] ** 2))
+    r.extra = {"変位（応答スペクトル） [mm]": np.linalg.norm(U, axis=1), "相当応力（応答スペクトル） [MPa]": vm}
+    r.modal_table = [{"モード": i + 1, "振動数 [Hz]": float(f[i]), "刺激係数": float(gam[i]),
+                      "スペクトル加速度 [mm/s²]": float(Sa[i]), "モード座標": float(amp[i])} for i in range(len(f))]
+    log(f"応答スペクトル（{info['組み合わせ']}）: 最大変位 {r.extra['変位（応答スペクトル） [mm]'].max():.4g} mm、"
+        f"最大相当応力 {vm.max():.4g} MPa、入力方向の有効質量 {info['有効質量の比（入力方向）']:.1%}")
+    return r

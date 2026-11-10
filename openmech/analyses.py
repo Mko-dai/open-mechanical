@@ -6,6 +6,8 @@ analysis_type:
   thermal     定常熱 / 過渡熱   opts: thermal = ThermalSettings の内容
   harmonic    調和応答          opts: n_modes, f_min_h, f_max_h, n_freq, zeta, base_acc（基礎加振の加速度振幅 [G] 3 成分 or 空）
   random      ランダム振動      opts: n_modes, psd（[[Hz, G²/Hz], ...]）, psd_dir, zeta
+  spectrum    応答スペクトル    opts: n_modes, spectrum（[[Hz, 加速度], ...]）, spec_unit（"G" / "mm/s2"）, spec_dir,
+                                spec_method（"srss" / "cqc"）, zeta
   electrostatic 静電場
   piezo       圧電（静解析）
 static でボルト予張力があるとき、または opts.thermal_import（熱解析の温度で熱応力）のときもここを通る。
@@ -16,9 +18,10 @@ import numpy as np
 
 from .solver import Result, material_D, nodal_stress, solve
 
-EXTRA_TYPES = ("modal", "buckling", "thermal", "harmonic", "random", "electrostatic", "piezo")
+EXTRA_TYPES = ("modal", "buckling", "thermal", "harmonic", "random", "spectrum", "electrostatic", "piezo")
 ANALYSIS_JP = {"static": "静的構造", "modal": "モーダル", "buckling": "固有値座屈", "thermal": "熱",
-               "harmonic": "調和応答", "random": "ランダム振動", "electrostatic": "静電場", "piezo": "圧電",
+               "harmonic": "調和応答", "random": "ランダム振動", "spectrum": "応答スペクトル", "electrostatic": "静電場",
+               "piezo": "圧電",
                "transient": "過渡構造"}
 G = 9806.65
 
@@ -99,9 +102,9 @@ def run_extra(project, mesh, em, log=print, progress=None):
             out.append(fr)
         p._last_temperature = res[-1].T          # 熱応力に使う
         return out
-    if t in ("harmonic", "random"):
+    if t in ("harmonic", "random", "spectrum"):
         from .modal import solve_modal
-        from .vibration import solve_harmonic, solve_random
+        from .vibration import solve_harmonic, solve_random, solve_spectrum
         nm = int(o.get("n_modes", 20))
         mr = solve_modal(mesh, mat, p.bcs, n_modes=nm, elem_materials=em, log=log)
         if t == "harmonic":
@@ -125,6 +128,13 @@ def run_extra(project, mesh, em, log=print, progress=None):
                 r.harmonic = h
                 out.append(r)
             return out
+        if t == "spectrum":
+            spec = o.get("spectrum") or [[1, 0.5], [10, 1.0], [100, 1.0], [1000, 0.5]]
+            r = solve_spectrum(mr, mesh, mat, spec, direction=o.get("spec_dir", [0, 0, 1]),
+                               unit=o.get("spec_unit", "G"), method=o.get("spec_method", "srss"),
+                               zeta=float(o.get("zeta", 0.05)), elem_materials=em, log=log)
+            r.label = r.info["組み合わせ"]
+            return [r]
         psd = o.get("psd") or [[20, 0.01], [2000, 0.01]]
         r = solve_random(mr, mesh, mat, psd, direction=o.get("psd_dir", [0, 0, 1]), zeta=float(o.get("zeta", 0.02)),
                          elem_materials=em, log=log)

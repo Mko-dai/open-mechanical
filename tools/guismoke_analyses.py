@@ -148,6 +148,10 @@ try:
     msgs.clear()
 except Exception:
     P("NG  収束ツール\n" + traceback.format_exc())
+# 応答スペクトル
+run("応答スペクトル（CQC）", "spectrum", [fix], opts={"n_modes": 10, "spec_method": "cqc", "spec_dir": [0, 0, 1],
+                                               "spectrum": [[1, 0.5], [10, 1.0], [100, 1.0], [1000, 0.5]]},
+    results=["変位（応答スペクトル） [mm]", "相当応力（応答スペクトル） [MPa]"], shot="spectrum")
 # ジョイント（地面との回転ジョイント＋ねじりばね）
 try:
     jbc = BC("joint", list(fix.faces), [], options={"type": "revolute", "ground": True, "axis": [0, 0, 1],

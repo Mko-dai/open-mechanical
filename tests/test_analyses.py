@@ -296,3 +296,26 @@ def test_lobpcg_block_matches_shift_invert():
     lam, vec, it, hist = lobpcg_block(Kf, Mf, 6, prec, tol=1e-6)
     assert np.allclose(lam, lam0, rtol=1e-9) and it < 30
     assert np.allclose(vec.T @ (Mf @ vec), np.eye(6), atol=1e-8)
+
+
+def test_response_spectrum_single_mode_and_cqc():
+    """応答スペクトル: 一定の加速度スペクトル Sa のとき、モード i の応答 = Γ_i Sa / ω_i² φ_i。
+    SRSS は各モードの 2 乗和の平方根、振動数の離れたモードでは CQC ≈ SRSS"""
+    from openmech.modal import solve_modal
+    from openmech.vibration import cqc_coeff, solve_spectrum
+    m = bar(nx=20, b=10.0, h=16.0, nz=3)              # 断面を長方形にして y・z の曲げの振動数を離す
+    md = solve_modal(m, S, [BC("fixed", [face(m, 0, 0, -1)])], n_modes=4, log=lambda *a: None)
+    Sa = 2.0                                          # [G] 一定
+    r = solve_spectrum(md, m, S, [[1, Sa], [1e5, Sa]], direction=[0, 0, 1], unit="G", method="srss",
+                       log=lambda *a: None)
+    w = 2 * np.pi * md.freqs
+    amp = md.participation[:, 2] * Sa * 9806.65 / w ** 2
+    exp = np.sqrt(np.sum((amp[:, None, None] * md.modes) ** 2, axis=0))
+    assert np.allclose(r.u, exp, rtol=1e-10, atol=1e-14)
+    rc = solve_spectrum(md, m, S, [[1, Sa], [1e5, Sa]], direction=[0, 0, 1], unit="G", method="cqc", zeta=0.02,
+                        log=lambda *a: None)
+    rho = cqc_coeff(w, 0.02)
+    assert np.allclose(np.diag(rho), 1.0)
+    # z 方向の曲げモードどうしは振動数が離れている → CQC と SRSS はほぼ同じ（正方形断面だと y・z が重なり CQC が大きくなる）
+    assert abs(rc.u[:, 2].max() / r.u[:, 2].max() - 1) < 0.02
+    assert r.extra["相当応力（応答スペクトル） [MPa]"].max() > 0
