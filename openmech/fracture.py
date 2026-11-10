@@ -436,6 +436,7 @@ def ellipse_front_nodes_range(mesh: Mesh, g: CrackGeom):
     if not on.any():
         raise ValueError("楕円の前縁の節点が見つかりません")
     th = np.arctan2(xa[on] / g.a, xc[on] / g.cc)
+    th = np.mod(th + 0.5 * np.pi, 2 * np.pi) - 0.5 * np.pi      # [−π/2, 3π/2): 表面の端 θ ≈ π が −π に飛ばないように
     return float(th.min()), float(th.max())
 
 
