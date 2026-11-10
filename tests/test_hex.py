@@ -67,3 +67,24 @@ def test_hex_thermal_and_plastic():
                       settings=AnalysisSettings(initial_substeps=5), elem_materials=([pl.state()], np.zeros(m2.n_elems, int)),
                       **Q)[-1]
     assert abs(np.median(rr.stress[:, 0]) / 250 - 1) < 0.01
+
+
+def test_degenerate_hex_mixed_mesh():
+    """三角柱・ピラミッド・四面体を縮退した Hex20 として扱える（要素の形が混ざったメッシュの読み込み用）。
+    四面体だけのメッシュを縮退六面体にしても、片持ちはりのたわみは Tet10 とほぼ同じ"""
+    from openmech.elements import DEGEN_TET10
+    from openmech.mesh import Mesh, structured_box
+    L, b, h, P = 100.0, 10.0, 10.0, 100.0
+    m = structured_box(L, b, h, 20, 2, 2).to_quadratic()
+    g = m.elems[:, [0, 1, 2, 3, 4, 5, 6, 7, 9, 8]]          # 自前の Tet10 の順 → gmsh の順
+    m2 = Mesh(m.nodes.copy(), g[:, DEGEN_TET10])
+    n, _ = m2.tri_normals_areas()
+    ax = np.argmax(np.abs(n), 1)
+    m2.set_face_ids(2 * ax + (n[np.arange(len(n)), ax] > 0))
+    assert m2.is_hex and m2.n_faces == 6 and abs(m2.volume() - L * b * h) < 1e-6
+    _, ar = m2.tri_normals_areas()
+    assert abs(ar.sum() - 2 * (L * b + L * h + b * h)) < 1e-6        # 潰れた面は境界に入らない
+    bcs = [BC("fixed", [0]), BC("force", [1], [0, 0, -P])]
+    w2 = -solve(m2, MAT, bcs, **Q).u[:, 2].min()
+    w1 = -solve(m, MAT, bcs, **Q).u[:, 2].min()
+    assert abs(w2 / w1 - 1) < 0.01

@@ -840,13 +840,21 @@ def _extract_mesh(gmsh, share: dict | None = None) -> Mesh:
         phys = gmsh.model.getPhysicalGroupsForEntity(3, vtag)
         body = int(phys[0]) - 1 if len(phys) else 0
         etypes, _, enodes = gmsh.model.mesh.getElements(3, vtag)
+        mixed = len({int(t) for t in etypes} & {4, 11, 6, 18, 7, 19}) > 0 and \
+            len({int(t) for t in etypes} & {5, 17}) > 0
         for t, en in zip(etypes, enodes):
-            npe = {4: 4, 11: 10, 5: 8, 17: 20}.get(int(t))
+            t = int(t)
+            npe = {4: 4, 11: 10, 5: 8, 17: 20, 6: 6, 18: 15, 7: 5, 19: 13}.get(t)
             if npe is None:
                 continue
             b = tag2idx[en.astype(np.int64)].reshape(-1, npe)
             if npe == 20:
                 b = b[:, GMSH_HEX20_TO_VTK]
+            elif mixed or t in (6, 18, 7, 19):
+                # 六面体優勢メッシュ: 三角柱・ピラミッド・四面体を、縮退した六面体として同じ配列に入れる
+                from .elements import DEGEN_PYR5, DEGEN_PYR13, DEGEN_TET4, DEGEN_TET10, DEGEN_WEDGE6, DEGEN_WEDGE15
+                b = b[:, {4: DEGEN_TET4, 11: DEGEN_TET10, 6: DEGEN_WEDGE6, 18: DEGEN_WEDGE15, 7: DEGEN_PYR5,
+                          19: DEGEN_PYR13}[t]]
             blocks.append(b)
             bodies.append(np.full(len(b), body, dtype=np.int64))
     if not blocks:

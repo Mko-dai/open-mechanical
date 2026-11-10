@@ -269,8 +269,17 @@ class Mesh:
         ne = len(e)
         quad2 = e.shape[1] == 20
         qf = np.concatenate([e[:, HEX_QUAD_FACES[k]] for k in range(6)])
-        _, qi, qc = np.unique(np.sort(qf, axis=1), axis=0, return_index=True, return_counts=True)
-        q_once = qi[qc == 1]
+        # 縮退した六面体（ピラミッド・三角柱・四面体の形）: 面の鍵は「重複を除いた頂点」。点や線に潰れた面は捨てる
+        key = np.sort(qf, axis=1)
+        dup = np.zeros_like(key, dtype=bool)
+        dup[:, 1:] = key[:, 1:] == key[:, :-1]
+        nuniq = 4 - dup.sum(1)
+        key = np.where(dup, -1, key)
+        key = np.sort(key, axis=1)
+        valid = nuniq >= 3
+        _, qi, qc = np.unique(key, axis=0, return_index=True, return_counts=True)
+        q_once = qi[(qc == 1) & valid[qi]]
+        q_once.sort()
         quads = qf[q_once]
         qloop = np.concatenate([e[:, HEX20_QUAD_LOOP[k]] for k in range(6)])[q_once] if quad2 else quads
         a, b, c, d = quads.T
@@ -282,11 +291,15 @@ class Mesh:
         else:
             full_q = tri_q
         nq = len(quads)
-        self._btri = tri_q
-        self._btri_full = full_q
-        self._btri_owner = np.tile(q_once % ne, 2)
+        owner = np.tile(q_once % ne, 2)
+        qof = np.tile(np.arange(nq), 2)
+        # 三角形に潰れた四角形の、面積 0 の三角形を除く
+        okt = (tri_q[:, 0] != tri_q[:, 1]) & (tri_q[:, 1] != tri_q[:, 2]) & (tri_q[:, 0] != tri_q[:, 2])
+        self._btri = tri_q[okt]
+        self._btri_full = full_q[okt]
+        self._btri_owner = owner[okt]
         self._bquad_full = qloop
-        self._bquad_of = np.tile(np.arange(nq), 2)
+        self._bquad_of = qof[okt]
 
     def sweep_lines(self):
         """三角柱メッシュの節点を、スイープ方向に並ぶ列（柱）ごとに番号付けする（反復法の線平滑化用）。
