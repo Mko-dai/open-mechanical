@@ -126,7 +126,7 @@ def tie_shell_to_solid(solid, shell, tol=None, log=print):
     return mpc, tied
 
 
-def _shell_post(shell, u6, mats, elem_mat, reactions, info):
+def _shell_post(shell, u6, mats, elem_mat, reactions, info, plastic=None):
     """シェルの変位（6 自由度）→ Result（上面・下面の応力。 shell.solve_shell の線形の後処理と同じ）"""
     from .shell import (_BEN, _MEMR, _allman_B, _dkt_B, _frames, _layer_to_global, _mises, _nodal_avg, _shell_dofs,
                         _transform, plane_stress_D)
@@ -141,6 +141,8 @@ def _shell_post(shell, u6, mats, elem_mat, reactions, info):
     out = {}
     for name, z in (("上面", 0.5), ("下面", -0.5)):
         s = np.einsum("eij,ej->ei", Dp, em + (z * t)[:, None] * kap)
+        if plastic is not None:          # 弾塑性: 積分点（面内 3 点・板厚 5 層）の応力の、いちばん外の層
+            s = plastic.trial[4][:, -1 if z > 0 else 0].mean(0)
         out[name] = _nodal_avg(shell, _layer_to_global(R, s), A)
     vm = {k: _mises(v) for k, v in out.items()}
     stress = np.where((vm["上面"] >= vm["下面"])[:, None], out["上面"], out["下面"])
@@ -149,6 +151,8 @@ def _shell_post(shell, u6, mats, elem_mat, reactions, info):
     r.extra = {"相当応力（上面） [MPa]": vm["上面"], "相当応力（下面） [MPa]": vm["下面"],
                "回転 θx [rad]": U[:, 3], "回転 θy [rad]": U[:, 4], "回転 θz [rad]": U[:, 5]}
     r.rotations = U[:, 3:].copy()
+    if plastic is not None:
+        r.extra["相当塑性ひずみ"] = _nodal_avg(shell, plastic.pb.max(axis=(0, 1))[:, None], A)[:, 0]
     return r
 
 
@@ -234,7 +238,7 @@ def _mixed_system(solid, shell, material, bcs_solid, bcs_shell, solid_materials,
 
 
 def solve_mixed(solid, shell, material, bcs_solid: list[BC], bcs_shell: list[BC], solid_materials=None,
-                shell_materials=None, tie_tol=None, log=print, method="auto", K_add=None):
+                shell_materials=None, tie_tol=None, log=print, method="auto", K_add=None, settings=None):
     """ソリッド＋シェルの線形静解析。 戻り値: (ソリッドの Result, シェルの Result)"""
     t0 = time.time()
     sy = _mixed_system(solid, shell, material, bcs_solid, bcs_shell, solid_materials, shell_materials, tie_tol, log,
@@ -254,15 +258,58 @@ def solve_mixed(solid, shell, material, bcs_solid: list[BC], bcs_shell: list[BC]
     ur[cd] = cv
     Kff = Kr[free][:, free].tocsc()
     rhs = Fr[free] - Kr[free][:, cd] @ cv
-    log(f"ソリッド＋シェル: ソリッド {solid.n_nodes:,} 節点・シェル {shell.n_nodes:,} 節点 / 自由度 {int(free.sum()):,}")
-    uf = _linear_solve(Kff, rhs, lambda *a: None, method="direct" if method == "auto" else method)
-    if not np.all(np.isfinite(uf)) or _rel_res(Kff, uf, rhs) > 1e-4:
-        raise RuntimeError("解が求まりませんでした。拘束が不足していないか確認してください。")
-    ur[free] = uf
-    u = T @ ur
-    Rall = K @ u - F
-    us, uh = u[:ns], u[ns:]
+    pl_s = any(getattr(m, "plastic", False) for m in mats_s)
+    pl_h = any(getattr(m, "plastic", False) for m in mats_h)
+    log(f"ソリッド＋シェル: ソリッド {solid.n_nodes:,} 節点・シェル {shell.n_nodes:,} 節点 / 自由度 {int(free.sum()):,}"
+        + ("（弾塑性）" if pl_s or pl_h else ""))
+    ps = ph = None
+    if pl_s or pl_h:
+        # 弾塑性: ソリッド・シェルそれぞれの内力と接線を並べ、結合の拘束 T で縮めてニュートン法（荷重を少しずつ増やす）
+        from .newton import solve_incremental
+        from .nonlinear import AnalysisSettings
+        from .plasticity import PlasticSolid
+        from .shell import ShellPlastic, plane_stress_D
+        nh = sy["nh"]
+        Ks_lin, Kh_lin = K[:ns][:, :ns].tocsr(), K[ns:][:, ns:].tocsr()      # Ks_lin は接触の剛性こみ
+        if pl_s:
+            ps = PlasticSolid(solid, mats_s, em_s, D)
+        if pl_h:
+            ph = ShellPlastic(shell, mats_h, em_h, np.stack([plane_stress_D(material_D(m)) for m in mats_h])[em_h])
+        Tt = T.T.tocsr()
+
+        def internal(urr):
+            uu = T @ urr
+            if ps is not None:
+                fs, Kst = ps.internal(uu[:ns])
+                if K_add is not None:
+                    fs, Kst = fs + K_add @ uu[:ns], Kst + K_add
+            else:
+                fs, Kst = Ks_lin @ uu[:ns], Ks_lin
+            fh, Kht = ph.internal(uu[ns:]) if ph is not None else (Kh_lin @ uu[ns:], Kh_lin)
+            return Tt @ np.r_[fs, fh], (Tt @ sp.bmat([[Kst, None], [None, Kht]], format="csr") @ T).tocsr()
+
+        def commit():
+            for q in (ps, ph):
+                if q is not None:
+                    q.commit()
+        ur = solve_incremental(internal, commit, Fr, fixed, nk, settings or AnalysisSettings(), log)
+        u = T @ ur
+        us, uh = u[:ns], u[ns:]
+        fs = ps.internal(us)[0] + (K_add @ us if K_add is not None else 0.0) if ps is not None else Ks_lin @ us
+        fh = ph.internal(uh)[0] if ph is not None else Kh_lin @ uh
+        Rall = np.r_[fs, fh] - F
+    else:
+        uf = _linear_solve(Kff, rhs, lambda *a: None, method="direct" if method == "auto" else method)
+        if not np.all(np.isfinite(uf)) or _rel_res(Kff, uf, rhs) > 1e-4:
+            raise RuntimeError("解が求まりませんでした。拘束が不足していないか確認してください。")
+        ur[free] = uf
+        u = T @ ur
+        Rall = K @ u - F
+        us, uh = u[:ns], u[ns:]
     stress, strain = nodal_stress(solid, us, D, elem_mat=em_s)
+    peq_s = None
+    if ps is not None:
+        stress, peq_s = ps.nodal()
     info = {"解析": "静的構造（ソリッド＋シェル）", "自由度数": int(free.sum()), "結合したシェルの節点": int(len(tied)),
             "合計時間 [s]": round(time.time() - t0, 2)}
     reac_s = {}
@@ -277,7 +324,12 @@ def solve_mixed(solid, shell, material, bcs_solid: list[BC], bcs_shell: list[BC]
         if bc.kind in ("fixed", "displacement", "symmetry", "frictionless"):
             nd = shell.face_nodes(bc.faces) if bc.faces else np.asarray(bc.nodes, np.int64)
             reac_h[i] = Rall[ns:].reshape(-1, 6)[nd, :3].sum(0)
-    rh = _shell_post(shell, uh, mats_h, em_h, reac_h, dict(info, 節点数=shell.n_nodes, 要素数=shell.n_elems))
+    rh = _shell_post(shell, uh, mats_h, em_h, reac_h, dict(info, 節点数=shell.n_nodes, 要素数=shell.n_elems),
+                     plastic=ph)
+    if ps is not None or ph is not None:
+        rs.extra = dict(getattr(rs, "extra", None) or {})
+        rs.extra["相当塑性ひずみ"] = peq_s if peq_s is not None else np.zeros(solid.n_nodes)
+        rh.extra.setdefault("相当塑性ひずみ", np.zeros(shell.n_nodes))
     rs.tied_nodes = rh.tied_nodes = tied
     return rs, rh
 
@@ -485,7 +537,11 @@ def run_mixed(project, mesh: MixedMesh, log=print) -> list:
         r = Result(mesh, em_s[0][0], np.vstack([rs.u, rh.u]), np.vstack([rs.stress, rh.stress]),
                    np.vstack([rs.strain, rh.strain]), {}, info, em_s[0], em_s[1])
         r.extra = {}
+        if "相当塑性ひずみ" in (getattr(rs, "extra", None) or {}):
+            r.extra["相当塑性ひずみ"] = np.r_[rs.extra["相当塑性ひずみ"], rh.extra["相当塑性ひずみ"]]
         for k, v in rh.extra.items():
+            if k == "相当塑性ひずみ":
+                continue
             a = np.full(mesh.n_nodes, np.nan)
             a[ns:] = v
             r.extra[k + "（シェル）" if "シェル" not in k else k] = a
@@ -509,7 +565,7 @@ def run_mixed(project, mesh: MixedMesh, log=print) -> list:
             out.append(r)
         return out
     rs, rh = solve_mixed(mesh.solid, mesh.shell, p.material, bs, bh, solid_materials=em_s, shell_materials=em_h,
-                         log=log, method=s.solver_type, K_add=Kc)
+                         log=log, method=s.solver_type, K_add=Kc, settings=s)
     reactions = {}
     js = jh = 0
     for which, i in origin:

@@ -177,3 +177,35 @@ def test_mixed_with_two_solid_bodies_bonded():
     p.bcs = [BC("fixed", [0])]
     with pytest.raises(ValueError, match="結合 と 分離なし"):
         p.run_all(m, log=lambda *a: None)
+
+
+@pytest.mark.parametrize("root", ["solid", "shell"])
+def test_mixed_plastic_cantilever(root):
+    """ソリッド＋シェルの弾塑性: 片持ちはりの根元（ソリッド側 または シェル側）が降伏する。
+    降伏より下はほぼ線形と同じ（角・つなぎ目の局所的な降伏の分だけ違う）、降伏荷重の 1.3 倍では塑性ひずみが出てたわみが線形より大きく、反力は荷重とつり合う"""
+    t, b, L = 2.0, 20.0, 100.0
+    pl = Material("p", 200000.0, 0.0, 7850.0, 250.0, plasticity="bilinear_iso", tangent_modulus=2000.0)
+    solid = structured_box(50, b, t, 25, 10, 2).to_quadratic()
+    shell = structured_plate(50, b, 10, 4, t, origin=(50, 0, t / 2))
+    Py = 250.0 * b * t ** 2 / (6 * L)
+
+    def em(mat):
+        return dict(solid_materials=([mat.state()], np.zeros(solid.n_elems, int)),
+                    shell_materials=([mat.state()], np.zeros(shell.n_elems, int)))
+
+    def run(P, mat):
+        if root == "solid":
+            rs, rh = solve_mixed(solid, shell, mat, [BC("fixed", face(solid, 0, 0, -1))],
+                                 [BC("force", [shell.n_surf + 1], [0, 0, -P])], **em(mat), **quiet)
+            return -rh.u[np.isclose(shell.nodes[:, 0], 100.0), 2].mean(), rs, rh, rs.reactions[0][2]
+        rs, rh = solve_mixed(solid, shell, mat, [BC("force", face(solid, 0, 0, -1), [0, 0, -P])],
+                             [BC("fixed", [shell.n_surf + 1])], **em(mat), **quiet)
+        return -rs.u[np.isclose(solid.nodes[:, 0], 0.0), 2].mean(), rs, rh, rh.reactions[0][2]
+    w_el = run(0.6 * Py, S)[0]
+    w, rs, rh, Rz = run(0.6 * Py, pl)
+    assert w == pytest.approx(w_el, rel=3e-3)
+    w13, rs, rh, Rz = run(1.3 * Py, pl)
+    assert Rz == pytest.approx(1.3 * Py, rel=1e-3)
+    assert w13 > 1.04 * w_el * 1.3 / 0.6
+    peq = (rs if root == "solid" else rh).extra["相当塑性ひずみ"]
+    assert np.nanmax(peq) > 1e-4                 # 根元が降伏している（つなぎ目のソリッドも局所的に降伏しうる）
