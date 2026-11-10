@@ -322,9 +322,19 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
     set_threads(settings.n_cores)
     # 接触の剛性で条件が悪くなるため、非線形では既定で直接法
     method = "direct" if settings.solver_type == "auto" else settings.solver_type
-    if settings.solver_type == "auto" and not pairs and ex is None and not hyper:
-        # 接触も多点拘束も無ければ係数行列は素直なので、大きなモデルは反復法（AMG）に任せる
+    if settings.solver_type == "auto" and ex is None and not hyper:
+        # 多点拘束が無ければ、大きなモデルは反復法（AMG）に任せる（接触のペナルティ剛性があっても対称正定値）。
+        # 反復法が収束せず直接法に切り替わったら、この解析の残りは最初から直接法にする（amg_failed）
         method = "auto"
+    amg_failed = [False]
+    import os as _os
+    _slog = _os.environ.get("OPENMECH_SOLVER_LOG", "") == "1"
+
+    def lin_log(msg):
+        if "直接法に切り替えます" in str(msg):
+            amg_failed[0] = True
+        if _slog:
+            log(msg)
     _fi = np.nonzero(free)[0]
     amg_coords = np.column_stack([mesh.nodes[np.minimum(_fi // 3, mesh.n_nodes - 1)], _fi % 3])
 
@@ -532,8 +542,9 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
                 with np.errstate(all="ignore"):
                     # 摩擦ですべっている節点があると接線が非対称になるので、LU 分解で解く
                     nonsym = any(p.nonsym for p in pairs)
-                    du_f = _linear_solve(Kff, Rf, lambda *a: None, method="superlu" if nonsym else method,
-                                         coords=amg_coords if method == "auto" else None)
+                    meth = "superlu" if nonsym else ("direct" if (method == "auto" and amg_failed[0]) else method)
+                    du_f = _linear_solve(Kff, Rf, lin_log, method=meth,
+                                         coords=amg_coords if meth == "auto" else None)
                 Rf_lin, du_lin = Rf, du_f
             if not np.all(np.isfinite(du_f)):
                 raise RuntimeError("剛性マトリクスが特異です。拘束が不足しているか、接触だけで支えられている"
