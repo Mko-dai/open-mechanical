@@ -125,3 +125,55 @@ def test_mixed_modal_cantilever():
     f1 = 0.5596 * np.sqrt(200000.0 * (b * t ** 3 / 12) / (7.85e-9 * b * t * 100.0 ** 4))
     assert len(rs) == 3 and rs[0].info["振動数 [Hz]"] == pytest.approx(f1, rel=0.02)
     assert np.abs(rs[0].u).max() == pytest.approx(1.0, rel=1e-6)
+
+
+def test_mixed_with_two_solid_bodies_bonded():
+    """ソリッドが 2 つのボディ（節点は共有しない）＋シェル: ソリッドどうしは接触（結合）でつなぐ。
+    片持ちはりの先端のたわみと 1 次の振動数が、ソリッド 1 ボディのときと合う"""
+    from openmech.mesh import Mesh
+    from openmech.mixed import MixedMesh
+    from openmech.project import Project
+    t, b, P = 2.0, 20.0, 10.0
+
+    def model(split):
+        if split:
+            a = structured_box(25, b, t, 12, 10, 2).to_quadratic()
+            c = structured_box(25, b, t, 12, 10, 2, origin=(25, 0, 0)).to_quadratic()
+            solid = Mesh(np.vstack([a.nodes, c.nodes]), np.vstack([a.elems, c.elems + a.n_nodes]))
+            solid.elem_body = np.r_[np.zeros(a.n_elems, int), np.ones(c.n_elems, int)]
+            solid.node_origin = np.arange(solid.n_nodes)
+        else:
+            solid = structured_box(50, b, t, 24, 10, 2).to_quadratic()
+            solid.elem_body = np.zeros(solid.n_elems, int)
+        solid.group_faces()
+        shell = structured_plate(50, b, 10, 4, t, origin=(50, 0, t / 2))
+        return MixedMesh(solid, shell, 2 if split else 1)
+
+    out = {}
+    for split in (True, False):
+        m = model(split)
+        info = m.face_info()
+        tip = next(f["id"] for f in info if f.get("edge") and abs(f["centroid"][0] - 100) < 1e-6)
+        root = next(f["id"] for f in info if not f.get("edge") and abs(f["centroid"][0]) < 1e-6
+                    and abs(f["normal"][0]) > 0.99)
+        p = Project()
+        p.material = S
+        p.bcs = [BC("fixed", [root]), BC("force", [tip], [0, 0, -P])]
+        r = p.run_all(m, log=lambda *a: None)[-1]
+        if split:
+            assert len(p.contacts) == 1 and p.contacts[0].type == "bonded"
+        p.analysis_type = "modal"
+        p.analysis_opts = {"n_modes": 2}
+        f1 = p.run_all(m, log=lambda *a: None)[0].info["振動数 [Hz]"]
+        out[split] = (-r.u[:, 2].min(), f1)
+    assert out[True][0] == pytest.approx(out[False][0], rel=0.01)
+    assert out[True][0] == pytest.approx(P * 100.0 ** 3 / (3 * 200000.0 * b * t ** 3 / 12), rel=0.03)
+    assert out[True][1] == pytest.approx(out[False][1], rel=0.01)
+    # 分離のある接触は、静解析ではエラーで知らせる
+    m = model(True)
+    p = Project()
+    p.material = S
+    p.contact_default_type = "frictionless"
+    p.bcs = [BC("fixed", [0])]
+    with pytest.raises(ValueError, match="結合 と 分離なし"):
+        p.run_all(m, log=lambda *a: None)

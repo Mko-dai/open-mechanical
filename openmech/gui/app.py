@@ -2820,7 +2820,7 @@ class MainWindow(QMainWindow):
             return
         old_auto = {(c.contact_body, c.target_body): c for c in self.project.contacts if c.auto}
         manual = [c for c in self.project.contacts if not c.auto]
-        found = detect_contacts(self.mesh, self.project.contact_tolerance, self.project.contact_default_type,
+        found = detect_contacts(self.mesh.solid if getattr(self.mesh, "is_mixed", False) else self.mesh, self.project.contact_tolerance, self.project.contact_default_type,
                                 self.project.contact_default_mu)
         keep = [k for k in ContactRegion.__dataclass_fields__
                 if k not in ("contact_faces", "target_faces", "contact_body", "target_body", "auto")]
@@ -4465,8 +4465,8 @@ class MainWindow(QMainWindow):
             p.assign(mesh.body_ids().tolist(), mat=p.material.name)
         self.selected_bodies = [b for b in self.selected_bodies if b in set(mesh.body_ids().tolist())]
         self._fill_attr_combos()
-        if len(mesh.body_ids()) > 1 and not getattr(mesh, "is_shell", False) and not getattr(mesh, "is_2d", False) \
-                and not getattr(mesh, "is_mixed", False):
+        base = mesh.solid if getattr(mesh, "is_mixed", False) else mesh      # 混在モデルはソリッドどうしだけ
+        if len(base.body_ids()) > 1 and not getattr(mesh, "is_shell", False) and not getattr(mesh, "is_2d", False):
             # Ansys と同じく、ボディ同士の接触を自動で作成（手動の接触は残す）
             self.auto_contacts(quiet=True)
         else:

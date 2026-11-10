@@ -153,7 +153,7 @@ def _shell_post(shell, u6, mats, elem_mat, reactions, info):
 
 
 def _mixed_system(solid, shell, material, bcs_solid, bcs_shell, solid_materials, shell_materials, tie_tol, log,
-                  supports_only=False, mass=False):
+                  supports_only=False, mass=False, K_add=None):
     """ソリッドとシェルの剛性（と質量）を並べ、結合の多点拘束を消去した式を作る"""
     from .shell import _frames, _shell_dofs, plane_stress_D, shell_constraints, shell_element_K
     for b in bcs_solid:
@@ -177,6 +177,8 @@ def _mixed_system(solid, shell, material, bcs_solid, bcs_shell, solid_materials,
     em_s, em_h = np.asarray(em_s, np.int64), np.asarray(em_h, np.int64)
     D = np.stack([material_D(m) for m in mats_s])
     Ks = assemble_stiffness(solid, D, elem_mat=em_s).tocsr()
+    if K_add is not None:          # ソリッドどうしの接触（結合・分離なし）の剛性
+        Ks = (Ks + K_add).tocsr()
     rho_e = np.array([m.density_t_mm3 for m in mats_s])[em_s]
     Fs, fx_s = build_load_and_constraints(solid, mats_s[0], bcs_solid, rho_e=rho_e)
     ns = Ks.shape[0]
@@ -232,10 +234,11 @@ def _mixed_system(solid, shell, material, bcs_solid, bcs_shell, solid_materials,
 
 
 def solve_mixed(solid, shell, material, bcs_solid: list[BC], bcs_shell: list[BC], solid_materials=None,
-                shell_materials=None, tie_tol=None, log=print, method="auto"):
+                shell_materials=None, tie_tol=None, log=print, method="auto", K_add=None):
     """ソリッド＋シェルの線形静解析。 戻り値: (ソリッドの Result, シェルの Result)"""
     t0 = time.time()
-    sy = _mixed_system(solid, shell, material, bcs_solid, bcs_shell, solid_materials, shell_materials, tie_tol, log)
+    sy = _mixed_system(solid, shell, material, bcs_solid, bcs_shell, solid_materials, shell_materials, tie_tol, log,
+                       K_add=K_add)
     K, F, T, fixed, ns = sy["K"], sy["F"], sy["T"], sy["fixed"], sy["ns"]
     mats_s, em_s, mats_h, em_h, D, tied = sy["mats_s"], sy["em_s"], sy["mats_h"], sy["em_h"], sy["D"], sy["tied"]
     Kr = (T.T @ K @ T).tocsr()
@@ -280,13 +283,13 @@ def solve_mixed(solid, shell, material, bcs_solid: list[BC], bcs_shell: list[BC]
 
 
 def solve_mixed_modal(solid, shell, material, bcs_solid, bcs_shell, n_modes=6, solid_materials=None,
-                      shell_materials=None, tie_tol=None, log=print):
+                      shell_materials=None, tie_tol=None, log=print, K_add=None):
     """ソリッド＋シェルのモーダル解析。 戻り値: (振動数 [Hz], [(ソリッドの Result, シェルの Result), …])
     モード形は最大変位 1 に正規化（変形・応力は相対値）"""
     import scipy.sparse.linalg as spla
     t0 = time.time()
     sy = _mixed_system(solid, shell, material, bcs_solid, bcs_shell, solid_materials, shell_materials, tie_tol, log,
-                       supports_only=True, mass=True)
+                       supports_only=True, mass=True, K_add=K_add)
     T, ns = sy["T"], sy["ns"]
     Kr = (T.T @ sy["K"] @ T).tocsr()
     Mr = (T.T @ sy["M"] @ T).tocsr()
@@ -429,11 +432,8 @@ def run_mixed(project, mesh: MixedMesh, log=print) -> list:
     if p.analysis_type not in ("static", "modal"):
         raise ValueError("ソリッドとシェルを混ぜたモデルは、いまは静的構造（線形）とモーダルだけ解けます")
     s = p.settings
-    if s.large_deflection or s.arc_length or any(c for c in p.contacts if not c.suppressed):
-        raise ValueError("ソリッドとシェルを混ぜたモデルは、いまは線形の静解析だけです（大変形・接触・弧長法は不可）")
-    if mesh.solid_unshared:
-        raise ValueError("ソリッドとシェルを混ぜたモデルでは、ソリッド側は 1 つのボディにするか、節点共有にしてください"
-                         "（ソリッドどうしの接触はまだ組み合わせられません）")
+    if s.large_deflection or s.arc_length:
+        raise ValueError("ソリッドとシェルを混ぜたモデルは、いまは線形の解析だけです（大変形・弧長法は不可）")
     bs, bh, origin = [], [], []
     import copy
     for i, b in enumerate(p.bcs):
@@ -461,6 +461,25 @@ def run_mixed(project, mesh: MixedMesh, log=print) -> list:
     em_s = p.elem_materials(mesh.solid)
     em_h = p.elem_materials(mesh.shell)
     ns = mesh.ns
+    # ソリッドどうしの接触: 結合・分離なしを線形の剛性として足す（シェルとソリッドは自動で結合する）
+    from .contact import LINEAR_TYPES, detect_contacts, linear_contact_stiffness
+    cs = [c for c in p.contacts if not c.suppressed]
+    if not cs and mesh.solid.elem_body is not None and len(np.unique(mesh.solid.elem_body)) > 1:
+        p.contacts = detect_contacts(mesh.solid, p.contact_tolerance, p.contact_default_type, p.contact_default_mu)
+        cs = list(p.contacts)
+    Kc = None
+    if cs:
+        for c in cs:
+            if any(int(f) >= mesh.nfs for f in list(c.contact_faces) + list(c.target_faces)):
+                raise ValueError(f"接触「{c.name}」: シェルの面・辺は接触に使えません（シェルはソリッドに自動で結合されます）")
+            if p.analysis_type == "static" and c.type not in LINEAR_TYPES:
+                raise ValueError(f"接触「{c.name}」: ソリッドとシェルを混ぜたモデルの静解析では、結合 と 分離なし だけ使えます"
+                                 "（摩擦なし・摩擦あり・粗いは不可）")
+        Kc = linear_contact_stiffness(mesh.solid, cs, em_s[0], em_s[1], p.contact_tolerance)
+        if Kc is not None:
+            log(f"接触: ソリッドどうしの {len(cs)} 領域を線形の接触として含めます")
+    if mesh.solid_unshared and Kc is None:
+        raise ValueError("ソリッドのボディどうしがつながっていません（接触領域を設定するか、節点共有にしてください）")
 
     def combine(rs, rh, info):
         r = Result(mesh, em_s[0][0], np.vstack([rs.u, rh.u]), np.vstack([rs.stress, rh.stress]),
@@ -477,7 +496,7 @@ def run_mixed(project, mesh: MixedMesh, log=print) -> list:
         if o.get("prestress"):
             raise ValueError("ソリッド＋シェルのモーダルでは、プリストレスはまだ使えません")
         freqs, modes = solve_mixed_modal(mesh.solid, mesh.shell, p.material, bs, bh, int(o.get("n_modes", 6)),
-                                         solid_materials=em_s, shell_materials=em_h, log=log)
+                                         solid_materials=em_s, shell_materials=em_h, log=log, K_add=Kc)
         out = []
         table = [{"モード": i + 1, "振動数 [Hz]": float(f)} for i, f in enumerate(freqs)]
         for i, (f, (rs, rh)) in enumerate(zip(freqs, modes)):
@@ -490,7 +509,7 @@ def run_mixed(project, mesh: MixedMesh, log=print) -> list:
             out.append(r)
         return out
     rs, rh = solve_mixed(mesh.solid, mesh.shell, p.material, bs, bh, solid_materials=em_s, shell_materials=em_h,
-                         log=log, method=s.solver_type)
+                         log=log, method=s.solver_type, K_add=Kc)
     reactions = {}
     js = jh = 0
     for which, i in origin:
