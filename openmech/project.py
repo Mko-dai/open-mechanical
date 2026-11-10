@@ -242,6 +242,11 @@ class Project:
             raise ValueError("シェル要素・2D 要素は現在、微小変形の静解析（接触なし）に対応しています（塑性は可）")
         if any(b.kind == "thermal" for b in self.bcs) and not self.geometry.get("analysis_2d"):
             raise ValueError("シェル要素ではまだ熱条件に対応していません")
+        # シェル・2D の解き方が知らない境界条件は、黙って無視せずに知らせる
+        ok = ("fixed", "displacement", "symmetry", "frictionless", "force", "pressure", "gravity", "thermal", "moment")
+        bad = [b.label() for b in self.bcs if b.kind not in ok]
+        if bad:
+            raise ValueError("シェル要素・2D 要素では、次の境界条件にまだ対応していません: " + "、".join(bad))
 
     def needs_nonlinear_solver(self, mesh) -> bool:
         s = self.settings
@@ -314,6 +319,11 @@ class Project:
         em = em if em is not None else self.elem_materials(mesh)
         if not self.transient_nonlinear(mesh):
             self.require_connected(mesh, "過渡構造の陽解法（および剛体壁を使う陰解法）")
+            from .remote import REMOTE_KINDS
+            bad = [b.label() for b in self.bcs if b.kind in REMOTE_KINDS or b.kind == "submodel"]
+            if bad:
+                raise ValueError("過渡構造の陽解法（および剛体壁を使う陰解法）では、次の境界条件にまだ対応していません: "
+                                 + "、".join(bad))
             return solve_dynamic(mesh, self.material, self.bcs, ds, elem_materials=em, log=log, progress=progress)
         if not self.contacts and mesh.elem_body is not None and len(mesh.body_ids()) > 1:
             from .contact import detect_contacts

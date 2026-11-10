@@ -98,6 +98,10 @@ def run_extra(project, mesh, em, log=print, progress=None):
         return _mode_results(mesh, mat, mr, em)
     if t == "buckling":
         from .modal import solve_buckling
+        from .remote import REMOTE_KINDS
+        bad = [b.label() for b in p.bcs if b.kind in REMOTE_KINDS or b.kind == "submodel"]
+        if bad:
+            raise ValueError("固有値座屈では、次の境界条件にまだ対応していません: " + "、".join(bad))
         mr = solve_buckling(mesh, mat, p.bcs, n_modes=int(o.get("n_buckling", 3)), elem_materials=em, log=log,
                             progress=progress, K_add=Kc,
                             static=p.static_result(mesh, em, log) if Kc is not None else None)
