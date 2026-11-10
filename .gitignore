@@ -8,3 +8,4 @@ results/
 .DS_Store
 logs/
 .tools/
+tools/tin_robot.py
