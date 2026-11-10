@@ -130,7 +130,7 @@ class Project:
                 states.append(mat.state(T, self.body_rotation(b)))
             lut[int(b)] = keys.index(key)
         eb = mesh.elem_body if mesh.elem_body is not None else np.zeros(mesh.n_elems, dtype=int)
-        table = np.zeros(int(eb.max()) + 1, dtype=np.int64)
+        table = np.zeros(max(int(eb.max()), max(lut, default=0)) + 1, dtype=np.int64)
         for b, i in lut.items():
             table[b] = i
         return states, table[eb]
