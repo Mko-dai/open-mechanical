@@ -64,3 +64,42 @@ def test_not_touching_error():
     shell = structured_plate(10, 10, 2, 2, 1.0, origin=(30, 0, 5))
     with pytest.raises(ValueError, match="乗っていません"):
         solve_mixed(solid, shell, S, [BC("fixed", [0])], [BC("force", [shell.n_surf + 1], [0, 0, -1])], **quiet)
+
+
+def test_mixed_mesh_and_project_run():
+    """MixedMesh: 面番号（ソリッドの面 → シェルの面 → シェルの辺）と、プロジェクトからの実行"""
+    from openmech.geometry import is_mixed_model, new_feature, split_mixed
+    from openmech.mixed import MixedMesh
+    from openmech.project import Project
+    t, b, P = 2.0, 20.0, 10.0
+    solid = structured_box(50, b, t, 25, 10, 2).to_quadratic()
+    solid.elem_body = np.zeros(solid.n_elems, int)
+    solid.group_faces()
+    shell = structured_plate(50, b, 10, 4, t, origin=(50, 0, t / 2))
+    m = MixedMesh(solid, shell, 1)
+    assert m.n_nodes == solid.n_nodes + shell.n_nodes and m.n_faces == solid.n_faces + 1 + 4
+    assert list(m.body_ids()) == [0, 1] and m.is_shell_body(1) and not m.is_shell_body(0)
+    info = m.face_info()
+    assert [f["id"] for f in info] == list(range(m.n_faces))
+    tip_edge = next(f["id"] for f in info if f.get("edge") and abs(f["centroid"][0] - 100) < 1e-6)
+    root = next(f["id"] for f in info if not f.get("edge") and abs(f["centroid"][0]) < 1e-6)
+    assert m.is_edge(tip_edge) and not m.is_edge(root)
+    assert np.allclose(m.nodes[m.face_nodes(tip_edge)][:, 0], 100.0)
+    assert len(m.boundary_tris) == len(m.face_ids) == len(m.tri_body()) == len(m.boundary_tris_full)
+    p = Project()
+    p.material = S
+    p.bcs = [BC("fixed", [root]), BC("force", [tip_edge], [0, 0, -P])]
+    r = p.run_all(m, log=lambda *a: None)[-1]
+    I = b * t ** 3 / 12
+    assert -r.u[:, 2].min() == pytest.approx(P * 100.0 ** 3 / (3 * 200000.0 * I), rel=0.02)
+    assert r.u.shape == (m.n_nodes, 3) and r.stress.shape == (m.n_nodes, 6)
+    assert r.reactions[0][2] == pytest.approx(P, rel=1e-6)
+    assert np.isnan(r.extra["相当応力（上面） [MPa]（シェル）"][:solid.n_nodes]).all()
+    # 形状の指定: シェルはソリッドのあと。 ボディ番号はソリッドの続き
+    spec = {"kind": "model", "features": [new_feature("box"), new_feature("plate")]}
+    assert is_mixed_model(spec)
+    s_spec, h_spec, off = split_mixed(spec)
+    assert len(s_spec["features"]) == 1 and len(h_spec["features"]) == 1 and off == 1
+    from openmech.geometry import GeometryError
+    with pytest.raises(GeometryError):
+        split_mixed({"kind": "model", "features": [new_feature("plate"), new_feature("box")]})

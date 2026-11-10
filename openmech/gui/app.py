@@ -772,6 +772,10 @@ class MainWindow(QMainWindow):
         self.bc_attr_w.setVisible(idx == 1)
         self.set_select_mode("body" if idx == 0 else "face")
 
+    def _has_edges(self):
+        """辺を選べるメッシュ（シェル・2D、またはソリッド＋シェル）"""
+        return self._surface_mesh() or bool(getattr(self.mesh, "is_mixed", False))
+
     def _surface_mesh(self):
         """シェルまたは 2D のメッシュ（辺を選べる）"""
         return bool(getattr(self.mesh, "is_shell", False) or getattr(self.mesh, "is_2d", False))
@@ -780,7 +784,7 @@ class MainWindow(QMainWindow):
         self.sel_body_btn.setChecked(mode == "body")
         self.sel_face_btn.setChecked(mode == "face")
         self.sel_edge_btn.setChecked(mode == "edge")
-        if mode == "edge" and not self._surface_mesh():
+        if mode == "edge" and not self._has_edges():
             self.log("辺の選択はシェル（サーフェス）・2D のモデルで使えます")
         if mode == "body":
             self.selected_faces = []
@@ -4396,7 +4400,8 @@ class MainWindow(QMainWindow):
             p.assign(mesh.body_ids().tolist(), mat=p.material.name)
         self.selected_bodies = [b for b in self.selected_bodies if b in set(mesh.body_ids().tolist())]
         self._fill_attr_combos()
-        if len(mesh.body_ids()) > 1 and not getattr(mesh, "is_shell", False) and not getattr(mesh, "is_2d", False):
+        if len(mesh.body_ids()) > 1 and not getattr(mesh, "is_shell", False) and not getattr(mesh, "is_2d", False) \
+                and not getattr(mesh, "is_mixed", False):
             # Ansys と同じく、ボディ同士の接触を自動で作成（手動の接触は残す）
             self.auto_contacts(quiet=True)
         else:
@@ -4631,7 +4636,8 @@ class MainWindow(QMainWindow):
         self.solver_log = []
         self._fail_history = None
         p = self.project
-        if not self._surface_mesh() and p.needs_nonlinear_solver(self.mesh) and not p.contacts \
+        mixed = bool(getattr(self.mesh, "is_mixed", False))
+        if not mixed and not self._surface_mesh() and p.needs_nonlinear_solver(self.mesh) and not p.contacts \
                 and len(self.mesh.body_ids()) > 1:
             self.auto_contacts(quiet=True)
         bad_c = [c.name for c in p.contacts if not c.suppressed and not (c.contact_faces and c.target_faces)]
@@ -4639,7 +4645,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "接触", "面が割り当てられていない接触領域があります: " + ", ".join(bad_c))
             return
         from ..bolt import has_beam_pretension
-        if (p.analysis_type in EXTRA_TYPES or any(b.kind == "bolt_pretension" for b in p.bcs)
+        if (mixed or p.analysis_type in EXTRA_TYPES or any(b.kind == "bolt_pretension" for b in p.bcs)
                 or (p.analysis_type == "static" and has_beam_pretension(p.bcs))
                 or (p.analysis_type == "static" and (p.analysis_opts or {}).get("thermal_import"))):
             self._busy(True, f"{self._analysis_label()}を実行しています…")
@@ -4913,7 +4919,7 @@ class MainWindow(QMainWindow):
                 self.set_body_selection([])
             return
         tri = self._tri_src[cell]
-        if self.sel_edge_btn.isChecked() and self._surface_mesh():
+        if self.sel_edge_btn.isChecked() and self._has_edges():
             lo, hi = self.mesh.bounds()
             e = self.mesh.nearest_edge(np.array(picker.GetPickPosition()), tol=0.05 * float(np.linalg.norm(hi - lo)))
             if e < 0:
@@ -5122,7 +5128,7 @@ class MainWindow(QMainWindow):
                     tb = mesh.tri_body()[src]
                     for b in (bc.bodies or mesh.body_ids().tolist()):
                         rgb[tb == b] = 0.5 * _hex(BC_COLORS["thermal"]) + 0.5
-                is_sh = getattr(mesh, "is_shell", False)
+                is_sh = getattr(mesh, "is_shell", False) or getattr(mesh, "is_mixed", False)
                 for f in bc.faces:
                     if is_sh and mesh.is_edge(f):
                         seg = mesh.edges[f - mesh.n_surf]
@@ -5194,7 +5200,7 @@ class MainWindow(QMainWindow):
                 for b in self.selected_bodies:
                     rgb[tb == b] = _hex(SELECT_COLOR)
         for f in self.selected_faces:
-            if getattr(mesh, "is_shell", False) and mesh.is_edge(f):
+            if (getattr(mesh, "is_shell", False) or getattr(mesh, "is_mixed", False)) and mesh.is_edge(f):
                 seg = mesh.edges[f - mesh.n_surf]
                 pl.add_mesh(pv.PolyData(mesh.nodes.copy(), lines=np.hstack([np.full((len(seg), 1), 2), seg]).ravel()),
                             color=SELECT_COLOR, line_width=7, pickable=False)

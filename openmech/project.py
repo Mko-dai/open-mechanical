@@ -326,6 +326,9 @@ class Project:
 
     def run_all(self, mesh=None, log=print, progress=None):
         mesh = mesh if mesh is not None else self.mesh(log=log)
+        if getattr(mesh, "is_mixed", False):
+            from .mixed import run_mixed
+            return [run_mixed(self, mesh, log=log)]
         em = self.elem_materials(mesh)
         from .analyses import EXTRA_TYPES, run_extra
         from .bolt import has_beam_pretension

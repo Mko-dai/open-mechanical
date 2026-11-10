@@ -120,6 +120,33 @@ def is_shell_model(spec) -> bool:
     return spec.get("kind") == "model" and bool(feats) and all(f["type"] in SHELL_FEATURES for f in feats)
 
 
+def is_mixed_model(spec) -> bool:
+    """ソリッドのフィーチャーとシェル（サーフェス）のフィーチャーが両方あるモデルか"""
+    if spec.get("kind") != "model" or analysis_2d_mode(spec):
+        return False
+    feats = [f for f in spec.get("features", []) if not f.get("suppressed")
+             and f.get("type") != "bool" and f.get("type") not in EDIT_FEATURES]
+    sh = [f["type"] in SHELL_FEATURES for f in feats]
+    return any(sh) and not all(sh)
+
+
+def split_mixed(spec):
+    """ソリッド＋シェルのモデルを、ソリッドだけ・シェルだけの 2 つの形状指定に分ける。
+    シェルのフィーチャーは、ソリッドの作業（作成・ブール演算・編集）が終わったあとに並べる決まり。
+    戻り値: (ソリッドの spec, シェルの spec, シェルのボディ番号の始まり)"""
+    feats = list(spec.get("features", []))
+    first = next(i for i, f in enumerate(feats) if not f.get("suppressed") and f.get("type") in SHELL_FEATURES)
+    tail = [f for f in feats[first:] if not f.get("suppressed")]
+    bad = [f for f in tail if f.get("type") not in SHELL_FEATURES or f.get("op", "new") != "new"]
+    if bad:
+        raise GeometryError("ソリッドとシェルを混ぜるときは、シェル（平板・多角形の面・円筒シェル・円板）を"
+                            "ソリッドの作業がすべて終わったあとに「新規ボディ」で追加してください"
+                            "（シェルのあとにソリッドのフィーチャー・ブール演算・編集は置けません）")
+    keys = feature_body_keys(feats[:first], all_keys=True)
+    offset = 1 + max([k for lst in keys.values() for k in lst], default=-1)
+    return dict(spec, features=feats[:first]), dict(spec, features=tail), offset
+
+
 def _plane_map(plane, off):
     return {"XY": lambda u, v: (u, v, off), "YZ": lambda u, v: (off, u, v),
             "ZX": lambda u, v: (v, off, u)}[plane]
@@ -1922,6 +1949,15 @@ def build_mesh(spec: dict, size: float = 0.0, order: int = 2, curvature: int = 1
     kind = spec.get("kind")
     path = spec.get("path", "")
     ext = os.path.splitext(path)[1].lower() if kind == "file" else ""
+    if kind == "model" and is_mixed_model(spec) and gmsh_available():
+        # ソリッド＋シェル: 別々にメッシュして、1 つのモデル（MixedMesh）として返す
+        s_spec, h_spec, off = split_mixed(spec)
+        solid = build_mesh(s_spec, size, order, curvature, log, local_sizes, share, settings)
+        shell = build_mesh(h_spec, size, order, curvature, log, None, None, settings)
+        from .mixed import MixedMesh
+        m = MixedMesh(solid, shell, off)
+        log(f"ソリッド＋シェル: ソリッド {solid.n_nodes:,} 節点 / シェル {shell.n_nodes:,} 節点・{len(shell.edges)} 辺")
+        return m
     if ext in PARASOLID_EXT:
         raise GeometryError(PARASOLID_MESSAGE)
 

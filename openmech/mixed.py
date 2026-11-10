@@ -16,6 +16,7 @@ import time
 import numpy as np
 import scipy.sparse as sp
 
+from .mesh import Mesh
 from .solver import (BC, Result, _linear_solve, _rel_res, assemble_stiffness, build_load_and_constraints,
                      material_D, nodal_stress)
 
@@ -246,3 +247,176 @@ def solve_mixed(solid, shell, material, bcs_solid: list[BC], bcs_shell: list[BC]
     rh = _shell_post(shell, uh, mats_h, em_h, reac_h, dict(info, 節点数=shell.n_nodes, 要素数=shell.n_elems))
     rs.tied_nodes = rh.tied_nodes = tied
     return rs, rh
+
+
+# ---------------------------------------------------------------------------- 1 つのモデルとして扱う
+
+class MixedMesh(Mesh):
+    """ソリッドのメッシュとシェルのメッシュを、画面・選択・境界条件の上では 1 つのメッシュとして見せる。
+
+    節点: ソリッドの節点 → シェルの節点 の順。 面番号: ソリッドの面 → シェルの面 → シェルの辺 の順。
+    ボディ番号: ソリッドのボディ（フィーチャーの順）→ シェルのボディ（body_offset から）。
+    elems はソリッドの要素だけ（断面表示など体積を使う処理用）。 解析は solid / shell を別々に組み立てて結合する。
+    """
+
+    def __init__(self, solid, shell, body_offset):
+        self.solid, self.shell = solid, shell
+        self.is_mixed = True
+        ns = solid.n_nodes
+        self.ns = ns
+        if solid.face_ids is None:
+            solid.group_faces()
+        self.nfs = int(solid.n_faces)
+        shell.elem_body = (np.zeros(shell.n_elems, np.int64) if shell.elem_body is None
+                           else np.asarray(shell.elem_body, np.int64)) + int(body_offset)
+        self.nodes = np.vstack([solid.nodes, shell.nodes])
+        self.elems = solid.elems
+        self.elem_body = (solid.elem_body if solid.elem_body is not None else np.zeros(solid.n_elems, np.int64))
+        st = solid.boundary_tris
+        sf = solid.boundary_tris_full
+        ht = shell.elems + ns
+        self._btri = np.vstack([st, ht])
+        # 表示用: ソリッドが 2 次（6 節点三角形）なら、シェルの三角形も 6 列にそろえる（中間節点 = 頂点の繰り返し）
+        self._btri_full = np.vstack([sf, np.hstack([ht, ht]) if sf.shape[1] == 6 else ht])
+        self._btri_owner = np.r_[solid.boundary_owner, solid.n_elems + np.arange(shell.n_elems)]
+        self._tri_body = np.r_[solid.tri_body(), shell.elem_body]
+        self.face_ids = np.r_[solid.face_ids, self.nfs + shell.face_ids]
+        self.n_surf = self.nfs + shell.n_surf                      # これ以降の面番号がシェルの辺
+        self.edges = [e + ns for e in shell.edges]
+        self.thickness = shell.thickness
+        self.body_names = None
+        self.node_origin = np.arange(len(self.nodes))
+        self._bquad = self._bquad_of = None
+        so = getattr(solid, "node_origin", None)
+        self.solid_unshared = bool(so is not None and len(np.unique(so)) < solid.n_nodes)
+
+    # --- 面・ボディ
+    @property
+    def n_faces(self):
+        return self.nfs + self.shell.n_faces
+
+    def is_edge(self, fid):
+        return int(fid) >= self.n_surf
+
+    def split_face(self, fid):
+        """全体の面番号 → ("solid" | "shell", それぞれのメッシュでの面番号)"""
+        fid = int(fid)
+        return ("solid", fid) if fid < self.nfs else ("shell", fid - self.nfs)
+
+    def face_info(self):
+        out = list(self.solid.face_info())
+        for f in self.shell.face_info():
+            out.append(dict(f, id=f["id"] + self.nfs))
+        return out
+
+    def face_tris(self, face_id, full=True):
+        which, f = self.split_face(face_id)
+        if which == "solid":
+            return self.solid.face_tris(f, full)
+        return self.shell.face_tris(f) + self.ns
+
+    def face_nodes(self, face_id):
+        out = []
+        for fid in np.atleast_1d(face_id):
+            which, f = self.split_face(fid)
+            out.append(self.solid.face_nodes(f) if which == "solid" else self.shell.face_nodes(f) + self.ns)
+        return np.unique(np.concatenate(out)) if out else np.zeros(0, np.int64)
+
+    def nearest_edge(self, point, tol=np.inf):
+        k = self.shell.nearest_edge(point, tol)
+        return k + self.nfs if k >= 0 else -1
+
+    def body_ids(self):
+        return np.unique(np.r_[self.solid.body_ids(), self.shell.elem_body])
+
+    def tri_body(self):
+        return self._tri_body
+
+    def body_faces(self, body):
+        return sorted(set(self.face_ids[self._tri_body == body].tolist()))
+
+    def is_shell_body(self, body) -> bool:
+        return bool(np.any(self.shell.elem_body == int(body)))
+
+    @property
+    def n_elems(self):
+        return self.solid.n_elems + self.shell.n_elems
+
+    def group_faces(self, angle_deg=35.0):
+        return self.face_ids
+
+    def _compute_boundary(self):
+        pass
+
+    def to_quadratic(self):
+        return self
+
+    def split_body_interfaces(self, share=None):
+        return self
+
+
+def run_mixed(project, mesh: MixedMesh, log=print) -> Result:
+    """プロジェクトの設定（材料・境界条件）で、ソリッド＋シェルのモデルを解く。 結果は MixedMesh の節点の並び"""
+    p = project
+    if p.analysis_type != "static":
+        raise ValueError("ソリッドとシェルを混ぜたモデルは、いまは静的構造（線形）だけ解けます")
+    s = p.settings
+    if s.large_deflection or s.arc_length or any(c for c in p.contacts if not c.suppressed):
+        raise ValueError("ソリッドとシェルを混ぜたモデルは、いまは線形の静解析だけです（大変形・接触・弧長法は不可）")
+    if mesh.solid_unshared:
+        raise ValueError("ソリッドとシェルを混ぜたモデルでは、ソリッド側は 1 つのボディにするか、節点共有にしてください"
+                         "（ソリッドどうしの接触はまだ組み合わせられません）")
+    bs, bh, origin = [], [], []
+    import copy
+    for i, b in enumerate(p.bcs):
+        fs = [f for f in b.faces if int(f) < mesh.nfs]
+        fh = [int(f) - mesh.nfs for f in b.faces if int(f) >= mesh.nfs]
+        if b.kind == "gravity":
+            bs.append(b)
+            bh.append(b)
+            origin += [("solid", i), ("shell", i)]
+            continue
+        if fs and fh and b.kind in ("force", "moment"):
+            raise ValueError(f"{b.label()}: ソリッドの面とシェルの面・辺を 1 つの荷重にまとめられません（別々に設定してください）")
+        if b.nodes:
+            raise ValueError(f"{b.label()}: 節点で指定した条件は、ソリッド＋シェルのモデルではまだ使えません")
+        if fs:
+            nb = copy.copy(b)
+            nb.faces = fs
+            bs.append(nb)
+            origin.append(("solid", i))
+        if fh:
+            nb = copy.copy(b)
+            nb.faces = fh
+            bh.append(nb)
+            origin.append(("shell", i))
+    em_s = p.elem_materials(mesh.solid)
+    em_h = p.elem_materials(mesh.shell)
+    rs, rh = solve_mixed(mesh.solid, mesh.shell, p.material, bs, bh, solid_materials=em_s, shell_materials=em_h,
+                         log=log, method=s.solver_type)
+    ns = mesh.ns
+    u = np.vstack([rs.u, rh.u])
+    stress = np.vstack([rs.stress, rh.stress])
+    strain = np.vstack([rs.strain, rh.strain])
+    reactions = {}
+    js = jh = 0
+    for which, i in origin:
+        if which == "solid":
+            if js in rs.reactions:
+                reactions[i] = reactions.get(i, 0) + rs.reactions[js]
+            js += 1
+        else:
+            if jh in rh.reactions:
+                reactions[i] = reactions.get(i, 0) + rh.reactions[jh]
+            jh += 1
+    info = dict(rs.info, 節点数=mesh.n_nodes, 要素数=mesh.n_elems,
+                要素タイプ="ソリッド（四面体）＋シェル（3 節点 DKT＋Allman 膜）")
+    r = Result(mesh, em_s[0][0], u, stress, strain, reactions, info, em_s[0], em_s[1])
+    r.extra = {}
+    for k, v in rh.extra.items():
+        a = np.full(mesh.n_nodes, np.nan)
+        a[ns:] = v
+        r.extra[k + "（シェル）" if "シェル" not in k else k] = a
+    r.time = 1.0
+    r.parts = (rs, rh)
+    return r

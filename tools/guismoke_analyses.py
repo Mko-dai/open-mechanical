@@ -377,6 +377,43 @@ try:
     msgs.clear()
 except Exception:
     P("NG  積層シェル\n" + traceback.format_exc())
+# ソリッド＋シェル: 直方体（50×20×2）の端面に平板（シェル）を突き合わせる。 面・辺の選択、解析、結果の表示
+try:
+    from openmech.geometry import new_feature
+    w.new_project()
+    app.processEvents()
+    w.project.geometry = {"kind": "model", "features": [
+        new_feature("box", dx=50.0, dy=20.0, dz=2.0),
+        new_feature("plate", plane="XY", offset=1.0, u0=50.0, v0=0.0, du=50.0, dv=20.0, t=2.0)]}
+    w.remesh(reset_camera=True)
+    app.processEvents()
+    mm = w.mesh
+    assert getattr(mm, "is_mixed", False), "MixedMesh になっていません"
+    inf = mm.face_info()
+    root = min((f for f in inf if not f.get("edge") and f["id"] < mm.nfs), key=lambda f: f["centroid"][0])["id"]
+    tip = max((f for f in inf if f.get("edge")), key=lambda f: f["centroid"][0])["id"]
+    w.set_select_mode("edge")
+    w.set_selection([tip])
+    app.processEvents()
+    w.set_select_mode("body")
+    w.set_body_selection([int(mm.body_ids()[-1])])
+    app.processEvents()
+    w.set_select_mode("face")
+    fr = run("ソリッド＋シェル（突き合わせ）", "static", [BC("fixed", [root]), BC("force", [tip], [0, 0, -10.0])],
+             results=["全変形 [mm]", "相当応力（ミーゼス） [MPa]"], shot="mixed")
+    for i in range(2):
+        w.select_node(("bc", i))
+        app.processEvents()
+    w.select_node(("mesh",))
+    app.processEvents()
+    tipw = -float(fr[-1].u[:, 2].min())
+    exact = 10.0 * 100.0 ** 3 / (3 * w.project.material.E * 20.0 * 2.0 ** 3 / 12)
+    P(f"OK  ソリッド＋シェル: 節点 {mm.n_nodes:,}（ソリッド {mm.ns:,}）/ 面 {mm.n_faces} / ボディ {mm.body_ids().tolist()} / "
+      f"先端たわみ {tipw:.4g} mm（はりの式 {exact:.4g}、ポアソン比の分だけ小さく出ます）"
+      + (f" / メッセージ: {msgs[-1]}" if msgs else ""))
+    msgs.clear()
+except Exception:
+    P("NG  ソリッド＋シェル\n" + traceback.format_exc())
 P("完了")
 logf.close()
 w.close()
