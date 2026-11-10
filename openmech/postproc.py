@@ -254,3 +254,28 @@ def linearize_stress(mesh, stress, p0, p1, n=49):
     lin = sm[None] + (1 - 2 * sv / t)[:, None] * sb[None]
     return {"表": rows, "s": sv, "全体": np.array([_vm6(x) for x in sig]), "膜": np.full(n, _vm6(sm)),
             "膜＋曲げ": np.array([_vm6(x) for x in lin]), "成分": {"膜": sm, "曲げ": sb}, "厚さ": t}
+
+
+def cylindrical_fields(mesh, u, stress, axis=2, origin=(0.0, 0.0, 0.0)) -> dict:
+    """円筒座標系（軸 = 座標軸 X/Y/Z のどれか、原点を通る）での変位・応力の成分。
+    半径方向 r、周方向 θ（軸のまわりに右ねじの向き）、軸方向 z"""
+    ax = int(axis)
+    a, b = (ax + 1) % 3, (ax + 2) % 3
+    X = np.asarray(mesh.nodes, float) - np.asarray(origin, float)
+    r = np.hypot(X[:, a], X[:, b])
+    ok = r > 1e-12
+    c = np.where(ok, X[:, a] / np.where(ok, r, 1.0), 1.0)
+    sn = np.where(ok, X[:, b] / np.where(ok, r, 1.0), 0.0)
+    er = np.zeros((len(X), 3))
+    et = np.zeros((len(X), 3))
+    er[:, a], er[:, b] = c, sn
+    et[:, a], et[:, b] = -sn, c
+    U = np.asarray(u, float).reshape(-1, 3)
+    S = np.asarray(stress, float)
+    T = S[:, [0, 3, 5, 3, 1, 4, 5, 4, 2]].reshape(-1, 3, 3)
+    q = lambda p, w: np.einsum("ni,nij,nj->n", p, T, w)      # noqa: E731
+    ez = np.zeros((len(X), 3))
+    ez[:, ax] = 1.0
+    return {"変位 半径方向 [mm]": np.einsum("ni,ni->n", U, er), "変位 周方向 [mm]": np.einsum("ni,ni->n", U, et),
+            "応力 σr（半径） [MPa]": q(er, er), "応力 σθ（周） [MPa]": q(et, et), "応力 σz（軸） [MPa]": q(ez, ez),
+            "せん断応力 τrθ [MPa]": q(er, et), "せん断応力 τθz [MPa]": q(et, ez), "せん断応力 τrz [MPa]": q(er, ez)}

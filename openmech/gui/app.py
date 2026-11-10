@@ -99,6 +99,10 @@ RESULT_GROUPS = {
            ("相当応力 1σ（Segalman） [MPa]", "相当応力 1σ（ランダム振動）"),
            ("変位（応答スペクトル） [mm]", "変位（応答スペクトル）"),
            ("相当応力（応答スペクトル） [MPa]", "相当応力（応答スペクトル）")],
+    "円筒座標系": [("変位 半径方向 [mm]", "変位（半径方向）"), ("変位 周方向 [mm]", "変位（周方向）"),
+               ("応力 σr（半径） [MPa]", "半径方向の応力"), ("応力 σθ（周） [MPa]", "周方向の応力"),
+               ("応力 σz（軸） [MPa]", "軸方向の応力"), ("せん断応力 τrθ [MPa]", "せん断応力 rθ"),
+               ("せん断応力 τθz [MPa]", "せん断応力 θz"), ("せん断応力 τrz [MPa]", "せん断応力 rz")],
     "疲労ツール": [("疲労:寿命 [回]", "寿命"), ("疲労:損傷度", "損傷度"), ("疲労:安全率（疲労）", "安全率（疲労）"),
                ("疲労:応力振幅（補正後） [MPa]", "等価応力振幅")],
 }
@@ -1650,6 +1654,30 @@ class MainWindow(QMainWindow):
         s = self._section("全体座標系")
         self._row(s, "タイプ", "直交座標")
         self._row(s, "原点", "(0, 0, 0) mm")
+        s = self._section("円筒座標系（結果の表示用）")
+        cs = dict((self.project.analysis_opts or {}).get("cyl_cs", {}))
+
+        def set_cs(**kw):
+            cur = dict((self.project.analysis_opts or {}).get("cyl_cs", {}))
+            cur.update(kw)
+            self.project.analysis_opts = dict(self.project.analysis_opts or {}, cyl_cs=cur)
+            self._field_cache = {}
+            self.refresh_view()
+        self._row(s, "軸", self._combo([("X", 0), ("Y", 1), ("Z", 2)], int(cs.get("axis", 2)),
+                                      lambda v: set_cs(axis=int(v))))
+        org = list(cs.get("origin", [0.0, 0.0, 0.0]))
+        wq = QWidget()
+        hq = QHBoxLayout(wq)
+        hq.setContentsMargins(0, 0, 0, 0)
+        sps = []
+        for k in range(3):
+            sp = dspin(float(org[k]), -1e9, 1e9, 4, 1.0)
+            sps.append(sp)
+            hq.addWidget(sp)
+        for sp in sps:
+            sp.valueChanged.connect(lambda *_: set_cs(origin=[x.value() for x in sps]))
+        self._row(s, "軸上の点 X, Y, Z [mm]", wq)
+        self._row(s, "", "結果の追加で「円筒座標系」の項目（半径方向・周方向の変位と応力）を選ぶと、この軸で表示します")
 
     def _share_section(self):
         s = self._section("節点共有（トポロジ共有）")
@@ -2846,6 +2874,12 @@ class MainWindow(QMainWindow):
         for k, v in (getattr(r, "contact", None) or {}).items():
             out["接触:" + k] = v
         want = set(self.project.results)
+        if any(k in want for k, _ in RESULT_GROUPS["円筒座標系"]) and not getattr(r, "only_extra", False) \
+                and getattr(r, "stress", None) is not None and np.ndim(r.stress) == 2 and r.stress.shape[1] == 6:
+            from ..postproc import cylindrical_fields
+            cs = (self.project.analysis_opts or {}).get("cyl_cs", {})
+            out.update(cylindrical_fields(r.mesh, r.u, r.stress, int(cs.get("axis", 2)),
+                                          cs.get("origin", [0.0, 0.0, 0.0])))
         if any(k.startswith("疲労:") for k in want) and not getattr(r, "only_extra", False):
             try:
                 from ..postproc import fatigue

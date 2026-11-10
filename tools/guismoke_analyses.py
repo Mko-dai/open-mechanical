@@ -484,7 +484,12 @@ try:
     w.project.settings.weak_springs = True          # 軸まわりの回転は止めていないので、弱いバネで支える
     mt = w.project.material
     fr = run("円筒面の摩擦なし支持＋内圧", "static", [BC("frictionless", [outer]), BC("frictionless", [bottom]),
-                                           BC("pressure", [inner], [100.0])], shot="cyl_frictionless")
+                                           BC("pressure", [inner], [100.0])],
+             results=["全変形 [mm]", "応力 σθ（周） [MPa]", "変位 半径方向 [mm]"], shot="cyl_frictionless")
+    w.select_node(("coords",))
+    app.processEvents()
+    hoop = w._fields(w.result)["応力 σθ（周） [MPa]"]
+    P(f"   円筒座標系の結果: 周方向の応力 最大 {float(np.nanmax(hoop)):.4g} MPa（内面）")
     for i in range(3):
         w.select_node(("bc", i))
         app.processEvents()

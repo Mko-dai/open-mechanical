@@ -98,3 +98,31 @@ def test_rotational_velocity_thin_ring():
     c, s_ = m.nodes[:, 0] / R, m.nodes[:, 1] / R
     sig_t = res.stress[:, 0] * s_ ** 2 + res.stress[:, 1] * c ** 2 - 2 * res.stress[:, 3] * s_ * c
     assert np.median(sig_t) == pytest.approx(rho * w ** 2 * a ** 2, rel=0.01)
+
+
+def test_cylindrical_result_components():
+    """円筒座標系の結果: 内圧を受ける厚肉円筒（外周を拘束）の σr・σθ がラメの式と合い、周方向の変位は 0"""
+    from openmech.postproc import cylindrical_fields
+    a, bo, t, p, E, nu = 20.0, 40.0, 2.0, 100.0, 200000.0, 0.3
+    bx = structured_box(bo - a, 1.0, t, 10, 16, 1).to_quadratic()
+    r, th = a + bx.nodes[:, 0], np.radians(90.0 * bx.nodes[:, 1])
+    m = Mesh(np.c_[r * np.cos(th), r * np.sin(th), bx.nodes[:, 2]], bx.elems)
+    m.group_faces()
+    R = np.hypot(m.nodes[:, 0], m.nodes[:, 1])
+
+    def faces(test):
+        return [f["id"] for f in m.face_info() if test(m.face_nodes(f["id"]))]
+    res = solve(m, S, [BC("frictionless", faces(lambda nd: np.allclose(R[nd], bo, atol=1e-6))),
+                       BC("symmetry", faces(lambda nd: np.allclose(m.nodes[nd, 0], 0, atol=1e-6))
+                          + faces(lambda nd: np.allclose(m.nodes[nd, 1], 0, atol=1e-6))),
+                       BC("frictionless", faces(lambda nd: np.allclose(m.nodes[nd, 2], 0, atol=1e-6))),
+                       BC("pressure", faces(lambda nd: np.allclose(R[nd], a, atol=1e-6)), [p])], **quiet)
+    f = cylindrical_fields(m, res.u, res.stress, 2)
+    A = -p * (1 - nu ** 2) / E / ((1 + nu) + (1 - nu) * bo ** 2 / a ** 2)
+    B = -A * bo ** 2
+    mid = np.isclose(R, 30.0)
+    sr = E / (1 - nu ** 2) * ((1 + nu) * A - (1 - nu) * B / 30.0 ** 2)
+    st = E / (1 - nu ** 2) * ((1 + nu) * A + (1 - nu) * B / 30.0 ** 2)
+    assert f["応力 σr（半径） [MPa]"][mid].mean() == pytest.approx(sr, rel=0.03)
+    assert f["応力 σθ（周） [MPa]"][mid].mean() == pytest.approx(st, rel=0.05, abs=1.0)
+    assert np.abs(f["変位 周方向 [mm]"]).max() < 1e-3 * np.abs(f["変位 半径方向 [mm]"]).max()
