@@ -126,3 +126,19 @@ def test_cylindrical_result_components():
     assert f["応力 σr（半径） [MPa]"][mid].mean() == pytest.approx(sr, rel=0.03)
     assert f["応力 σθ（周） [MPa]"][mid].mean() == pytest.approx(st, rel=0.05, abs=1.0)
     assert np.abs(f["変位 周方向 [mm]"]).max() < 1e-3 * np.abs(f["変位 半径方向 [mm]"]).max()
+
+
+def test_hydrostatic_pressure_resultant():
+    """静水圧: 水槽の壁（幅 b、水深 h）が受ける合力 = ρ g b h² / 2、作用点は底から h/3"""
+    b, H, t, h = 40.0, 100.0, 10.0, 80.0
+    m = structured_box(t, b, H, 2, 4, 10).to_quadratic()        # 壁: x 方向が厚さ、z が高さ
+    wet = [f["id"] for f in m.face_info() if f["normal"][0] > 0.99]
+    base = [f["id"] for f in m.face_info() if f["normal"][2] < -0.99]
+    r = solve(m, S, [BC("fixed", base), BC("hydrostatic", wet, [1000.0, 9806.65, h], options={"axis": [0, 0, 1]})],
+              **quiet)
+    Fx = 1000e-12 * 9806.65 * b * h ** 2 / 2
+    assert r.reactions[0][0] == pytest.approx(Fx, rel=0.01)          # 支持が押し返す力（壁は −x に押される）
+    # 曲げ応力 σ = M c / I（z = 10 の断面。それより上の水圧のモーメント）
+    low = np.isclose(m.nodes[:, 2], 10.0) & np.isclose(m.nodes[:, 0], t)
+    Mz10 = 1000e-12 * 9806.65 * b * (h - 10.0) ** 3 / 6              # z = 10 より上の水圧のモーメント
+    assert r.stress[low, 2].mean() == pytest.approx(Mz10 * (t / 2) / (b * t ** 3 / 12), rel=0.05)
