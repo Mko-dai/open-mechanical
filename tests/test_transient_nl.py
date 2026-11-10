@@ -140,3 +140,35 @@ def test_explicit_bonded_contact_matches_single_body():
         assert t2 == pytest.approx(t1, rel=0.03, abs=2e-5)
     # 下のボディにも波が伝わっている（つながっていなければ 0 のまま）
     assert abs(r2[-1].u[np.isclose(m.nodes[:, 2], 15.0), 2].mean()) > 1e-5
+
+
+def test_explicit_finite_sliding_flying_block():
+    """陽解法の有限すべり接触: 離れた位置から斜めに飛んできたブロックが、台の外から入ってきて台の上に当たり、はね返る。
+    接触相手を変形後の位置で決め直すので、最初に向かい合っていなかった場所でも接触する（微小すべりでは素通りする）"""
+    from openmech.contact import ContactRegion
+    from openmech.dynamics import solve_explicit
+    steel = Material("s", 200000.0, 0.0, 7850.0, 250.0)
+    base = Material("base", 2e7, 0.0, 7850.0 * 100, 250.0)
+    m1 = structured_box(60, 10, 5, 12, 2, 1).to_quadratic()
+    m2 = structured_box(10, 10, 10, 2, 2, 2, origin=(-15.0, 0, 7.0)).to_quadratic()    # 台の外・2 mm 上
+    m = Mesh(np.vstack([m1.nodes, m2.nodes]), np.vstack([m1.elems, m2.elems + m1.n_nodes]))
+    m.elem_body = np.r_[np.zeros(m1.n_elems, int), np.ones(m2.n_elems, int)]
+    m.group_faces()
+    top = [f["id"] for f in m.face_info() if abs(f["centroid"][2] - 5.0) < 1e-6]
+    bot = [f["id"] for f in m.face_info() if abs(f["centroid"][2] - 7.0) < 1e-6]
+    nb = np.unique(m.elems[m.elem_body == 1])
+    vz, vx = 2000.0, 20000.0                 # 2 mm 落ちる間（1e-3 s）に横へ 20 mm 進む
+    v0 = np.zeros((m.n_nodes, 3))
+    v0[nb, 2], v0[nb, 0] = -vz, vx
+    out = {}
+    for sliding in ("finite", "small"):
+        cr = ContactRegion(name="c", type="frictionless", contact_faces=bot, target_faces=top, interface="none",
+                           sliding=sliding, behavior="asymmetric")
+        ds = DynamicSettings(method="explicit", end_time=1.6e-3, n_frames=4)
+        rs = solve_explicit(m, steel, [BC("fixed", face(m, 2, 0, -1))], ds, elem_materials=([base, steel], m.elem_body),
+                            v0=v0, contacts=[cr], **quiet)
+        out[sliding] = (rs[-1].extra["速度 Z [mm/s]"][nb].mean(), rs[-1].u[nb, 2].min(), rs[-1].u[nb, 0].mean())
+    assert out["finite"][0] == pytest.approx(vz, rel=0.1)          # はね返った
+    assert out["finite"][1] > -2.0 - 0.2                           # 台を突き抜けていない
+    assert out["finite"][2] == pytest.approx(vx * 1.6e-3, rel=0.02)        # 摩擦なし: 横の速さは変わらない
+    assert out["small"][0] < 0                                     # 微小すべり: 最初に向かい合っていないので素通り

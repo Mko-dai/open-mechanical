@@ -275,6 +275,9 @@ class ExplicitInternal:
 
 # ---------------------------------------------------------------------------- 陽解法
 
+REPAIR_EVERY = 10        # 陽解法の有限すべり接触: 接触相手を決め直す間隔（ステップ数）
+
+
 def solve_explicit(mesh, material, bcs, settings: DynamicSettings, elem_materials=None, log=print, progress=None,
                    v0=None, monitor=None, contacts=None, contact_tolerance: float = 0.0):
     """中心差分法（LS-DYNA と同じ陽解法）。集中質量・自動時間増分・質量スケーリング・剛体壁・塑性・大変形
@@ -348,7 +351,8 @@ def solve_explicit(mesh, material, bcs, settings: DynamicSettings, elem_material
     creg = [c for c in (contacts or []) if not c.suppressed]
     if creg:
         from .contact import build_pairs, node_modulus
-        for pr in build_pairs(mesh, creg, node_modulus(mesh, mats, elem_mat), contact_tolerance):
+        for pr in build_pairs(mesh, creg, node_modulus(mesh, mats, elem_mat), contact_tolerance,
+                              large_deflection=s.large_deflection):
             reg = creg[pr.region]
             mm = np.einsum("ij,ij->i", pr.w, m[pr.masters])
             meff = m[pr.slave] * mm / np.maximum(m[pr.slave] + mm, 1e-300)
@@ -358,7 +362,8 @@ def solve_explicit(mesh, material, bcs, settings: DynamicSettings, elem_material
                 continue
             cpairs.append({"s": pr.slave, "m": pr.masters, "w": pr.w, "n": pr.n, "g0": pr.g0,
                            "k": 0.2 * meff / dt ** 2, "type": reg.type, "mu": float(reg.mu),
-                           "ref": np.zeros((len(pr.slave), 3)), "on": np.zeros(len(pr.slave), bool)})
+                           "ref": np.zeros((len(pr.slave), 3)), "on": np.zeros(len(pr.slave), bool),
+                           "pr": pr if getattr(pr, "finite", False) else None})
         if ties:
             tied = np.concatenate([t[0] for t in ties])
             if len(np.unique(tied)) < len(tied) or np.isin(np.concatenate([t[1].ravel() for t in ties]), tied).any():
@@ -374,6 +379,27 @@ def solve_explicit(mesh, material, bcs, settings: DynamicSettings, elem_material
         log(f"  接触: {len(creg)} 領域 / ペナルティ {sum(len(c['s']) for c in cpairs):,} 節点・"
             f"結合 {sum(len(t[0]) for t in ties):,} 節点")
     cforce = [0.0]
+    finite_c = [c for c in cpairs if c["pr"] is not None]
+    if finite_c:
+        log(f"  接触: {len(finite_c)} 組は有限すべり（接触相手を {REPAIR_EVERY} ステップごとに変形後の位置で決め直します）")
+
+    def repair_contacts(u):
+        """有限すべり: 変形後の位置で接触相手を決め直す。 摩擦のすべり量（基準からの増分）は引き継ぐ"""
+        from .contact import repair_pairs
+        U = u.reshape(-1, 3)
+        for c in finite_c:
+            pr = c["pr"]
+
+            def tang():
+                d = U[c["s"]] - np.einsum("ij,ijk->ik", c["w"], U[c["m"]])
+                return d - np.einsum("ij,ij->i", d, c["n"])[:, None] * c["n"]
+            inc = tang() - c["ref"]
+            repair_pairs(pr, u)
+            c["m"], c["w"], c["n"], c["g0"] = pr.masters, pr.w, pr.n, pr.g0
+            inc = inc - np.einsum("ij,ij->i", inc, c["n"])[:, None] * c["n"]
+            c["ref"] = tang() - inc
+            mm = np.einsum("ij,ij->i", c["w"], m[c["m"]])
+            c["k"] = 0.2 * m[c["s"]] * mm / np.maximum(m[c["s"]] + mm, 1e-300) / dt ** 2
 
     def contact_force(u):
         """接触力（全体のベクトル）。 摩擦の基準位置（ref）は呼ぶたびに更新する"""
@@ -501,6 +527,8 @@ def solve_explicit(mesh, material, bcs, settings: DynamicSettings, elem_material
                     red = np.minimum(1.0, wall["mu"] * (dvn + np.abs(g[hit]) / dt) / np.maximum(vtn, 1e-300))
                     V[hn] -= vt * red[:, None]
                 imp += float((mw[hit] * dvn).sum())          # 壁が止めた運動量 = 力積
+        if finite_c and k % REPAIR_EVERY == 0:
+            repair_contacts(u)
         a, ku = accel(u, vh, t)
         v = vh + 0.5 * dt * a
         if k % every == 0 or k == nsteps:
