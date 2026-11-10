@@ -3399,6 +3399,10 @@ class MainWindow(QMainWindow):
             ha.setToolTip("0 = Newmark 平均加速度法（エネルギー保存）。負にすると高い周波数の振動を減衰")
             ha.valueChanged.connect(lambda v: self._dyn_set("hht_alpha", v))
             self._row(s, "HHT-α（数値減衰）", ha)
+            self._row(s, "大変形", self._combo([("オフ", False), ("オン", True)],
+                                            ds.large_deflection, lambda v: self._dyn_set("large_deflection", v)))
+            self._row(s, "", "接触・塑性・超弾性・大変形・リモート境界条件・ジョイントがあると、静解析と同じ非線形の"
+                             "解き方に慣性力を加えて解きます（Ansys の過渡構造と同じ）。接触があるときは数値減衰 0.1 が既定です")
         s2 = self._section("初期条件・荷重")
         for i, ax in enumerate("XYZ"):
             w = dspin(float(ds.init_velocity[i]), -1e9, 1e9, 3, 100.0, "mm/s")
@@ -3406,6 +3410,29 @@ class MainWindow(QMainWindow):
                                                                 [v if j == i else float(self._dyn().init_velocity[j])
                                                                  for j in range(3)]))
             self._row(s2, f"初速度 {ax}", w)
+        if not ex and self.mesh is not None and len(self.mesh.body_ids()) > 1:
+            # ボディごとの初速度（衝突の解析用）。空欄 = 上の初速度を使う
+            for bid in self.mesh.body_ids():
+                cur = (ds.body_velocity or {}).get(str(int(bid)), (ds.body_velocity or {}).get(int(bid)))
+                ed = QLineEdit("" if cur is None else ", ".join(f"{float(x):g}" for x in cur))
+                ed.setPlaceholderText("vx, vy, vz [mm/s]（空欄 = 上の初速度）")
+
+                def set_bv(bid=bid, ed=ed):
+                    bv = {str(k): v for k, v in (self._dyn().body_velocity or {}).items()}
+                    txt = ed.text().replace("、", ",").strip()
+                    if not txt:
+                        bv.pop(str(int(bid)), None)
+                    else:
+                        try:
+                            vals = [float(x) for x in txt.split(",")]
+                            assert len(vals) == 3
+                        except Exception:
+                            QMessageBox.warning(self, "初速度", "vx, vy, vz の 3 つの数値をカンマ区切りで入力してください")
+                            return
+                        bv[str(int(bid))] = vals
+                    self._dyn_set("body_velocity", bv)
+                ed.editingFinished.connect(set_bv)
+                self._row(s2, f"初速度 {self._body_label(bid)}", ed)
         rt = dspin(ds.ramp_time, 0, 1e6, 9, 1e-4, "s")
         rt.setToolTip("荷重を 0 からこの時間で直線的に増やします。0 = t=0 から一定（ステップ荷重）")
         rt.valueChanged.connect(lambda v: self._dyn_set("ramp_time", v))
@@ -4520,13 +4547,16 @@ class MainWindow(QMainWindow):
             self.worker.start()
             return
         if transient:
-            from ..dynamics import DynamicSettings, solve_dynamic
+            from ..dynamics import DynamicSettings
             ds = DynamicSettings.from_dict(p.dynamic)
-            if not self._has_support() and not (ds.wall or {}).get("normal") and not any(ds.init_velocity):
+            if not self._has_support() and not (ds.wall or {}).get("normal") and not any(ds.init_velocity) \
+                    and not ds.body_velocity:
                 QMessageBox.warning(self, "過渡構造", "支持・剛体壁・初速度のどれもありません。")
                 return
+            if p.transient_nonlinear(self.mesh) and not p.contacts and len(self.mesh.body_ids()) > 1:
+                self.auto_contacts(quiet=True)
             self._busy(True, "過渡解析を実行しています…")
-            self.worker = Worker(solve_dynamic, self.mesh, p.material, list(p.bcs), ds, elem_materials=em)
+            self.worker = Worker(p.run_transient, self.mesh, em)
             self.worker.log.connect(lambda m: (self.solver_log.append(m), self.log(m)))
             self.worker.done.connect(self._on_solved)
             self.worker.failed.connect(self._on_solve_failed)

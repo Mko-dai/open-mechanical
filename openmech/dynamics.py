@@ -39,6 +39,7 @@ class DynamicSettings:
     mass_scaling_dt: float = 0.0       # 陽解法の目標時間増分 [s]（0 = 質量スケーリングなし）
     dt_safety: float = 0.9             # 陽解法の安定限界に掛ける係数（LS-DYNA の TSSFAC）
     large_deflection: bool = False     # 大変形（陽解法: Total Lagrangian。塑性と組み合わせ可）
+    body_velocity: dict = field(default_factory=dict)  # ボディごとの初速度 {ボディ番号: [vx,vy,vz]}（陰解法）
     wall: dict = field(default_factory=dict)  # 剛体壁 {"normal": [nx,ny,nz]（壁から物体側）, "point": [x,y,z], "friction": μ}
 
     def to_dict(self):

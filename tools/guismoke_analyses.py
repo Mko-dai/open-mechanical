@@ -152,6 +152,26 @@ except Exception:
 run("応答スペクトル（CQC）", "spectrum", [fix], opts={"n_modes": 10, "spec_method": "cqc", "spec_dir": [0, 0, 1],
                                                "spectrum": [[1, 0.5], [10, 1.0], [100, 1.0], [1000, 0.5]]},
     results=["変位（応答スペクトル） [mm]", "相当応力（応答スペクトル） [MPa]"], shot="spectrum")
+# 過渡構造（陰解法）を非線形の解き方で（大変形オン → 静解析と同じ解き方に慣性力）
+try:
+    w._set_analysis_type("transient")
+    w.project.dynamic = dict(w.project.dynamic or {}, method="implicit", end_time=2e-3, dt=5e-5, n_frames=8,
+                             large_deflection=True, wall={})
+    w.project.bcs = [fix, BC("force", right, [0, 0, -1000.0])]
+    w.invalidate()
+    w.select_node(("analysis",))
+    app.processEvents()
+    assert w.project.transient_nonlinear(w.mesh)
+    fr = w.project.run_all(w.mesh, log=lambda *a: None)
+    w._on_solved(fr)
+    app.processEvents()
+    w.grab().save(os.path.join(out, "transient_nl.png"))
+    P(f"OK  過渡（陰解法・非線形）: 結果 {len(fr)} 個 / 最大たわみ {max(-r.u[:, 2].min() for r in fr):.4g} mm / "
+      f"{fr[-1].info.get('解析')}")
+    w.project.dynamic = dict(w.project.dynamic, large_deflection=False)
+    w._set_analysis_type("static")
+except Exception:
+    P("NG  過渡（陰解法・非線形）\n" + traceback.format_exc())
 # サブモデル: 粗い結果を保存して、切断境界に与える
 try:
     import tempfile

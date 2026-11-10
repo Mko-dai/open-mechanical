@@ -253,6 +253,36 @@ class Project:
         return bool(self.contacts or multi or plastic or s.large_deflection or s.n_steps > 1 or s.weak_springs
                     or any(b.step_factors for b in self.bcs))
 
+    def transient_nonlinear(self, mesh) -> bool:
+        """過渡（陰解法）を非線形の解き方（接触・塑性・大変形・リモート境界条件・六面体など）で解くか"""
+        from .dynamics import DynamicSettings
+        from .remote import REMOTE_KINDS
+        ds = DynamicSettings.from_dict(self.dynamic)
+        if ds.method != "implicit" or (ds.wall or {}).get("normal"):
+            return False
+        if getattr(mesh, "is_shell", False) or getattr(mesh, "is_2d", False):
+            return False
+        multi = (getattr(mesh, "node_origin", None) is not None
+                 and len(np.unique(mesh.node_origin)) < mesh.n_nodes)
+        plastic = any(m.plasticity != "none" or m.hyper or (m.creep and float(m.creep.get("C1", 0) or 0) > 0)
+                      for m in (list(self.materials.values()) or [self.material]))
+        return bool(self.contacts or multi or plastic or self.settings.large_deflection or ds.large_deflection
+                    or ds.body_velocity or mesh.elems.shape[1] not in (4, 10)
+                    or any(b.kind in REMOTE_KINDS or b.kind == "submodel" for b in self.bcs))
+
+    def run_transient(self, mesh, em=None, log=print, progress=None):
+        from .dynamics import DynamicSettings, solve_dynamic
+        ds = DynamicSettings.from_dict(self.dynamic)
+        em = em if em is not None else self.elem_materials(mesh)
+        if not self.transient_nonlinear(mesh):
+            return solve_dynamic(mesh, self.material, self.bcs, ds, elem_materials=em, log=log, progress=progress)
+        if not self.contacts and mesh.elem_body is not None and len(mesh.body_ids()) > 1:
+            from .contact import detect_contacts
+            self.contacts = detect_contacts(mesh, self.contact_tolerance, self.contact_default_type,
+                                            self.contact_default_mu)
+        return solve_static(mesh, self.material, self.bcs, self.contacts, self.settings, elem_materials=em,
+                            log=log, progress=progress, contact_tolerance=self.contact_tolerance, dynamic=ds)
+
     def laminate(self, mesh):
         """ボディ属性の積層（複合材）→ composite.Laminates。積層が無ければ None"""
         if mesh is None or not getattr(mesh, "is_shell", False) or mesh.elem_body is None:
@@ -301,9 +331,7 @@ class Project:
                 or (self.analysis_opts or {}).get("thermal_import"):
             return run_extra(self, mesh, em, log=log, progress=progress)
         if self.analysis_type == "transient":
-            from .dynamics import DynamicSettings, solve_dynamic
-            return solve_dynamic(mesh, self.material, self.bcs, DynamicSettings.from_dict(self.dynamic),
-                                 elem_materials=em, log=log, progress=progress)
+            return self.run_transient(mesh, em, log=log, progress=progress)
         if getattr(mesh, "is_2d", False):
             from .plane import solve_2d
             self.check_shell_supported()

@@ -184,12 +184,22 @@ def _step_factor(bc: BC, t: float, ends: list[float]) -> float:
 
 def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[ContactRegion] | None = None,
                  settings: AnalysisSettings | None = None, elem_materials=None, log=print,
-                 progress=None, contact_tolerance: float = 0.0) -> list[Result]:
-    """静的構造解析（接触・大変形・複数ステップ対応）。各ステップ終了時の Result のリストを返す。"""
+                 progress=None, contact_tolerance: float = 0.0, dynamic=None) -> list[Result]:
+    """静的構造解析（接触・大変形・複数ステップ対応）。各ステップ終了時の Result のリストを返す。
+
+    dynamic（DynamicSettings）を渡すと、同じ非線形の解き方に慣性力と減衰力を加えた過渡構造解析（陰解法・
+    Newmark 法）になる。接触・塑性・大変形・リモート境界条件がそのまま使え、保存した時刻ごとの Result を返す。
+    """
     t_start = time.time()
     settings = settings or AnalysisSettings()
+    dyn = dynamic
+    if dyn is not None:
+        import copy
+        settings = copy.copy(settings)
+        settings.n_steps, settings.step_end_times = 1, [float(dyn.end_time)]
+        settings.large_deflection = bool(settings.large_deflection or dyn.large_deflection)
     contacts = [c for c in (contacts or []) if not c.suppressed]
-    if not any(b.kind in SUPPORT_KINDS for b in bcs):
+    if dyn is None and not any(b.kind in SUPPORT_KINDS for b in bcs):
         raise ValueError("拘束（固定支持 または 変位）がありません。少なくとも1つ設定してください。")
 
     # 材料
@@ -233,11 +243,16 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
     th_bcs = [bc for bc in bcs if bc.kind == "thermal"]
     F_th = thermal_load_vector(mesh, D, elem_mat, eps_th_m) if (has_th and not plastic) else None
 
+    def sfac(bc, t):
+        if dyn is not None:      # 過渡: ステップ荷重、または ramp_time までに直線で増やす
+            return 1.0 if dyn.ramp_time <= 0 else min(1.0, t / dyn.ramp_time)
+        return _step_factor(bc, t, ends)
+
     def th_factor(t):
         """熱ひずみの倍率（熱条件のステップ倍率。熱条件が無く材料温度だけなら 1 で一定）"""
         if not th_bcs:
             return 1.0
-        return _step_factor(th_bcs[0], t, ends)
+        return sfac(th_bcs[0], t)
 
     def loads_at(t):
         F = np.zeros(ndof)
@@ -245,7 +260,7 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
         if F_th is not None:
             F[:nb] += th_factor(t) * F_th
         for bc, (Fi, fx) in zip(bcs, per_bc):
-            f = _step_factor(bc, t, ends)
+            f = sfac(bc, t)
             if bc.kind in ("fixed", "symmetry", "frictionless"):
                 for d in fx:
                     fixed[d] = 0.0
@@ -324,6 +339,59 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
             return np.r_[fi, np.zeros(ndof - nb)], _pad(Kb, ndof)
 
     nonlinear = LD or nonlinear_contact or al or plastic
+    # 過渡（Newmark 法）: 慣性力 M a と減衰力 C v を残差に、M/(β dt²) + γ C/(β dt) を接線に加える
+    dst = None
+    if dyn is not None:
+        from .dynamics import consistent_mass
+        from .remote import pad as _padm
+        Mm = consistent_mass(mesh, rho_e)
+        if ndof > nb:
+            Mm = _padm(Mm, ndof)
+        if ex is not None:
+            Mm = Mm + ex.M()
+        Mm = Mm.tocsr()
+        dlt = -float(dyn.hht_alpha)            # 数値減衰（0 = 平均加速度法）
+        if dlt == 0.0 and nonlinear_contact:
+            dlt = 0.1                          # 接触の衝突は数値減衰なしだとエネルギーが増える（Ansys の既定も 0.1）
+            log("接触あり: 数値減衰 0.1 を入れます（HHT-α = -0.1 相当。解析設定で変更できます）")
+        if not (0.0 <= dlt <= 1 / 3 + 1e-12):
+            raise ValueError("HHT-α（数値減衰）は -1/3 〜 0 の範囲で指定してください")
+        Cm = dyn.alpha_damping * Mm if dyn.alpha_damping else None
+        if dyn.beta_damping:
+            K0 = K_lin if K_lin is not None else assemble_stiffness(mesh, D, elem_mat=elem_mat)
+            if ndof > nb:
+                K0 = _padm(K0, ndof)
+            Cm = dyn.beta_damping * K0 if Cm is None else Cm + dyn.beta_damping * K0
+        dst = {"beta": (1 + dlt) ** 2 / 4, "gamma": 0.5 + dlt, "dt": 1.0, "un": np.zeros(ndof),
+               "v": np.zeros(ndof), "a": np.zeros(ndof)}
+
+    def kinem(uu):
+        """Newmark 法の加速度・速度（前の時刻の状態 dst と今の変位 uu から）"""
+        b_, g_, h = dst["beta"], dst["gamma"], dst["dt"]
+        a_ = (uu - dst["un"]) / (b_ * h * h) - dst["v"] / (b_ * h) - (0.5 / b_ - 1.0) * dst["a"]
+        v_ = dst["v"] + h * ((1 - g_) * dst["a"] + g_ * a_)
+        return a_, v_
+
+    def inertia(uu):
+        a_, v_ = kinem(uu)
+        fd = Mm @ a_
+        if Cm is not None:
+            fd = fd + Cm @ v_
+        return fd
+
+    def inertia_committed():
+        fd = Mm @ dst["a"]
+        if Cm is not None:
+            fd = fd + Cm @ dst["v"]
+        return fd
+
+    def inertia_K():
+        b_, g_, h = dst["beta"], dst["gamma"], dst["dt"]
+        Kd = Mm / (b_ * h * h)
+        if Cm is not None:
+            Kd = Kd + Cm * (g_ / (b_ * h))
+        return Kd
+
     history = []
     results: list[Result] = []
     u = np.zeros(ndof)
@@ -357,6 +425,7 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
         free_r[_cr[_cr >= 0]] = False
 
     pen_state = {}
+    lu_cache = {}
 
     def res_norms(Rv, uu=None):
         """収束判定に使う残差（自由な自由度）と反力（拘束した自由度）の大きさ。
@@ -409,6 +478,9 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
             R = F + fc - fint - (Kc @ ue if Kc is not None else 0.0)
             if W is not None:
                 R = R - W @ ue
+            if dst is not None:
+                Kt = Kt + inertia_K()
+                R = R - inertia(ue)
             if predictor and len(cdofs):
                 R = R - Kt[:, cdofs] @ (vals - u0[cdofs])
             Rf = R[free]
@@ -433,6 +505,16 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
                 du_f = (Tm @ dr)[free]
                 Rf_lin = Rf_r
                 du_lin = dr[fre]
+            elif dst is not None and not nonlinear and int(free.sum()) <= 300_000:
+                # 線形の過渡: 係数行列は時間増分が同じなら変わらないので、分解を使い回す
+                key = float(f"{dst['dt']:.9e}")
+                if key not in lu_cache:
+                    from scipy.sparse.linalg import splu
+                    lu_cache.clear()
+                    lu_cache[key] = (splu(Kt[free][:, free].tocsc()), Kt[free][:, free].tocsr())
+                lu, Kff = lu_cache[key]
+                du_f = lu.solve(Rf)
+                Rf_lin, du_lin = Rf, du_f
             else:
                 Kff = Kt[free][:, free].tocsc()
                 with np.errstate(all="ignore"):
@@ -449,7 +531,10 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
                     ut = u.copy()
                     ut[free] += alpha * du_f
                     fi, _k = internal(ut)
-                    rt = np.linalg.norm((F + fc - fi - (Kc @ ut if Kc is not None else 0.0))[free])
+                    rv = F + fc - fi - (Kc @ ut if Kc is not None else 0.0)
+                    if dst is not None:
+                        rv = rv - inertia(ut)
+                    rt = np.linalg.norm(rv[free])
                     if rt < r0:
                         break
                     alpha *= 0.5
@@ -466,9 +551,14 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
                     R2 = R2 + fc2 - Kc2 @ u
                 if W is not None:
                     R2 = R2 - W @ u
-                # 参照力 = 外力と反力の大きさ（Ansys と同じ考え方）
+                fd2 = 0.0
+                if dst is not None:
+                    fdv = inertia(u)
+                    R2 = R2 - fdv
+                    fd2 = res_norms(fdv)[0]
+                # 参照力 = 外力と反力の大きさ（Ansys と同じ考え方）。過渡では慣性力も含める
                 rf2, rc2 = res_norms(R2, u)
-                ref2 = max(res_norms(F)[0], rc2, 0.01)  # 最小参照値 0.01 N（Ansys と同じ）
+                ref2 = max(res_norms(F)[0], rc2, fd2, 0.01)  # 最小参照値 0.01 N（Ansys と同じ）
                 crit = rf2 / ref2
             dcrit = np.linalg.norm(alpha * du_f) / max(np.linalg.norm(u[free]), 1e-30)
             history.append({"時間": round(t, 6), "反復": it, "力の残差比": float(crit),
@@ -489,18 +579,55 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
 
     t_prev = 0.0
     n_done = 0
+    frame_t, hist = [], {}
+    if dst is not None:
+        import math
+        from .dynamics import _frame_times
+        frame_t = [float(x) for x in _frame_times(dyn)]
+        hist = {"時間 [s]": [], "運動エネルギー [mJ]": [], "ひずみエネルギー [mJ]": [], "接触力 [N]": [],
+                "最大変位 [mm]": []}
+        v0 = np.zeros(ndof)
+        v0[:nb] = np.tile(np.asarray(dyn.init_velocity, float), mesh.n_nodes)
+        bv = getattr(dyn, "body_velocity", None) or {}
+        if bv and mesh.elem_body is not None:
+            for b, vb in bv.items():      # ボディごとの初速度（衝突の解析用）
+                nd = np.unique(mesh.elems[mesh.elem_body == int(b)])
+                v0[3 * nd[:, None] + np.arange(3)] = np.asarray(vb, float)
+        v0[cdofs] = 0.0
+        if Tm0 is not None:
+            v0 = Tm0 @ v0[Tm0.keep]
+        dst["v"] = v0
+        # 最初の加速度: 集中質量で a = (F - C v) / m（拘束した自由度は 0）
+        ml = np.asarray(Mm.sum(axis=1)).ravel()
+        f_init = loads_at(0.0)[0] - (Cm @ v0 if Cm is not None else 0.0)
+        a0 = np.where(ml > 0, f_init / np.where(ml > 0, ml, 1.0), 0.0)
+        a0[cdofs] = 0.0
+        dst["a"] = (Tm0 @ a0[Tm0.keep]) if Tm0 is not None else a0
+        dt_dyn = float(dyn.dt) if dyn.dt else dyn.end_time / max(20, int(dyn.n_frames) * 5)
+        nsteps_dyn = int(math.ceil(dyn.end_time / dt_dyn - 1e-9))
+        log(f"過渡（陰解法・Newmark）: 時間増分 {dyn.end_time / nsteps_dyn:.3e} s × {nsteps_dyn:,} ステップ"
+            + ("、非線形" if nonlinear else "、線形"))
     for si, t_end in enumerate(ends):
         nsub = max(1, settings.initial_substeps if (nonlinear or settings.auto_time_stepping == "on") else 1)
         if LD and settings.auto_time_stepping == "auto" and settings.initial_substeps <= 1:
             nsub = max(nsub, 5)
+        if dst is not None:
+            nsub = nsteps_dyn
         dt = (t_end - t_prev) / nsub
         t = t_prev
         min_dt = (t_end - t_prev) / max(settings.max_substeps, 1)
-        while t < t_end - 1e-12:
+        if dst is not None:
+            min_dt = dt / 64.0
+        dt_user = dt
+        while t < t_end - 1e-12 * max(t_end, 1.0):
             t_next = min(t + dt, t_end)
+            if frame_t and t_next > frame_t[0] - 1e-9 * t_end:
+                t_next = frame_t[0]
             state = save_pair_state()
             if ps is not None:
                 ps.dt = t_next - t
+            if dst is not None:
+                dst["dt"], dst["un"] = t_next - t, u.copy()
             try:
                 u_new, F_now = equilibrium(t_next, u)
             except ConvergenceError as e:
@@ -512,6 +639,10 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
                 err = RuntimeError(f"{e}。解析設定でサブステップ数を増やすか、荷重・接触設定を見直してください。")
                 err.history = history
                 raise err
+            if dst is not None:
+                a_n, v_n = kinem(u_new)
+                dst["a"], dst["v"] = a_n, v_n
+                dt = min(dt_user, dt * 2.0)       # 収束したら時間増分を戻していく
             u, t = u_new, t_next
             if pairs:
                 commit_states(pairs, contacts, u)
@@ -521,8 +652,33 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
             n_done += 1
             if progress:
                 progress(min(0.95, t / ends[-1]), f"時間 {t:g} / {ends[-1]:g}")
+            if dst is not None:
+                vv = dst["v"]
+                hist["時間 [s]"].append(t)
+                hist["運動エネルギー [mJ]"].append(0.5 * float(vv @ (Mm @ vv)))
+                hist["ひずみエネルギー [mJ]"].append(0.5 * float(u @ internal(u)[0]) if not (ps is not None or LD)
+                                                 else float("nan"))
+                hist["接触力 [N]"].append(float(sum((p.pressure * p.area).sum() for p in pairs
+                                                   if p.pressure is not None)))
+                hist["最大変位 [mm]"].append(float(np.abs(u[:nb]).max()))
+                if frame_t and t >= frame_t[0] - 1e-9 * t_end:
+                    frame_t.pop(0)
+                    cur_t[0] = t
+                    fdv = inertia_committed()
+
+                    def internal_dyn(uu, fdv=fdv):
+                        fi, Kb = internal_base(uu)
+                        return fi + fdv[:nb], Kb
+                    rr = _make_result(mesh, mats, elem_mat, D, u[:nb], bcs,
+                                      [(Fi[:nb], {d: v for d, v in fx.items() if d < nb}) for Fi, fx in per_bc],
+                                      loads_at(t)[0][:nb], pairs, contacts, LD, internal_dyn, t, len(results) + 1,
+                                      settings, ps, eps_th_m * th_factor(t) if has_th else None)
+                    v3 = vv[:nb].reshape(-1, 3)
+                    rr.extra.update({"速度 [mm/s]": np.linalg.norm(v3, axis=1), "速度 X [mm/s]": v3[:, 0].copy(),
+                                     "速度 Y [mm/s]": v3[:, 1].copy(), "速度 Z [mm/s]": v3[:, 2].copy()})
+                    results.append(rr)
         t_prev = t_end
-        if settings.store_results == "all" or si == len(ends) - 1:
+        if dst is None and (settings.store_results == "all" or si == len(ends) - 1):
             cur_t[0] = t_end
             results.append(_make_result(mesh, mats, elem_mat, D, u[:nb], bcs,
                                         [(Fi[:nb], {d: v for d, v in fx.items() if d < nb}) for Fi, fx in per_bc],
@@ -534,9 +690,15 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
                    "大変形": "オン" if LD else "オフ", "接触領域数": len(contacts),
                    "非線形": "はい" if nonlinear else "いいえ", "サブステップ数（合計）": n_done,
                    "合計時間 [s]": round(time.time() - t_start, 2)}
+    if dst is not None:
+        info_common.update({"解析": "陰解法（Newmark、非線形対応）", "ステップ数": n_done,
+                            "計算時間 [s]": round(time.time() - t_start, 1),
+                            "最大接触力 [N]": max(hist["接触力 [N]"] or [0.0])})
     for r in results:
         r.info.update(info_common)
-        r.history = history
+        r.history = hist if dst is not None else history
+        if dst is not None:
+            r.iterations = history
     return results
 
 
