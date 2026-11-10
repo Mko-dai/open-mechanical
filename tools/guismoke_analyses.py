@@ -155,7 +155,7 @@ run("応答スペクトル（CQC）", "spectrum", [fix], opts={"n_modes": 10, "s
 # 過渡構造（陰解法）を非線形の解き方で（大変形オン → 静解析と同じ解き方に慣性力）
 try:
     w._set_analysis_type("transient")
-    w.project.dynamic = dict(w.project.dynamic or {}, method="implicit", end_time=2e-3, dt=5e-5, n_frames=8,
+    w.project.dynamic = dict(w.project.dynamic or {}, method="implicit", end_time=4e-4, dt=5e-5, n_frames=4,
                              large_deflection=True, wall={})
     w.project.bcs = [fix, BC("force", right, [0, 0, -1000.0])]
     w.invalidate()
