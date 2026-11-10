@@ -119,6 +119,18 @@ w.select_node(("result", 0))
 w._path_plot("疲労:寿命 [回]")
 mat.permittivity = 4.0
 run("静電場", "electrostatic", [BC("ground", bot), BC("voltage", top, [100.0])])
+# 弧長法（大変形）: 先端を押す片持ちはりで、荷重係数 1 まで追う
+try:
+    w._set_analysis_type("static")
+    st0 = w.project.settings
+    st0.arc_length, st0.large_deflection, st0.arc_initial, st0.arc_max_steps = True, True, 0.25, 6
+    fr = run("弧長法（大変形）", "static", [fix, BC("force", right, [0, 0, -20000.0])], shot="arclength")
+    w.select_node(("analysis",))
+    app.processEvents()
+    P(f"OK  弧長法: 点 {len(fr)} / 荷重係数 {[round(float(r.time), 3) for r in fr][:6]}")
+    st0.arc_length, st0.large_deflection = False, False
+except Exception:
+    P("NG  弧長法\n" + traceback.format_exc())
 # 環境タブのメニュー（追加の境界条件）
 for k in A.BC_SPEC:
     try:

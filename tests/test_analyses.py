@@ -319,3 +319,64 @@ def test_response_spectrum_single_mode_and_cqc():
     # z 方向の曲げモードどうしは振動数が離れている → CQC と SRSS はほぼ同じ（正方形断面だと y・z が重なり CQC が大きくなる）
     assert abs(rc.u[:, 2].max() / r.u[:, 2].max() - 1) < 0.02
     assert r.extra["相当応力（応答スペクトル） [MPa]"].max() > 0
+
+
+def test_arc_length_elastica_column():
+    """弧長法: 片持ち柱の座屈後（エラスティカ）。 P/Pcr = 1.063 で先端の横たわみ 0.422 L、1.152 で 0.593 L
+    （Timoshenko & Gere の表）。 Pcr はこのメッシュの線形座屈の値を使う"""
+    from openmech.modal import solve_buckling
+    from openmech.nonlinear import AnalysisSettings, solve_static
+    E, L, b = 200000.0, 100.0, 4.0
+    mat = Material("s", E, 0.3, 7850, 1e9)
+    m = structured_box(L, b, b, 50, 2, 2).to_quadratic()
+    Pe = np.pi ** 2 * E * (b ** 4 / 12) / (4 * L ** 2)
+    k = solve_buckling(m, mat, [BC("fixed", [0]), BC("force", [1], [-Pe, 0, 0])], 1, log=lambda *a: None).load_factors[0]
+    assert k == pytest.approx(1.0, rel=0.01)
+    st = AnalysisSettings(large_deflection=True, arc_length=True, arc_initial=0.1, arc_max_steps=200,
+                          arc_max_load=0.6, arc_growth=40)
+    rs = solve_static(m, mat, [BC("fixed", [0]), BC("force", [1], [-2 * Pe, 0.0, -2e-3 * Pe])], settings=st,
+                      log=lambda *a: None)
+    tip = np.argmin(np.linalg.norm(m.nodes - [L, b / 2, b / 2], axis=1))
+    lam = np.array([2 * r.time for r in rs]) / k
+    d = np.array([-r.u[tip, 2] / L for r in rs])
+    assert np.interp(1.063, lam, d) == pytest.approx(0.422, rel=0.03)
+    assert np.interp(1.152, lam, d) == pytest.approx(0.593, rel=0.03)
+
+
+def test_arc_length_passes_limit_point():
+    """弧長法: 両端固定の浅いアーチに外圧。 飛び移りの極限点を越えて、荷重が下がる経路まで追える。
+    極限点の手前は荷重制御（ふつうの静解析）と同じ答えで、極限荷重を少し超えた荷重制御は大きく飛び移る"""
+    from openmech.mesh import Mesh
+    from openmech.nonlinear import AnalysisSettings, solve_static
+    mat = Material("s", 200000.0, 0.3, 7850, 1e9)
+    b = structured_box(2.0, 1.0, 4.0, 2, 30, 1).to_quadratic()
+    r, th = 200 + b.nodes[:, 0], np.radians(75 + 30 * b.nodes[:, 1])
+    m = Mesh(np.c_[r * np.cos(th), r * np.sin(th), b.nodes[:, 2]], b.elems)
+    m.group_faces()
+    R, TH = np.hypot(m.nodes[:, 0], m.nodes[:, 1]), np.degrees(np.arctan2(m.nodes[:, 1], m.nodes[:, 0]))
+
+    def fid(test):
+        return [f["id"] for f in m.face_info() if test(m.face_nodes(f["id"]))]
+    ends = fid(lambda nd: np.allclose(TH[nd], 75, atol=1e-6) or np.allclose(TH[nd], 105, atol=1e-6))
+    outer = fid(lambda nd: np.allclose(R[nd], 202, atol=1e-6))
+    zf = [f["id"] for f in m.face_info() if abs(abs(f["normal"][2]) - 1) < 1e-6]
+
+    def bcs(p):
+        return [BC("fixed", ends), BC("symmetry", zf), BC("pressure", outer, [p])]
+    apex = np.argmin(np.hypot(m.nodes[:, 0], m.nodes[:, 1] - 202))
+    st = AnalysisSettings(large_deflection=True, arc_length=True, arc_initial=0.02, arc_max_steps=120,
+                          arc_max_load=40.0, arc_max_disp=4.0, arc_growth=20)
+    rs = solve_static(m, mat, bcs(1.0), settings=st, log=lambda *a: None)
+    lam = np.array([x.time for x in rs])
+    w = np.array([-x.u[apex, 1] for x in rs])
+    i = int(np.argmax(lam))
+    assert 0 < i < len(lam) - 3 and lam[-1] < 0.8 * lam[i]           # 極限点を越えて荷重が下がっている
+    assert np.all(np.diff(w) > 0)                                    # たわみは増え続ける
+    ld = AnalysisSettings(large_deflection=True, initial_substeps=6, max_substeps=200)
+    w_lc = -solve_static(m, mat, bcs(0.75 * lam[i]), settings=ld, log=lambda *a: None)[-1].u[apex, 1]
+    assert w_lc == pytest.approx(np.interp(0.75 * lam[i], lam[:i + 1], w[:i + 1]), rel=0.02)
+    try:
+        w_over = -solve_static(m, mat, bcs(1.05 * lam[i]), settings=ld, log=lambda *a: None)[-1].u[apex, 1]
+    except RuntimeError:
+        w_over = np.inf                                              # 荷重制御では収束しない（飛び移り）
+    assert w_over > 2 * w[i]

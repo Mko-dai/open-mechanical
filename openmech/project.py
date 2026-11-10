@@ -251,6 +251,7 @@ class Project:
         plastic = any(m.plasticity != "none" or m.hyper or (m.creep and float(m.creep.get("C1", 0) or 0) > 0)
                       for m in (list(self.materials.values()) or [self.material]))
         return bool(self.contacts or multi or plastic or s.large_deflection or s.n_steps > 1 or s.weak_springs
+                    or s.arc_length
                     or any(b.step_factors for b in self.bcs))
 
     def transient_nonlinear(self, mesh) -> bool:

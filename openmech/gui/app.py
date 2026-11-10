@@ -3648,6 +3648,28 @@ class MainWindow(QMainWindow):
         pt.valueChanged.connect(lambda v: self._set_setting("penetration_tolerance", v))
         self._row(s, "貫通許容係数（要素サイズ比）", pt)
         self._row(s, "安定化", "オフ")
+        self._row(s, "弧長法", self._combo([("オフ", False), ("オン（座屈後・飛び移りの経路を追う）", True)], st.arc_length,
+                                        lambda v: self._set_setting("arc_length", v, rebuild=True)))
+        if st.arc_length:
+            a0 = dspin(st.arc_initial, 1e-6, 10, 4, 0.01)
+            a0.valueChanged.connect(lambda v: self._set_setting("arc_initial", v))
+            self._row(s, "最初の荷重係数の増分", a0)
+            a1 = dspin(st.arc_max_load, 0.001, 1e6, 3, 0.5)
+            a1.valueChanged.connect(lambda v: self._set_setting("arc_max_load", v))
+            self._row(s, "終了する荷重係数", a1)
+            a2 = dspin(st.arc_max_disp, 0.0, 1e9, 3, 1.0, "mm")
+            a2.setSpecialValueText("使わない")
+            a2.valueChanged.connect(lambda v: self._set_setting("arc_max_disp", v))
+            self._row(s, "終了する最大変位", a2)
+            a3 = dspin(st.arc_max_steps, 1, 100000, 0, 10)
+            a3.valueChanged.connect(lambda v: self._set_setting("arc_max_steps", int(v)))
+            self._row(s, "追う点の数の上限", a3)
+            a4 = dspin(st.arc_growth, 1, 10000, 1, 5)
+            a4.valueChanged.connect(lambda v: self._set_setting("arc_growth", v))
+            self._row(s, "弧長を伸ばす上限（最初の何倍）", a4)
+            self._row(s, "", "与えた荷重 × 荷重係数 λ で、λ も未知数にして解きます。各結果の「時間」は λ です。"
+                             "極限点を越えると λ が下がります。大変形をオンにして使ってください"
+                             "（力・圧力・重力の荷重だけ。0 以外の強制変位・非線形の接触・リモートは不可）")
         # 出力制御
         s = self._section("出力制御")
         self._row(s, "応力", "はい")

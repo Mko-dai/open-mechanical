@@ -47,6 +47,13 @@ class AnalysisSettings:
     line_search: str = "auto"             # auto / on / off
     max_iterations: int = 50
     penetration_tolerance: float = 0.1    # 要素サイズに対する比（拡張ラグランジュ）
+    # 弧長法（Ansys の ARCLEN）: 荷重係数 λ も未知数にして、座屈・飛び移りの極限点を越えて経路を追う
+    arc_length: bool = False
+    arc_initial: float = 0.1              # 最初の荷重係数の増分（与えた荷重に対する比）
+    arc_max_steps: int = 60               # 追う点の数の上限
+    arc_growth: float = 50.0              # 弧長を最初の何倍まで伸ばしてよいか（大きいと点が粗くなる）
+    arc_max_load: float = 1.0             # 荷重係数がこれに達したら終了
+    arc_max_disp: float = 0.0             # 最大変位 [mm] がこれに達したら終了（0 = 使わない）
     # 出力制御
     store_results: str = "all"            # all（全ステップ）/ last（最終のみ）
     calc_stress: bool = True
@@ -603,6 +610,8 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
                     return u, F
         raise ConvergenceError(f"時間 {t:g} で収束しませんでした（最大反復 {max_it} 回）")
 
+    if settings.arc_length and dyn is None:
+        return _arc_length(locals())
     t_prev = 0.0
     n_done = 0
     fin_pairs = [p for p in pairs if p.finite]
@@ -735,6 +744,123 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
         r.history = hist if dst is not None else history
         if dst is not None:
             r.iterations = history
+    return results
+
+
+def _arc_length(c):
+    """弧長法（Crisfield の円筒型）。 solve_static の準備（内力・荷重・拘束）をそのまま使う。
+
+    釣り合い  λ F_ref − f_int(u) = 0  を、増分の長さ |Δu| = Δl の条件と一緒に解く。 予測子は接線の向き
+    （前の増分と同じ側）、修正子は 2 次方程式の根のうち前の向きに近い方。 収束の回数で Δl を伸び縮みさせる。
+    戻り値: 収束した点ごとの Result（time = 荷重係数 λ）。
+    """
+    from scipy.sparse.linalg import splu
+    s, log, mesh = c["settings"], c["log"], c["mesh"]
+    ends, free, nb, ndof = c["ends"], c["free"], c["nb"], c["ndof"]
+    pairs, contacts, ps, LD, W = c["pairs"], c["contacts"], c["ps"], c["LD"], c["W"]
+    if c["ex"] is not None or any(k.nonlinear for k in contacts):
+        raise ValueError("弧長法は、リモート境界条件・ジョイント・非線形の接触（摩擦なし・摩擦ありなど）とは"
+                         "まだ組み合わせられません（結合・分離なしの接触は使えます）")
+    c["cur_t"][0] = ends[-1]
+    Fref, fixed = c["loads_at"](ends[-1])
+    if any(abs(v) > 0 for v in fixed.values()):
+        raise ValueError("弧長法では 0 以外の強制変位は使えません（力・圧力・重力で荷重を与えてください）")
+    if not np.any(Fref[free]):
+        raise ValueError("弧長法には荷重（力・圧力など）が必要です")
+    Kc, fc = (c["_contact"](np.zeros(ndof)) if pairs else (None, 0.0))
+    internal = c["internal"]
+
+    def resid(u, lam):
+        fint, Kt = internal(u)
+        R = lam * Fref - fint
+        if Kc is not None:
+            R, Kt = R + fc - Kc @ u, Kt + Kc
+        if W is not None:
+            R, Kt = R - W @ u, Kt + W
+        return R, Kt
+
+    def solver(Kt):
+        lu = splu(Kt[free][:, free].tocsc())
+
+        def sol(b):
+            x = np.zeros(ndof)
+            x[free] = lu.solve(b[free])
+            return x
+        return sol
+
+    fn = float(np.linalg.norm(Fref[free]))
+    u, lam, dl, dl0, du_prev = np.zeros(ndof), 0.0, None, None, None
+    lam_peak, results, hist = 0.0, [], []
+    t0 = time.time()
+    per_bc = [(Fi[:nb], {d: v for d, v in fx.items() if d < nb}) for Fi, fx in c["per_bc"]]
+    for step in range(1, int(s.arc_max_steps) + 1):
+        _R, Kt = resid(u, lam)
+        dut = solver(Kt)(Fref)
+        nt = float(np.linalg.norm(dut))
+        if not np.isfinite(nt) or nt == 0:
+            raise RuntimeError("弧長法: 接線の解が求まりません（拘束が不足していないか確認してください）")
+        if dl is None:
+            dl = dl0 = abs(float(s.arc_initial)) * nt
+        sgn = 1.0 if du_prev is None else (1.0 if float(du_prev @ dut) >= 0 else -1.0)
+        ok, it = False, 0
+        for _attempt in range(10):
+            Du, Dl = sgn * dl / nt * dut, sgn * dl / nt
+            for it in range(1, s.max_iterations + 1):
+                Rk, Ktk = resid(u + Du, lam + Dl)
+                ref = max(max(abs(lam + Dl), lam_peak) * fn, 1e-2)
+                if it > 1 and np.linalg.norm(Rk[free]) <= s.force_convergence * ref:
+                    ok = True
+                    break
+                sol = solver(Ktk)
+                dub, dutk = sol(Rk), sol(Fref)
+                if not (np.all(np.isfinite(dub)) and np.all(np.isfinite(dutk))):
+                    break
+                v = Du + dub
+                a, b, cc = float(dutk @ dutk), 2.0 * float(v @ dutk), float(v @ v) - dl * dl
+                disc = b * b - 4 * a * cc
+                if disc < 0:
+                    break
+                r1, r2 = (-b + np.sqrt(disc)) / (2 * a), (-b - np.sqrt(disc)) / (2 * a)
+                r = r1 if float(Du @ (v + r1 * dutk)) >= float(Du @ (v + r2 * dutk)) else r2
+                Du, Dl = v + r * dutk, Dl + r
+            if ok:
+                break
+            dl *= 0.5
+            if ps is not None:
+                ps.trial = None
+        if not ok:
+            err = RuntimeError(f"弧長法: {step} 点目で収束しませんでした（弧長を {dl:.3g} まで縮めました）。"
+                               "最初の荷重係数の増分を小さくしてみてください。")
+            err.history = hist
+            raise err
+        u, lam, du_prev = u + Du, lam + Dl, Du
+        lam_peak = max(lam_peak, abs(lam))
+        if ps is not None:
+            ps.internal(u[:nb], c["th_factor"](ends[-1]), large=LD)
+            ps.commit()
+        umax = float(np.abs(u[:nb]).max())
+        hist.append({"時間": round(lam, 6), "反復": it, "荷重係数": float(lam), "最大変位 [mm]": umax,
+                     "力の残差比": float(np.linalg.norm(Rk[free]) / ref), "変位の変化比": 0.0,
+                     "接触状態の変化": 0, "最大貫通 [mm]": 0.0})
+        log(f"  弧長法 {step}: 荷重係数 {lam:.5g} / 最大変位 {umax:.5g} mm / 反復 {it}")
+        rr = _make_result(mesh, c["mats"], c["elem_mat"], c["D"], u[:nb], c["bcs"], per_bc, lam * Fref[:nb], pairs,
+                          contacts, LD, c["internal_base"], lam, step, s, ps,
+                          c["eps_th_m"] * c["th_factor"](ends[-1]) if c["has_th"] else None)
+        rr.label = f"λ = {lam:.4g}"
+        rr.info["荷重係数"] = float(lam)
+        results.append(rr)
+        if c["progress"]:
+            c["progress"](min(0.95, step / s.arc_max_steps), f"弧長法 {step} 点 / 荷重係数 {lam:.4g}")
+        if lam >= s.arc_max_load or (s.arc_max_disp > 0 and umax >= s.arc_max_disp):
+            break
+        dl = float(np.clip(dl * min(np.sqrt(4.0 / max(it - 1, 1)), 1.6), 0.02 * dl0, float(s.arc_growth) * dl0))
+    lams = [r.time for r in results]
+    info = {"自由度数": int(free.sum()), "節点数": mesh.n_nodes, "要素数": mesh.n_elems, "解析": "弧長法",
+            "大変形": "オン" if LD else "オフ", "点の数": len(results), "最大の荷重係数": float(max(lams)),
+            "合計時間 [s]": round(time.time() - t0, 2)}
+    for r in results:
+        r.info.update(info)
+        r.history = hist
     return results
 
 
