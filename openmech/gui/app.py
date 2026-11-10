@@ -67,7 +67,7 @@ BC_COLORS = {"fixed": "#5a4fcf", "displacement": "#e8b100", "force": "#e03131",
              "symmetry": "#1c7ed6", "frictionless": "#7048e8"}
 BC_COLORS.update({"remote_force": "#c2255c", "remote_displacement": "#b8860b", "point_mass": "#495057",
                   "elastic_support": "#2b8a3e", "cylindrical_support": "#364fc7", "bearing_load": "#e8590c",
-                  "spring": "#5f3dc4", "bolt_pretension": "#862e9c", "temperature": "#e03131",
+                  "spring": "#5f3dc4", "joint": "#0b7285", "bolt_pretension": "#862e9c", "temperature": "#e03131",
                   "heat_flux": "#f76707", "heat_flow": "#fd7e14", "convection": "#1098ad", "radiation": "#f59f00",
                   "heat_generation": "#c92a2a", "insulation": "#868e96", "voltage": "#1971c2", "ground": "#343a40",
                   "charge": "#9c36b5", "compression_only": "#2f9e44"})
@@ -133,10 +133,11 @@ BC_SPEC = {
     "voltage": ([("電圧", "V", 100.0, False)], set()),
     "ground": ([], set()),
     "charge": ([("電荷", "C", 1e-9, False)], set()),
+    "joint": ([], {"point"}),
 }
 NO_FACE_KINDS = ("gravity", "thermal", "heat_generation", "bolt_pretension")
 SUPPORT_LIKE = ("fixed", "displacement", "symmetry", "frictionless", "remote_displacement", "elastic_support",
-                "cylindrical_support", "spring")
+                "cylindrical_support", "spring", "joint")
 RESULT_NAME = {k: v for g in RESULT_GROUPS.values() for k, v in g}
 RESULT_TYPE_JP = {
     "全変形 [mm]": "全変形", "相当応力（ミーゼス） [MPa]": "相当 (von-Mises) 応力",
@@ -564,6 +565,7 @@ class MainWindow(QMainWindow):
                  menu=self._bc_menu(["cylindrical_support", "elastic_support", "spring"]))
         R.button(g, "ベアリング", make_icon(BC_COLORS["bearing_load"], "軸"), lambda: self.add_bc("bearing_load"))
         R.button(g, "ボルト予張力", make_icon(BC_COLORS["bolt_pretension"], "ボ"), lambda: self.add_bc("bolt_pretension"))
+        R.button(g, "ジョイント", make_icon(BC_COLORS["joint"], "関"), lambda: self.add_bc("joint"))
         g = R.add_group(t, "熱")
         R.button(g, "熱荷重", make_icon(BC_COLORS["temperature"], "熱"),
                  menu=self._bc_menu(["temperature", "heat_flux", "heat_flow", "convection", "radiation",
@@ -3697,6 +3699,8 @@ class MainWindow(QMainWindow):
                 sp.valueChanged.connect(apply_pt)
             auto.toggled.connect(apply_pt)
             self._row(sec, "位置 X, Y, Z [mm]" if key == "point" else "地面の点 X, Y, Z [mm]", w)
+        if bc.kind == "joint":
+            self._details_joint(i, bc, sec)
         if bc.kind == "bolt_pretension":
             self._row(sec, "ボルトのボディ", self._combo(
                 [(self._body_label(b), int(b)) for b in (self.mesh.body_ids() if self.mesh is not None else [0])],
@@ -3716,6 +3720,88 @@ class MainWindow(QMainWindow):
                  "remote_force": "変形可は面を硬くしない（RBE3）。剛体は面を剛体として結ぶ"}
         if bc.kind in notes:
             self._row(sec, "", notes[bc.kind])
+
+    def _details_joint(self, i, bc, sec):
+        """ジョイントの詳細（Ansys の Joint: 種類・地面かボディか・座標系・自由な方向のばね/荷重/強制変位）"""
+        from ..remote import JOINT_FREE, JOINT_JP
+        o = bc.options or {}
+        self._row(sec, "種類", self._combo([(v, k) for k, v in JOINT_JP.items()], o.get("type", "revolute"),
+                                         lambda v: (self._bc_opt(i, "type", v), self._later(self.build_details))))
+        self._row(sec, "接続", self._combo([("ボディ－地面", True), ("ボディ－ボディ", False)], bool(o.get("ground", True)),
+                                         lambda v: (self._bc_opt(i, "ground", bool(v)), self._later(self.build_details))))
+        if not o.get("ground", True):
+            fb = list(o.get("faces_b") or [])
+            b2 = QPushButton(f"選択中の面を可動側にする（いま {len(fb)} 面）")
+            b2.clicked.connect(lambda: (self._bc_opt(i, "faces_b", list(self.selected_faces)),
+                                        self._later(self.build_details)))
+            self._row(sec, "可動側の面", b2)
+            self._row(sec, "", "上の「面」が参照側、ここで決めた面が可動側です（Ansys の Reference / Mobile）")
+        for key, lab, dflt in (("axis", "軸（局所 z）", [0, 0, 1]), ("axis_x", "局所 x の向き", [1, 0, 0])):
+            cur = list(o.get(key) or dflt)
+            w = QWidget()
+            h = QHBoxLayout(w)
+            h.setContentsMargins(0, 0, 0, 0)
+            sps = []
+            for k in range(3):
+                sp = dspin(float(cur[k]), -1e6, 1e6, 4, 0.1)
+                sps.append(sp)
+                h.addWidget(sp)
+            for sp in sps:
+                sp.valueChanged.connect(lambda _=None, key=key, sps=sps: self._bc_opt(i, key, [x.value() for x in sps]))
+            self._row(sec, lab, w)
+        jt = o.get("type", "revolute")
+        names = ["並進 x", "並進 y", "並進 z", "回転 x", "回転 y", "回転 z"]
+        if jt == "general":
+            free = list(o.get("free") or [])
+            for k in range(6):
+                cb = QCheckBox("自由")
+                cb.setChecked(k in free)
+                cb.toggled.connect(lambda on, k=k: self._bc_opt(
+                    i, "free", sorted(set((bc.options or {}).get("free") or []) ^ {k})))
+                self._row(sec, names[k], cb)
+            free = list(o.get("free") or [])
+        else:
+            free = JOINT_FREE[jt]
+        self._row(sec, "自由な方向", "、".join(names[k] for k in free) or "なし（固定）")
+
+        def setlist(key, k, v, n=6, fill=0.0):
+            lst = (list((bc.options or {}).get(key) or []) + [fill] * n)[:n]
+            lst[k] = v
+            self._bc_opt(i, key, lst)
+        for k in free:
+            unit = "mm" if k < 3 else "rad"
+            st = dspin(float(((o.get("stiffness") or [0] * 6) + [0] * 6)[k]), 0.0, 1e15, 4, 10.0,
+                       "N/mm" if k < 3 else "N·mm/rad")
+            st.valueChanged.connect(lambda v, k=k: setlist("stiffness", k, float(v)))
+            self._row(sec, f"{names[k]} のばね", st)
+            ld = dspin(float(((o.get("load") or [0] * 6) + [0] * 6)[k]), -1e12, 1e12, 4, 10.0, "N" if k < 3 else "N·mm")
+            ld.valueChanged.connect(lambda v, k=k: setlist("load", k, float(v)))
+            self._row(sec, f"{names[k]} の荷重", ld)
+            dv = ((o.get("disp") or [None] * 6) + [None] * 6)[k]
+            w = QWidget()
+            h = QHBoxLayout(w)
+            h.setContentsMargins(0, 0, 0, 0)
+            cb = QComboBox()
+            cb.addItems(["なし", "与える"])
+            cb.setCurrentIndex(0 if dv is None else 1)
+            sp = dspin(0.0 if dv is None else float(dv), -1e6, 1e6, 6, 0.01, unit)
+            sp.setEnabled(dv is not None)
+            cb.currentIndexChanged.connect(lambda idx, k=k, sp=sp: (sp.setEnabled(idx == 1), setlist(
+                "disp", k, sp.value() if idx == 1 else None, fill=None)))
+            sp.valueChanged.connect(lambda v, k=k, cb=cb: cb.currentIndex() == 1 and setlist("disp", k, float(v), fill=None))
+            h.addWidget(cb)
+            h.addWidget(sp)
+            self._row(sec, f"{names[k]} の強制変位", w)
+        self._row(sec, "", "面は剛体としてジョイントの点に結びます。自由な方向は、ばね・荷重・強制変位で動きを決めます"
+                         "（どれもないと動きが止まらず解けないことがあります）")
+        r = self.result
+        jr = getattr(r, "joints", {}).get(i) if r is not None else None
+        if jr:
+            fl, ml = jr["力（局所）"], jr["モーメント（局所）"]
+            self._row(sec, "ジョイントの力（局所）", f"{fl[0]:.4g}, {fl[1]:.4g}, {fl[2]:.4g} N")
+            self._row(sec, "ジョイントのモーメント（局所）", f"{ml[0]:.4g}, {ml[1]:.4g}, {ml[2]:.4g} N·mm")
+            rel = list(jr["相対変位（局所）"]) + list(jr["相対回転（局所） [rad]"])
+            self._row(sec, "相対運動（自由な方向）", "、".join(f"{names[k]} {rel[k]:.4g}" for k in free) or "—")
 
     def _bc_opt(self, i, key, value):
         bc = self.project.bcs[i]
@@ -3894,6 +3980,9 @@ class MainWindow(QMainWindow):
             bc.options = {"behavior": "rigid" if kind == "spring" else "deformable"}
         if kind == "bolt_pretension":
             bc.options = {"body": int(self.selected_bodies[0]) if self.selected_bodies else 0}
+        if kind == "joint":
+            # 最初に選んでいる面を参照側にする（可動側は詳細の「選択中の面を可動側に」で。なければ地面とのジョイント）
+            bc.options = {"type": "revolute", "ground": True, "axis": [0.0, 0.0, 1.0]}
         if kind in ("thermal", "heat_generation"):
             bc.bodies = list(self.selected_bodies)
         self.project.bcs.append(bc)

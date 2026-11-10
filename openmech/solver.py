@@ -339,9 +339,9 @@ BC_EXTRA_JP = {"remote_force": "リモート荷重", "remote_displacement": "リ
                "bolt_pretension": "ボルト予張力", "spring": "ばね（ボディ－地面）", "compression_only": "圧縮のみ支持",
                "temperature": "温度", "heat_flux": "熱流束", "heat_flow": "熱流量", "convection": "対流",
                "radiation": "放射", "heat_generation": "内部発熱", "insulation": "断熱",
-               "voltage": "電圧", "charge": "電荷", "ground": "接地"}
+               "voltage": "電圧", "charge": "電荷", "ground": "接地", "joint": "ジョイント"}
 SUPPORT_KINDS = ("fixed", "displacement", "symmetry", "frictionless", "remote_displacement", "elastic_support",
-                 "cylindrical_support", "spring")
+                 "cylindrical_support", "spring", "joint")
 
 
 @dataclass
@@ -730,6 +730,20 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
         u = T_mpc @ u
         R = np.zeros(K_full.shape[0])
         R[T_mpc.keep] = R_r
+    joints = {}
+    if ex is not None and ex.joints:
+        # ジョイントの力: 可動側の面の節点にかかる拘束力 λ = K u − F の合計（可動側のボディが受ける力）と、点まわりのモーメント
+        lam = (K_full @ u - F_full)[:nb].reshape(-1, 3)
+        for i, jd in ex.joints.items():
+            nd = jd["nodes_b"]
+            Fj = lam[nd].sum(0)
+            Mj = np.cross(mesh.nodes[nd] - jd["point"], lam[nd]).sum(0)
+            E = jd["E"]
+            rel = np.zeros(6)
+            for j, k in enumerate(jd["free"]):
+                rel[k] = u[jd["dof"] + j]
+            joints[i] = {"力（全体）": Fj, "モーメント（全体）": Mj, "力（局所）": E @ Fj, "モーメント（局所）": E @ Mj,
+                         "相対変位（局所）": rel[:3], "相対回転（局所） [rad]": rel[3:], "type": jd["type"]}
     u_pilot = u[nb:]
     u = u[:nb]
     stress, strain = nodal_stress(mesh, u, D, elem_mat=elem_mat, eps_th_m=eps_th_m)
@@ -751,6 +765,7 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
             "合計時間 [s]": round(time.time() - t0, 2), "相対残差": float(res)}
     r = Result(mesh, material, u.reshape(-1, 3), stress, strain, reactions, info, mats, elem_mat)
     r.reaction_moments = reaction_moments
+    r.joints = joints
     if ex is not None and ex.pilots:
         r.pilots = {i: (p, u_pilot[d0 - nb:d0 - nb + 6]) for i, p, d0 in ex.pilots}
     return r

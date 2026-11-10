@@ -15,7 +15,12 @@ import scipy.sparse as sp
 from .surface import surface_sets
 
 REMOTE_KINDS = ("remote_force", "remote_displacement", "point_mass", "elastic_support", "cylindrical_support",
-                "bearing_load", "spring")
+                "bearing_load", "spring", "joint")
+# ジョイント（Ansys の Joint と同じ種類）: 局所座標の自由な自由度（0-2 並進 x,y,z、3-5 回転 x,y,z。z が軸）
+JOINT_FREE = {"fixed": [], "revolute": [5], "cylindrical": [2, 5], "translational": [0], "slot": [0, 3, 4, 5],
+              "universal": [3, 5], "spherical": [3, 4, 5], "planar": [0, 1, 5], "general": None}
+JOINT_JP = {"fixed": "固定", "revolute": "回転（レボリュート）", "cylindrical": "円筒", "translational": "並進",
+            "slot": "スロット", "universal": "ユニバーサル", "spherical": "球面", "planar": "平面", "general": "一般"}
 PENALTY = 1e5           # 剛体結合のペナルティ（剛性の平均の何倍か）
 
 
@@ -38,6 +43,7 @@ class Extra:
     mpc: dict = field(default_factory=dict)        # 従属自由度 → (独立自由度の配列, 係数の配列)  u_s = Σ c u_m
     F_by: dict = field(default_factory=dict)       # 境界条件の番号 → {dof: 力}（非線形のステップ倍率用）
     fixed_by: dict = field(default_factory=dict)   # 境界条件の番号 → {dof: 値}
+    joints: dict = field(default_factory=dict)     # 境界条件の番号 → ジョイントの情報（結果の集計用）
 
     def Fvec_of(self, i):
         F = np.zeros(self.n)
@@ -142,6 +148,7 @@ def _cyl_axis(mesh, faces):
 
 
 def extra_terms(mesh, bcs, kref: float, acc=None) -> Extra:
+    from .solver import BC
     """リモート・ばね・弾性支持・円筒支持・ベアリング荷重・点質量の剛性・質量・荷重・拘束。
     kref: 剛性の大きさの目安（全体剛性の対角の平均）、acc: 重力加速度（点質量の重量）"""
     ex = Extra(3 * mesh.n_nodes)
@@ -194,10 +201,74 @@ def extra_terms(mesh, bcs, kref: float, acc=None) -> Extra:
             for k in range(3):
                 ex.mpc[d0 + 3 + k] = (fdofs, A[k].copy())
 
+    def joint(i, b):
+        """ジョイント: 参照側（A）と可動側（B）の面を剛体でパイロットに結び、局所座標の自由な方向だけ相対運動を許す。
+        B の面の節点:  u = u_A + θ_A × r + Σ_並進 e_k α_k + (Σ_回転 e_k β_k) × r   （r = x − p）
+        α・β は新しい自由度（ジョイントの相対変位・回転）。地面とのジョイントは u_A = θ_A = 0"""
+        o = b.options or {}
+        jt = o.get("type", "revolute")
+        free = o.get("free") if jt == "general" else JOINT_FREE[jt]
+        free = sorted(int(k) for k in (free or []))
+        ground = bool(o.get("ground", False))
+        faces_b = list(b.faces) if ground else list(o.get("faces_b") or [])
+        if not faces_b or (not ground and not b.faces):
+            raise ValueError(f"{b.label()}: ジョイントの面（参照側と可動側）を選んでください")
+        p = np.asarray(b.point, float) if len(b.point) == 3 else face_weights(mesh, faces_b)[2]
+        ez = np.asarray(o.get("axis", [0, 0, 1]), float)
+        ez /= np.linalg.norm(ez)
+        ex_ = np.asarray(o.get("axis_x", [1, 0, 0]), float)
+        ex_ = ex_ - (ex_ @ ez) * ez
+        if np.linalg.norm(ex_) < 1e-9:
+            ex_ = np.cross(ez, [0, 1, 0]) if abs(ez[1]) < 0.9 else np.cross(ez, [1, 0, 0])
+        ex_ /= np.linalg.norm(ex_)
+        E = np.vstack([ex_, np.cross(ez, ex_), ez])           # 行 = 局所 x, y, z（全体座標）
+        dA = None
+        if not ground:
+            dA = new_pilot(i, p)
+            bb = BC(b.kind, list(b.faces), [], options={"behavior": "rigid"})
+            couple(i, bb, p, dA)
+        dj = ex.n
+        ex.n_extra += len(free)
+        nodes, _, _, _, _ = face_weights(mesh, faces_b)
+        for nd in nodes:
+            if any(3 * int(nd) + k in ex.mpc for k in range(3)):
+                raise ValueError(f"{b.label()}: 可動側の面がほかの剛体結合と重なっています")
+            r = mesh.nodes[nd] - p
+            rot = [(np.array([4, 5]), np.array([r[2], -r[1]])), (np.array([5, 3]), np.array([r[0], -r[2]])),
+                   (np.array([3, 4]), np.array([r[1], -r[0]]))]
+            for c in range(3):
+                m, cf = [], []
+                if dA is not None:
+                    m += [dA + c, dA + rot[c][0][0], dA + rot[c][0][1]]
+                    cf += [1.0, rot[c][1][0], rot[c][1][1]]
+                for j, k in enumerate(free):
+                    e = E[k % 3]
+                    m.append(dj + j)
+                    cf.append(e[c] if k < 3 else np.cross(e, r)[c])
+                ex.mpc[3 * int(nd) + c] = (np.asarray(m, np.int64), np.asarray(cf, float))
+        # 自由な方向の荷重・強制変位・ばね（局所座標の 6 成分）
+        load = (list(o.get("load") or []) + [0.0] * 6)[:6]
+        disp = (list(o.get("disp") or []) + [None] * 6)[:6]
+        kk = (list(o.get("stiffness") or []) + [0.0] * 6)[:6]
+        for j, k in enumerate(free):
+            if load[k]:
+                addF(dj + j, float(load[k]))
+            if disp[k] is not None:
+                ex.fixed[dj + j] = float(disp[k])
+                ex.fixed_by.setdefault(i, {})[dj + j] = float(disp[k])
+            if kk[k]:
+                ex.add_block([dj + j], [dj + j], [[float(kk[k])]])
+        if not free and dA is None:
+            ex.notes.append(f"{b.label()}: 地面との固定ジョイント（固定支持と同じ）")
+        ex.joints[i] = {"type": jt, "free": free, "E": E, "point": p, "nodes_b": nodes, "dof": dj, "ground": ground}
+
     for i, b in enumerate(bcs):
         if b.kind not in REMOTE_KINDS:
             continue
         cur[0] = i
+        if b.kind == "joint":
+            joint(i, b)
+            continue
         Fb = np.zeros(3 * mesh.n_nodes)
         v = [None if x is None else float(x) for x in (list(b.values) + [None] * 6)[:6]]
         vz = [0.0 if x is None else x for x in v]

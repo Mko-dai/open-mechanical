@@ -148,6 +148,18 @@ try:
     msgs.clear()
 except Exception:
     P("NG  収束ツール\n" + traceback.format_exc())
+# ジョイント（地面との回転ジョイント＋ねじりばね）
+try:
+    jbc = BC("joint", list(fix.faces), [], options={"type": "revolute", "ground": True, "axis": [0, 0, 1],
+                                                    "stiffness": [0, 0, 0, 0, 0, 1e9]})
+    fr = run("ジョイント（回転＋ねじりばね）", "static", [jbc, BC("force", right, [0, -1000.0, 0])], shot="joint")
+    w.select_node(("bc", 0))
+    app.processEvents()
+    jr = w.results[-1].joints[0]
+    P(f"OK  ジョイント: 回転 {jr['相対回転（局所） [rad]'][2]:.4g} rad / 力 {np.round(jr['力（全体）'], 3)} / "
+      f"モーメント z {jr['モーメント（全体）'][2]:.4g}")
+except Exception:
+    P("NG  ジョイント\n" + traceback.format_exc())
 # 断面表示とアニメーション
 try:
     w.select_node(("result", 1))
