@@ -4679,21 +4679,28 @@ class MainWindow(QMainWindow):
         p0 = [w.value() for w in sp[0]]
         p1 = [w.value() for w in sp[1]]
         if mode["lin"]:
-            from .charts import table_dialog
-            from ..postproc import linearize_stress
-            try:
-                lz = linearize_stress(self.mesh, self.result.stress, p0, p1)
-            except ValueError as e:
-                QMessageBox.warning(self, "応力の線形化", str(e))
-                return
-            self.last_linearized = lz
-            table_dialog(self, f"応力の線形化（相当応力、厚さ {lz['厚さ']:.4g} mm）",
-                         [{k: (round(v, 4) if isinstance(v, float) else v) for k, v in r.items()} for r in lz["表"]])
-            chart_dialog(self, "応力の線形化", "始点からの距離 [mm]", "相当応力 [MPa]",
-                         [("全体", lz["s"], lz["全体"]), ("膜", lz["s"], lz["膜"]), ("膜＋曲げ", lz["s"], lz["膜＋曲げ"])])
+            self.show_linearized(p0, p1)
             return
         d, v = path_values(self.mesh, vals, p0, p1, 101)
         chart_dialog(self, f"パス結果: {RESULT_NAME.get(key, key)}", "始点からの距離 [mm]", key, [(key, d, v)])
+
+    def show_linearized(self, p0, p1):
+        """応力の線形化の表とグラフを出す"""
+        from .charts import chart_dialog, table_dialog
+        from ..postproc import linearize_stress
+        if self.result is None or getattr(self.result, "stress", None) is None:
+            return None
+        try:
+            lz = linearize_stress(self.mesh, self.result.stress, p0, p1)
+        except ValueError as e:
+            QMessageBox.warning(self, "応力の線形化", str(e))
+            return None
+        self.last_linearized = lz
+        table_dialog(self, f"応力の線形化（相当応力、厚さ {lz['厚さ']:.4g} mm）",
+                     [{k: (round(v, 4) if isinstance(v, float) else v) for k, v in r.items()} for r in lz["表"]])
+        chart_dialog(self, "応力の線形化", "始点からの距離 [mm]", "相当応力 [MPa]",
+                     [("全体", lz["s"], lz["全体"]), ("膜", lz["s"], lz["膜"]), ("膜＋曲げ", lz["s"], lz["膜＋曲げ"])])
+        return lz
 
     def run_solve(self):
         if self.worker and self.worker.isRunning():

@@ -490,6 +490,14 @@ try:
     app.processEvents()
     hoop = w._fields(w.result)["応力 σθ（周） [MPa]"]
     P(f"   円筒座標系の結果: 周方向の応力 最大 {float(np.nanmax(hoop)):.4g} MPa（内面）")
+    n0 = len(shown)
+    lz = w.show_linearized([20.0, 0.0, 5.0], [40.0, 0.0, 5.0])
+    P(f"   応力の線形化（肉厚方向）: 膜 {lz['表'][0]['始点 [MPa]']:.4g} / 膜＋曲げ {lz['表'][2]['始点 [MPa]']:.4g} / "
+      f"全体 {lz['表'][4]['始点 [MPa]']:.4g} MPa / 表・グラフ {len(shown) - n0} 個")
+    w.add_bc("hydrostatic")
+    app.processEvents()
+    w.select_node(("bc", len(w.project.bcs) - 1))
+    app.processEvents()
     for i in range(3):
         w.select_node(("bc", i))
         app.processEvents()
