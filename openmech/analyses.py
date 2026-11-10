@@ -169,7 +169,9 @@ def run_extra(project, mesh, em, log=print, progress=None):
         r.extra = {"温度 [°C]": T}
         return [r]
     if any(b.kind == "bolt_pretension" for b in p.bcs):
-        from .bolt import solve_pretension
+        from .bolt import has_beam_pretension as _hbp, solve_pretension
+        if _hbp(p.bcs):
+            raise ValueError("ボルト予張力（ソリッドのボルト）とビーム接続の予張力は、同じ解析では併用できません")
         if p.needs_nonlinear_solver(mesh):
             from .nonlinear import solve_static
 
@@ -180,6 +182,22 @@ def run_extra(project, mesh, em, log=print, progress=None):
             def fn(bcs, emm):
                 return solve(mesh, mat, bcs, log=lambda *a: None, elem_materials=emm)
         res = solve_pretension(mesh, mat, p.bcs, fn, elem_materials=em, log=log)
+        for r in res:
+            r.label = r.info.get("解析", "")
+        return res
+    from .bolt import has_beam_pretension
+    if has_beam_pretension(p.bcs):
+        from .bolt import solve_beam_pretension
+        if p.needs_nonlinear_solver(mesh):
+            from .nonlinear import solve_static
+
+            def fnb(bcs):
+                return solve_static(mesh, mat, bcs, p.contacts, p.settings, elem_materials=em,
+                                    log=lambda *a: None, contact_tolerance=p.contact_tolerance)[-1]
+        else:
+            def fnb(bcs):
+                return solve(mesh, mat, bcs, log=lambda *a: None, elem_materials=em)
+        res = solve_beam_pretension(p.bcs, fnb, log=log)
         for r in res:
             r.label = r.info.get("解析", "")
         return res

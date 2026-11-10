@@ -64,3 +64,37 @@ def test_beam_between_two_bodies(nonlinear):
     assert gap == pytest.approx(F * L / (E * A), rel=1e-3)
     assert r.beams[2]["軸力 [N]"] == pytest.approx(F, rel=1e-4)
     assert r.beams[2]["伸び [mm]"] == pytest.approx(F * L / (E * A), rel=1e-4)
+
+
+def test_beam_pretension_clamps_joint():
+    """2 枚の板（摩擦なし接触）を、上面から地面までのビームに予張力 P をかけて締める。
+    ステップ 1: 軸力 = P、接触力 = P。 ステップ 2（上面を F で引く）: 軸力の増分 = F kb/(kb+kc)（kb ≪ kc）"""
+    from openmech.bolt import solve_beam_pretension
+    from openmech.contact import detect_contacts
+    from openmech.nonlinear import AnalysisSettings, solve_static
+    S = Material("steel", 200000.0, 0.0, 7850.0, 250.0)        # ν = 0: 板の圧縮が 1 次元の式どおりになる
+    m1 = structured_box(40, 40, 10, 2, 2, 1).to_quadratic()
+    m2 = structured_box(40, 40, 10, 2, 2, 1, origin=(0, 0, 10)).to_quadratic()
+    m = Mesh(np.vstack([m1.nodes, m2.nodes]), np.vstack([m1.elems, m2.elems + m1.n_nodes]))
+    m.elem_body = np.r_[np.zeros(m1.n_elems, int), np.ones(m2.n_elems, int)]
+    m.group_faces()
+    cs = detect_contacts(m)
+    for c in cs:
+        # 接触の法線剛性を高くして、接触面のたわみ（ペナルティ分）が板の剛性 kc に効かないようにする
+        c.type, c.stiffness_mode, c.stiffness_factor = "frictionless", "factor", 100.0
+    top = face(m, 2, 20, 1)
+    xs = [f["id"] for f in m.face_info() if abs(f["centroid"][0]) < 1e-6]
+    ys = [f["id"] for f in m.face_info() if abs(f["centroid"][1]) < 1e-6]
+    P, F = 5000.0, 2000.0
+    bcs = [BC("fixed", face(m, 2, 0, -1)), BC("displacement", xs, [0.0, None, None]),
+           BC("displacement", ys, [None, 0.0, None]), BC("force", top, [0, 0, F]),
+           BC("beam", top, [RAD, E, 0.3, P], options={"ground": True, "ground_point": [20.0, 20.0, 0.0],
+                                                     "behavior": "rigid"})]
+    r1, r2 = solve_beam_pretension(bcs, lambda b: solve_static(m, S, b, cs, AnalysisSettings(), **quiet)[-1],
+                                   log=lambda *a: None)
+    assert r1.beams[4]["軸力 [N]"] == pytest.approx(P, rel=1e-4)
+    assert r1.reactions[0][2] == pytest.approx(P, rel=1e-3)                 # 板が受ける圧縮 = 予張力
+    kb, kc = E * A / 20.0, 1600.0 * 200000.0 / 20.0
+    dN = r2.beams[4]["軸力 [N]"] - P
+    assert dN == pytest.approx(F * kb / (kb + kc), rel=0.05)
+    assert r2.reactions[0][2] == pytest.approx(P + dN - F, rel=1e-3)        # 残った締め付け力

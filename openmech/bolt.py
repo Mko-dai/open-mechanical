@@ -153,3 +153,47 @@ def solve_pretension(mesh, material, bcs, solve_fn, elem_materials=None, log=pri
         r2.info[f"ボルト {k + 1} の力 [N]"] = round(float(f2), 3)
         r2.info[f"ボルト {k + 1} の調整ひずみ"] = float(eps[k])
     return [r1, r2]
+
+
+def has_beam_pretension(bcs) -> bool:
+    return any(b.kind == "beam" and len(b.values) > 3 and b.values[3] for b in bcs)
+
+
+def solve_beam_pretension(bcs, solve_fn, log=print):
+    """ビーム接続の予張力（Ansys の Bolt Pretension をビームにかけた場合と同じ 2 ステップ）。
+    solve_fn(bcs) → Result（r.beams に断面力）。 戻り値: [ステップ 1（予張力のみ）, ステップ 2（ロック＋外力）]"""
+    support = ("fixed", "displacement", "symmetry", "frictionless", "remote_displacement", "elastic_support",
+               "cylindrical_support", "spring", "joint", "cyclic", "compression_only")
+
+    def with_mode(b, **pre):
+        nb = copy.copy(b)
+        nb.options = dict(b.options or {}, _pre=pre)
+        return nb
+    step1, idx1 = [], {}
+    for i, b in enumerate(bcs):
+        if b.kind == "beam":
+            idx1[i] = len(step1)
+            step1.append(with_mode(b, mode="preload") if (len(b.values) > 3 and b.values[3]) else b)
+        elif b.kind == "displacement":
+            nb = copy.copy(b)
+            nb.values = [None if v is None else 0.0 for v in b.values]
+            step1.append(nb)
+        elif b.kind in support:
+            step1.append(b)
+    r1 = solve_fn(step1)
+    b1 = getattr(r1, "beams", {})
+    step2 = []
+    for i, b in enumerate(bcs):
+        if b.kind == "beam" and len(b.values) > 3 and b.values[3]:
+            du1 = float(b1[idx1[i]]["伸び [mm]"])
+            log(f"ビームの予張力: {b.label()} … ステップ 1 の軸力 {b1[idx1[i]]['軸力 [N]']:,.5g} N（伸び {du1:.4g} mm）")
+            step2.append(with_mode(b, mode="locked", du1=du1))
+        else:
+            step2.append(b)
+    r2 = solve_fn(step2)
+    r1.beams = {i: b1[j] for i, j in idx1.items()}          # 番号を元の境界条件の並びに合わせる
+    for r, k, name in ((r1, 1, "ビームの予張力（ステップ 1）"), (r2, 2, "ビームの予張力（ステップ 2: ロック＋外力）")):
+        r.info["ステップ"], r.info["解析"], r.time = k, name, float(k)
+        for i, br in getattr(r, "beams", {}).items():
+            r.info[f"ビーム {i + 1} の軸力 [N]"] = round(float(br["軸力 [N]"]), 3)
+    return [r1, r2]

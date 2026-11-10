@@ -577,7 +577,7 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
             if not nonlinear:
                 crit = _rel_res(Kff, du_lin, Rf_lin)
             else:
-                fint2 = internal(u)[0] if (LD or ps is not None) else K_lin @ u
+                fint2 = internal(u)[0]
                 R2 = F - fint2
                 if pairs:
                     Kc2, fc2 = _contact(u)

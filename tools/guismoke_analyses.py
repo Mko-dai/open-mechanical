@@ -195,6 +195,9 @@ try:
     br = w.results[-1].beams[1]
     P(f"OK  ビーム接続: 軸力 {br['軸力 [N]']:.4g} N / せん断力 {br['せん断力 [N]']:.4g} N / "
       f"最大応力 {br['最大応力（軸＋曲げ） [MPa]']:.4g} MPa")
+    bb2 = BC("beam", list(right), [3.0, 200000.0, 0.3, 1000.0], options=dict(bb.options))
+    fr = run("ビーム接続（予張力 2 ステップ）", "static", [fix, bb2, BC("pressure", top, [1.0])], shot="beam_pre")
+    P(f"OK  ビームの予張力: ステップ 1 の軸力 {fr[0].beams[1]['軸力 [N]']:.5g} N / ステップ 2 {fr[1].beams[1]['軸力 [N]']:.5g} N")
 except Exception:
     P("NG  ビーム接続\n" + traceback.format_exc())
 # サブモデル: 粗い結果を保存して、切断境界に与える

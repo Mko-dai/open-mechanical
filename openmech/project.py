@@ -328,8 +328,10 @@ class Project:
         mesh = mesh if mesh is not None else self.mesh(log=log)
         em = self.elem_materials(mesh)
         from .analyses import EXTRA_TYPES, run_extra
+        from .bolt import has_beam_pretension
         if self.analysis_type in EXTRA_TYPES or any(b.kind == "bolt_pretension" for b in self.bcs) \
-                or (self.analysis_opts or {}).get("thermal_import"):
+                or (self.analysis_opts or {}).get("thermal_import") \
+                or (self.analysis_type == "static" and has_beam_pretension(self.bcs)):
             return run_extra(self, mesh, em, log=log, progress=progress)
         if self.analysis_type == "transient":
             return self.run_transient(mesh, em, log=log, progress=progress)

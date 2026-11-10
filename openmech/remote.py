@@ -300,6 +300,26 @@ def extra_terms(mesh, bcs, kref: float, acc=None) -> Extra:
         G = Eb / (2 * (1 + nu))
         phi = 12 * Eb * I_ / (0.9 * G * A_ * L ** 2)          # せん断変形（丸棒 κ = 0.9）: 短いビームで効く
         kl = _k_local(Eb, G, A_, I_, I_, 2 * I_, L, phi, phi)
+        # 予張力（values[3]）: bolt.solve_beam_pretension が 2 回に分けて解く。
+        #   ステップ 1「preload」: 軸方向の剛性を抜いて、両端を引き寄せる力 P だけを与える → 軸力はちょうど P
+        #   ステップ 2「locked」 : 剛性を戻し、ステップ 1 の伸び du1 のときに軸力が P になるよう力をずらす
+        P0 = float(b.values[3]) if len(b.values) > 3 and b.values[3] else 0.0
+        pre = o.get("_pre") or {}
+        N0 = 0.0
+        if P0 and pre.get("mode") == "preload":
+            for a_, b_ in ((0, 0), (0, 6), (6, 0), (6, 6)):
+                kl[a_, b_] *= 1e-8
+            N0 = P0
+        elif P0 and pre.get("mode") == "locked":
+            N0 = P0 - Eb * A_ / L * float(pre.get("du1", 0.0))
+        elif P0:
+            ex.notes.append(f"{b.label()}: この解析では予張力は使いません（静的構造だけ）")
+        if N0:
+            e_ax = Rm[0]
+            for kk in range(3):
+                addF(dA + kk, N0 * e_ax[kk])
+                if dB is not None:
+                    addF(dB + kk, -N0 * e_ax[kk])
         T12 = np.kron(np.eye(4), Rm)
         kg = T12.T @ kl @ T12
         if dB is None:
@@ -307,7 +327,7 @@ def extra_terms(mesh, bcs, kref: float, acc=None) -> Extra:
         else:
             dofs = np.r_[dA + np.arange(6), dB + np.arange(6)]
             ex.add_block(dofs, dofs, kg)
-        ex.beams[i] = {"dA": dA, "dB": dB, "T": T12, "k": kl, "L": L, "radius": rad, "A": A_, "I": I_}
+        ex.beams[i] = {"dA": dA, "dB": dB, "T": T12, "k": kl, "L": L, "radius": rad, "A": A_, "I": I_, "N0": N0}
         ex.notes.append(f"{b.label()}: 長さ {L:.4g} mm、半径 {rad:g} mm" + ("（地面と接続）" if ground else ""))
 
     def cyclic(i, b):
@@ -507,7 +527,7 @@ def beam_results(ex: Extra, u: np.ndarray) -> dict:
         if bd["dB"] is not None:
             ue[6:] = u[bd["dB"]:bd["dB"] + 6]
         f = bd["k"] @ (bd["T"] @ ue)              # 局所の節点力（端 A: 0-5、端 B: 6-11）
-        N = float(f[6])                           # 軸力（引張 正）
+        N = float(f[6]) + bd.get("N0", 0.0)       # 軸力（引張 正。予張力の分を含む）
         V = float(np.hypot(f[7], f[8]))
         Mt = float(f[9])
         Ma, Mb = float(np.hypot(f[4], f[5])), float(np.hypot(f[10], f[11]))

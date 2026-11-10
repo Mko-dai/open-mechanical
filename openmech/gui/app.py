@@ -139,7 +139,8 @@ BC_SPEC = {
     "joint": ([], {"point"}),
     "submodel": ([], set()),
     "cyclic": ([], {"point"}),
-    "beam": ([("半径（丸棒）", "mm", 3.0, False), ("ヤング率", "MPa", 200000.0, False), ("ポアソン比", "", 0.3, False)],
+    "beam": ([("半径（丸棒）", "mm", 3.0, False), ("ヤング率", "MPa", 200000.0, False), ("ポアソン比", "", 0.3, False),
+              ("予張力（0 = なし）", "N", 0.0, False)],
              {"behavior"}),
 }
 NO_FACE_KINDS = ("gravity", "thermal", "heat_generation", "bolt_pretension")
@@ -3902,7 +3903,8 @@ class MainWindow(QMainWindow):
                                         self._later(self.build_details)))
             self._row(sec, "相手側の面", b2)
         self._row(sec, "", "2 つの面（の重心）を丸棒のはり 1 本でつなぎます（Ansys の Beam 接続）。ボルト・ピン・スポット溶接の"
-                           "簡易モデルに使います。挙動「剛体」は面を剛体として、「変形可」は面を硬くせずに結びます。")
+                           "簡易モデルに使います。挙動「剛体」は面を剛体として、「変形可」は面を硬くせずに結びます。"
+                           "予張力を入れると 2 ステップで解きます（1: 予張力だけ、2: 長さを固定して外力。Ansys のボルト予張力と同じ）")
         r = self.result
         br = getattr(r, "beams", {}).get(i) if r is not None else None
         if br:
@@ -4636,7 +4638,9 @@ class MainWindow(QMainWindow):
         if bad_c:
             QMessageBox.warning(self, "接触", "面が割り当てられていない接触領域があります: " + ", ".join(bad_c))
             return
+        from ..bolt import has_beam_pretension
         if (p.analysis_type in EXTRA_TYPES or any(b.kind == "bolt_pretension" for b in p.bcs)
+                or (p.analysis_type == "static" and has_beam_pretension(p.bcs))
                 or (p.analysis_type == "static" and (p.analysis_opts or {}).get("thermal_import"))):
             self._busy(True, f"{self._analysis_label()}を実行しています…")
             self.worker = Worker(p.run_all, self.mesh)
