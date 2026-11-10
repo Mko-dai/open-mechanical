@@ -344,3 +344,25 @@ def test_finite_sliding_on_curved_surface():
     assert f1 == pytest.approx(f0, rel=0.02)
     assert d1 - d0 == pytest.approx(rot, abs=0.5)
     assert c1 - c0 == pytest.approx(rot, abs=0.5)
+
+
+def test_arc_length_with_frictionless_contact():
+    """弧長法＋開閉する接触（摩擦なし）: 押しつけとモーメントで片側が浮く問題。
+    荷重係数 1 の点が、ふつうの静解析（荷重制御）と同じ答えになる"""
+    m, cs = blocks()
+    for c in cs:
+        c.type, c.formulation = "frictionless", "penalty"
+    top = face(m, 2, 20, 1)
+    bcs = _press_bcs(m, 10.0) + [BC("moment", [top], [0.0, 3.0e5, 0.0])]
+    ref = solve_static(m, S, bcs, cs, **quiet)[-1]
+    m2, cs2 = blocks()
+    for c in cs2:
+        c.type, c.formulation = "frictionless", "penalty"
+    st = AnalysisSettings(arc_length=True, arc_initial=0.25, arc_max_load=1.0, arc_max_steps=40)
+    rs = solve_static(m2, S, bcs, cs2, settings=st, **quiet)
+    assert rs[-1].time == pytest.approx(1.0, rel=2e-3)
+    pr, pa = ref.contact["接触圧 [MPa]"], rs[-1].contact["接触圧 [MPa]"]
+    ok = np.isfinite(pr)
+    assert np.sum(pr[ok] == 0.0) >= 3 and np.nanmax(pr) > 15.0          # 片側が浮いて、反対側に圧力が寄っている
+    assert np.abs(rs[-1].u - ref.u).max() < 0.02 * np.abs(ref.u).max()
+    assert np.abs(pa[ok] - pr[ok]).max() < 0.03 * np.nanmax(pr)

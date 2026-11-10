@@ -766,9 +766,10 @@ def _arc_length(c):
     s, log, mesh = c["settings"], c["log"], c["mesh"]
     ends, free, nb, ndof = c["ends"], c["free"], c["nb"], c["ndof"]
     pairs, contacts, ps, LD, W = c["pairs"], c["contacts"], c["ps"], c["LD"], c["W"]
-    if c["ex"] is not None or any(k.nonlinear for k in contacts):
-        raise ValueError("弧長法は、リモート境界条件・ジョイント・非線形の接触（摩擦なし・摩擦ありなど）とは"
-                         "まだ組み合わせられません（結合・分離なしの接触は使えます）")
+    if c["ex"] is not None:
+        raise ValueError("弧長法は、リモート境界条件・ジョイント・ビーム接続とはまだ組み合わせられません")
+    nlc = bool(pairs) and any(k.nonlinear for k in contacts)      # 開閉・摩擦のある接触: 反復ごとに状態を更新する
+    pen_tol, save_st, load_st = c["pen_tol"], c["save_pair_state"], c["load_pair_state"]
     c["cur_t"][0] = ends[-1]
     Fref, fixed = c["loads_at"](ends[-1])
     if any(abs(v) > 0 for v in fixed.values()):
@@ -781,7 +782,10 @@ def _arc_length(c):
     def resid(u, lam):
         fint, Kt = internal(u)
         R = lam * Fref - fint
-        if Kc is not None:
+        if nlc:
+            Kn, fn_ = c["_contact"](u)
+            R, Kt = R + fn_ - Kn @ u, Kt + Kn
+        elif Kc is not None:
             R, Kt = R + fc - Kc @ u, Kt + Kc
         if W is not None:
             R, Kt = R - W @ u, Kt + W
@@ -812,13 +816,17 @@ def _arc_length(c):
         sgn = 1.0 if du_prev is None else (1.0 if float(du_prev @ dut) >= 0 else -1.0)
         ok, it = False, 0
         land = 0
+        st0 = save_st() if nlc else None
         for _attempt in range(16):
             ok = False
             Du, Dl = sgn * dl / nt * dut, sgn * dl / nt
+            if nlc:
+                load_st(st0)
             for it in range(1, s.max_iterations + 1):
+                nchg = update_states(pairs, contacts, (u + Du)[:nb], al_update=False, pen_tol=pen_tol)[0] if nlc else 0
                 Rk, Ktk = resid(u + Du, lam + Dl)
                 ref = max(max(abs(lam + Dl), lam_peak) * fn, 1e-2)
-                if it > 1 and np.linalg.norm(Rk[free]) <= s.force_convergence * ref:
+                if it > 1 and nchg == 0 and np.linalg.norm(Rk[free]) <= s.force_convergence * ref:
                     ok = True
                     break
                 sol = solver(Ktk)
@@ -853,6 +861,8 @@ def _arc_length(c):
             raise err
         u, lam, du_prev = u + Du, lam + Dl, Du
         lam_peak = max(lam_peak, abs(lam))
+        if nlc:
+            commit_states(pairs, contacts, u[:nb])
         if ps is not None:
             ps.internal(u[:nb], c["th_factor"](ends[-1]), large=LD)
             ps.commit()
