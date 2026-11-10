@@ -322,6 +322,11 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
     set_threads(settings.n_cores)
     # 接触の剛性で条件が悪くなるため、非線形では既定で直接法
     method = "direct" if settings.solver_type == "auto" else settings.solver_type
+    if settings.solver_type == "auto" and not pairs and ex is None and not hyper:
+        # 接触も多点拘束も無ければ係数行列は素直なので、大きなモデルは反復法（AMG）に任せる
+        method = "auto"
+    _fi = np.nonzero(free)[0]
+    amg_coords = np.column_stack([mesh.nodes[np.minimum(_fi // 3, mesh.n_nodes - 1)], _fi % 3])
 
     cur_t = [0.0]
 
@@ -527,7 +532,8 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
                 with np.errstate(all="ignore"):
                     # 摩擦ですべっている節点があると接線が非対称になるので、LU 分解で解く
                     nonsym = any(p.nonsym for p in pairs)
-                    du_f = _linear_solve(Kff, Rf, lambda *a: None, method="superlu" if nonsym else method)
+                    du_f = _linear_solve(Kff, Rf, lambda *a: None, method="superlu" if nonsym else method,
+                                         coords=amg_coords if method == "auto" else None)
                 Rf_lin, du_lin = Rf, du_f
             if not np.all(np.isfinite(du_f)):
                 raise RuntimeError("剛性マトリクスが特異です。拘束が不足しているか、接触だけで支えられている"
