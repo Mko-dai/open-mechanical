@@ -74,6 +74,7 @@ def run_extra(project, mesh, em, log=print, progress=None):
     if t == "modal" and any(b.kind == "cyclic" for b in p.bcs) and o.get("cyclic_harmonics", "all") != "0":
         # 周期対称: 調和指数ごとに解く（"all" = 0〜N/2、または "0,1,2" のような指定）
         from .cyclic import solve_cyclic_modal
+        p.require_connected(mesh, "周期対称のモーダル")
         h = o.get("cyclic_harmonics", "all")
         hs = "all" if h in ("all", "", None) else [int(x) for x in str(h).replace("、", ",").split(",") if x.strip()]
         mr = solve_cyclic_modal(mesh, mat, p.bcs, n_modes=int(o.get("n_modes", 6)), harmonics=hs, elem_materials=em,
@@ -163,6 +164,7 @@ def run_extra(project, mesh, em, log=print, progress=None):
         return [_field_result(mesh, mat, r.fields(), r.info)]
     if t == "piezo":
         from .electric import solve_piezo_static
+        p.require_connected(mesh, "圧電解析")
         r, _ = solve_piezo_static(mesh, mat, p.bcs, elem_materials=em, log=log)
         return [r]
     # 静的構造（ボルト予張力・熱解析の温度の取り込み）

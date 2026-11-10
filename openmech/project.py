@@ -254,6 +254,12 @@ class Project:
                     or s.arc_length
                     or any(b.step_factors for b in self.bcs))
 
+    def require_connected(self, mesh, what):
+        """接触を扱えない解析で、節点を共有していないボディがあるときは、黙ってバラバラに解かずにエラーにする"""
+        if getattr(mesh, "node_origin", None) is not None and len(np.unique(mesh.node_origin)) < mesh.n_nodes:
+            raise ValueError(f"{what}は、ボディ間の接触にまだ対応していません。ボディどうしがつながらずに計算されてしまうため、"
+                             "［モデル］タブの「共有方法」を「すべて」にする（節点共有）か、ボディを結合してから実行してください。")
+
     def ensure_contacts(self, mesh):
         """節点を共有していないボディがあって接触が未設定なら、自動検出する（静解析と同じ）"""
         if getattr(mesh, "is_shell", False) or getattr(mesh, "is_2d", False) or getattr(mesh, "is_mixed", False):
@@ -307,6 +313,7 @@ class Project:
         ds = DynamicSettings.from_dict(self.dynamic)
         em = em if em is not None else self.elem_materials(mesh)
         if not self.transient_nonlinear(mesh):
+            self.require_connected(mesh, "過渡構造の陽解法（および剛体壁を使う陰解法）")
             return solve_dynamic(mesh, self.material, self.bcs, ds, elem_materials=em, log=log, progress=progress)
         if not self.contacts and mesh.elem_body is not None and len(mesh.body_ids()) > 1:
             from .contact import detect_contacts

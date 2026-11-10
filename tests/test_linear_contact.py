@@ -103,3 +103,13 @@ def test_thermal_contact_conductance():
     left = T[np.isclose(x, 100.0) & (np.arange(m.n_nodes) < m.n_nodes // 2)].mean()
     right = T[np.isclose(x, 100.0) & (np.arange(m.n_nodes) >= m.n_nodes // 2)].mean()
     assert left - right == pytest.approx(q / h, rel=0.02)
+
+
+def test_unsupported_analysis_refuses_disconnected_bodies():
+    """接触を扱えない解析（陽解法など）は、節点を共有していないボディがあるとエラーで知らせる"""
+    m, _one = two_bodies(4)
+    m.node_origin = np.r_[np.arange(m.n_nodes - 5), np.arange(5)]      # 界面で節点を分けたメッシュの印
+    p = project(m, "transient", [BC("fixed", face(m, 0, 0, -1))])
+    p.dynamic = {"method": "explicit", "end_time": 1e-5}
+    with pytest.raises(ValueError, match="節点共有"):
+        p.run_all(m, log=quiet)
