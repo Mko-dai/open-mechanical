@@ -447,6 +447,20 @@ try:
     P(f"OK  組立品: ボディ {am.body_ids().tolist()} / 接触 {len(w.project.contacts)} 領域 / 1 次 {f1:.5g} Hz"
       f"（1 本のはりの式 {fb:.5g}）/ x = 150 の温度 {Tm:.4g} °C（直線なら 25）")
     assert abs(f1 / fb - 1) < 0.05 and abs(Tm - 25.0) < 2.0, "組立品の結果が 1 ボディの値と合いません"
+    # 接触の熱コンダクタンス: 界面で温度が段になる（直列の熱抵抗 L/k + 1/h + L/k）
+    w.project.contacts[0].conductance = 1000.0
+    w.select_node(("contact", 0))
+    app.processEvents()
+    fr = run("組立品の熱（接触コンダクタンス 1000 W/(m²·K)）", "thermal",
+             [BC("temperature", [x_lo], [100.0]), BC("temperature", [x_hi], [0.0])], shot="assembly_conductance")
+    T = fr[-1].extra["温度 [°C]"]
+    at = np.abs(am.nodes[:, 0] - 100.0) < 1e-6
+    q_ = 100.0 / (2 * 0.1 / mt.conductivity + 1 / 1000.0)
+    Th, Tc = 100.0 - q_ * 0.1 / mt.conductivity, q_ * 0.1 / mt.conductivity
+    P(f"OK  接触コンダクタンス: 界面の温度 高い側 {float(T[at].max()):.4g}・低い側 {float(T[at].min()):.4g} °C"
+      f"（式 {Th:.4g}・{Tc:.4g}）")
+    assert abs(T[at].max() - Th) < 1.5 and abs(T[at].min() - Tc) < 1.5, "接触コンダクタンスの温度の段が式と合いません"
+    w.project.contacts[0].conductance = 0.0
     # 陽解法の落下（剛体壁）: 結合接触で 2 つのボディが一体のまま床に当たる
     w._set_analysis_type("transient")
     w.project.dynamic = dict(w.project.dynamic or {}, method="explicit", end_time=1e-4, dt=0.0, n_frames=5,
@@ -469,6 +483,31 @@ try:
     w._set_analysis_type("static")
 except Exception:
     P("NG  組立品\n" + traceback.format_exc())
+# 静水圧: 水槽の壁（幅 40、水深 80）が受ける合力 = ρ g b h² / 2
+try:
+    w.new_project()
+    app.processEvents()
+    w.project.geometry = {"kind": "model", "features": [new_feature("box", dx=10.0, dy=40.0, dz=100.0)]}
+    w.remesh(reset_camera=True)
+    app.processEvents()
+    inf = w.mesh.face_info()
+    wet = max(inf, key=lambda f: f["centroid"][0])["id"]
+    base = min(inf, key=lambda f: f["centroid"][2])["id"]
+    w.project.bcs = [BC("fixed", [base])]
+    w.add_bc("hydrostatic")
+    app.processEvents()
+    hb = w.project.bcs[-1]
+    hb.faces, hb.values = [wet], [1000.0, 9806.65, 80.0]
+    hb.options = dict(hb.options or {}, axis=[0, 0, 1])
+    w.select_node(("bc", len(w.project.bcs) - 1))
+    app.processEvents()
+    fr = run("静水圧（水槽の壁）", "static", list(w.project.bcs), results=["全変形 [mm]", "相当応力 [MPa]"], shot="hydrostatic")
+    Fx = 1000e-12 * 9806.65 * 40.0 * 80.0 ** 2 / 2
+    Rx = float(np.asarray(fr[-1].reactions[0])[0])
+    P(f"OK  静水圧: 支持の反力 X {Rx:.5g} N（式 ρ g b h²/2 = {Fx:.5g}）/ 最大変位 {float(np.abs(fr[-1].u).max()):.3g} mm")
+    assert abs(abs(Rx) / Fx - 1) < 0.02, "静水圧の合力が式と合いません"
+except Exception:
+    P("NG  静水圧\n" + traceback.format_exc())
 # パイプ: 外周（円筒面）の摩擦なし支持＋内圧、回転速度（遠心力）
 try:
     w.new_project()
