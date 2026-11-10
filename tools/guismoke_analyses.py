@@ -152,6 +152,36 @@ except Exception:
 run("応答スペクトル（CQC）", "spectrum", [fix], opts={"n_modes": 10, "spec_method": "cqc", "spec_dir": [0, 0, 1],
                                                "spectrum": [[1, 0.5], [10, 1.0], [100, 1.0], [1000, 0.5]]},
     results=["変位（応答スペクトル） [mm]", "相当応力（応答スペクトル） [MPa]"], shot="spectrum")
+# サブモデル: 粗い結果を保存して、切断境界に与える
+try:
+    import tempfile
+    from PySide6.QtWidgets import QFileDialog
+    cpath = os.path.join(tempfile.mkdtemp(), "coarse.npz")
+    run("サブモデル（粗い全体）", "static", [fix, BC("force", right, [0, 0, -1000.0])], shot="sub_coarse")
+    QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (cpath, ""))
+    w.save_coarse_result()
+    tip0 = float(w.results[-1].u[:, 2].min())
+    sbc = BC("submodel", list(right), [], options={"file": cpath, "offset": [0.0, 0.0, 0.0]})
+    run("サブモデル（切断境界）", "static", [fix, sbc], shot="submodel")
+    w.select_node(("bc", 1))
+    app.processEvents()
+    tip1 = float(w.results[-1].u[:, 2].min())
+    P(f"OK  サブモデル: 先端たわみ 全体 {tip0:.5g} / サブモデル {tip1:.5g} mm")
+except Exception:
+    P("NG  サブモデル\n" + traceback.format_exc())
+# ガスケット接触の詳細
+try:
+    from openmech.contact import ContactRegion
+    w.project.contacts.append(ContactRegion(name="ガスケット", type="gasket", contact_faces=list(top),
+                                            target_faces=list(bot), auto=False))
+    w.rebuild_tree()
+    w.select_node(("contact", len(w.project.contacts) - 1))
+    app.processEvents()
+    P(f"OK  ガスケットの詳細: 表 {w.project.contacts[-1].gasket}")
+    w.project.contacts.pop()
+    w.rebuild_tree()
+except Exception:
+    P("NG  ガスケットの詳細\n" + traceback.format_exc())
 # ジョイント（地面との回転ジョイント＋ねじりばね）
 try:
     jbc = BC("joint", list(fix.faces), [], options={"type": "revolute", "ground": True, "axis": [0, 0, 1],

@@ -42,6 +42,8 @@ def _supports_only(bcs):
     for b in bcs:
         if b.kind == "displacement":
             out.append(BC("displacement", b.faces, [None if v is None else 0.0 for v in b.values], b.name, b.nodes))
+        elif b.kind == "submodel":
+            out.append(BC("fixed", b.faces, [0.0, 0.0, 0.0], b.name, b.nodes))
         elif b.kind in SUPPORT_KINDS:
             out.append(b)
     return out

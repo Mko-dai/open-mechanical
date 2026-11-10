@@ -249,7 +249,7 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
             if bc.kind in ("fixed", "symmetry", "frictionless"):
                 for d in fx:
                     fixed[d] = 0.0
-            elif bc.kind in ("displacement", "remote_displacement"):
+            elif bc.kind in ("displacement", "remote_displacement", "submodel"):
                 for d, v in fx.items():
                     fixed[d] = f * v
                 if bc.kind == "remote_displacement":
@@ -563,7 +563,7 @@ def _make_result(mesh, mats, elem_mat, D, u, bcs, per_bc, F, pairs, contacts, LD
         Rv = Rv + Kc @ u - fc
     reactions = {}
     for i, (bc, (_, fx)) in enumerate(zip(bcs, per_bc)):
-        if bc.kind in ("fixed", "displacement", "symmetry", "frictionless"):
+        if bc.kind in ("fixed", "displacement", "symmetry", "frictionless", "submodel"):
             d = np.fromiter(fx.keys(), dtype=np.int64)
             r = np.zeros(3)
             for c in range(3):

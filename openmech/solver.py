@@ -339,9 +339,10 @@ BC_EXTRA_JP = {"remote_force": "リモート荷重", "remote_displacement": "リ
                "bolt_pretension": "ボルト予張力", "spring": "ばね（ボディ－地面）", "compression_only": "圧縮のみ支持",
                "temperature": "温度", "heat_flux": "熱流束", "heat_flow": "熱流量", "convection": "対流",
                "radiation": "放射", "heat_generation": "内部発熱", "insulation": "断熱",
-               "voltage": "電圧", "charge": "電荷", "ground": "接地", "joint": "ジョイント"}
+               "voltage": "電圧", "charge": "電荷", "ground": "接地", "joint": "ジョイント",
+               "submodel": "サブモデル（切断境界）"}
 SUPPORT_KINDS = ("fixed", "displacement", "symmetry", "frictionless", "remote_displacement", "elastic_support",
-                 "cylindrical_support", "spring", "joint")
+                 "cylindrical_support", "spring", "joint", "submodel")
 
 
 @dataclass
@@ -438,6 +439,14 @@ def build_load_and_constraints(mesh: Mesh, material: Material, bcs: list[BC], rh
                     continue
                 for d in (3 * nodes + c):
                     fixed[int(d)] = float(vals[c])
+        elif bc.kind == "submodel":
+            # サブモデルの切断境界: 粗いモデルの変位を内挿して節点ごとの強制変位にする
+            from .submodel import cut_boundary_values
+            nodes = mesh.face_nodes(bc.faces) if bc.faces else np.asarray(bc.nodes, dtype=np.int64)
+            vals = cut_boundary_values(mesh, bc, nodes)
+            for c in range(3):
+                for d, v in zip(3 * nodes + c, vals[:, c]):
+                    fixed[int(d)] = float(v)
         elif bc.kind == "force":
             nodes, w, _, Atot = face_load_weights(mesh, bc.faces)
             t = np.asarray(bc.values, float) / Atot
@@ -749,7 +758,7 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
     stress, strain = nodal_stress(mesh, u, D, elem_mat=elem_mat, eps_th_m=eps_th_m)
     reactions = {}
     for i, bc in enumerate(bcs):
-        if bc.kind in ("fixed", "displacement", "symmetry", "frictionless"):
+        if bc.kind in ("fixed", "displacement", "symmetry", "frictionless", "submodel"):
             nodes = mesh.face_nodes(bc.faces) if bc.faces else np.asarray(bc.nodes, dtype=np.int64)
             reactions[i] = R[:nb].reshape(-1, 3)[nodes].sum(0)
     reaction_moments = {}

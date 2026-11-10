@@ -70,7 +70,7 @@ BC_COLORS.update({"remote_force": "#c2255c", "remote_displacement": "#b8860b", "
                   "spring": "#5f3dc4", "joint": "#0b7285", "bolt_pretension": "#862e9c", "temperature": "#e03131",
                   "heat_flux": "#f76707", "heat_flow": "#fd7e14", "convection": "#1098ad", "radiation": "#f59f00",
                   "heat_generation": "#c92a2a", "insulation": "#868e96", "voltage": "#1971c2", "ground": "#343a40",
-                  "charge": "#9c36b5", "compression_only": "#2f9e44"})
+                  "charge": "#9c36b5", "compression_only": "#2f9e44", "submodel": "#5c940d"})
 BC_UNIT = {"displacement": "mm", "force": "N", "pressure": "MPa", "moment": "N·mm", "gravity": "mm/s²",
            "thermal": "°C"}
 
@@ -137,10 +137,11 @@ BC_SPEC = {
     "ground": ([], set()),
     "charge": ([("電荷", "C", 1e-9, False)], set()),
     "joint": ([], {"point"}),
+    "submodel": ([], set()),
 }
 NO_FACE_KINDS = ("gravity", "thermal", "heat_generation", "bolt_pretension")
 SUPPORT_LIKE = ("fixed", "displacement", "symmetry", "frictionless", "remote_displacement", "elastic_support",
-                "cylindrical_support", "spring", "joint")
+                "cylindrical_support", "spring", "joint", "submodel")
 RESULT_NAME = {k: v for g in RESULT_GROUPS.values() for k, v in g}
 RESULT_TYPE_JP = {
     "全変形 [mm]": "全変形", "相当応力（ミーゼス） [MPa]": "相当 (von-Mises) 応力",
@@ -569,6 +570,9 @@ class MainWindow(QMainWindow):
         R.button(g, "ベアリング", make_icon(BC_COLORS["bearing_load"], "軸"), lambda: self.add_bc("bearing_load"))
         R.button(g, "ボルト予張力", make_icon(BC_COLORS["bolt_pretension"], "ボ"), lambda: self.add_bc("bolt_pretension"))
         R.button(g, "ジョイント", make_icon(BC_COLORS["joint"], "関"), lambda: self.add_bc("joint"))
+        g = R.add_group(t, "サブモデル")
+        R.button(g, "切断境界", make_icon(BC_COLORS["submodel"], "切"), lambda: self.add_bc("submodel"))
+        R.button(g, "粗い結果を保存", make_icon(BC_COLORS["submodel"], "保"), self.save_coarse_result)
         g = R.add_group(t, "熱")
         R.button(g, "熱荷重", make_icon(BC_COLORS["temperature"], "熱"),
                  menu=self._bc_menu(["temperature", "heat_flux", "heat_flow", "convection", "radiation",
@@ -1104,6 +1108,7 @@ class MainWindow(QMainWindow):
                          ("レポートを作成（HTML）…", self.export_report),
                          ("結果を VTU で書き出す（ParaView）…", self.export_vtu),
                          ("結果を CSV で書き出す…", self.export_csv),
+                         ("サブモデル用に結果を保存（粗いモデル）…", self.save_coarse_result),
                          ("画像を保存…", self.save_screenshot)]:
             a = QAction(text, self)
             a.triggered.connect(fn)
@@ -3779,6 +3784,8 @@ class MainWindow(QMainWindow):
             self._row(sec, "位置 X, Y, Z [mm]" if key == "point" else "地面の点 X, Y, Z [mm]", w)
         if bc.kind == "joint":
             self._details_joint(i, bc, sec)
+        if bc.kind == "submodel":
+            self._details_submodel(i, bc, sec)
         if bc.kind == "bolt_pretension":
             self._row(sec, "ボルトのボディ", self._combo(
                 [(self._body_label(b), int(b)) for b in (self.mesh.body_ids() if self.mesh is not None else [0])],
@@ -3798,6 +3805,60 @@ class MainWindow(QMainWindow):
                  "remote_force": "変形可は面を硬くしない（RBE3）。剛体は面を剛体として結ぶ"}
         if bc.kind in notes:
             self._row(sec, "", notes[bc.kind])
+
+    def _details_submodel(self, i, bc, sec):
+        """サブモデルの切断境界: 粗いモデルの結果ファイルと座標のずれ"""
+        o = bc.options or {}
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        ed = QLineEdit(str(o.get("file", "")))
+        ed.setPlaceholderText("粗いモデルの結果（.npz）")
+        ed.editingFinished.connect(lambda: self._bc_opt(i, "file", ed.text().strip()))
+        btn = QPushButton("参照…")
+
+        def browse():
+            path, _ = QFileDialog.getOpenFileName(self, "粗いモデルの結果", ed.text() or "", "サブモデル用の結果 (*.npz)")
+            if path:
+                ed.setText(path)
+                self._bc_opt(i, "file", path)
+        btn.clicked.connect(browse)
+        h.addWidget(ed)
+        h.addWidget(btn)
+        self._row(sec, "粗いモデルの結果", w)
+        off = list(o.get("offset", [0.0, 0.0, 0.0]))
+        w2 = QWidget()
+        h2 = QHBoxLayout(w2)
+        h2.setContentsMargins(0, 0, 0, 0)
+        sps = []
+        for k in range(3):
+            sp = dspin(float(off[k]), -1e9, 1e9, 4, 1.0)
+            sps.append(sp)
+            h2.addWidget(sp)
+        for sp in sps:
+            sp.valueChanged.connect(lambda *_: self._bc_opt(i, "offset", [x.value() for x in sps]))
+        self._row(sec, "座標のずれ X, Y, Z [mm]", w2)
+        far = getattr(bc, "_submodel_far", None)
+        if far is not None:
+            self._row(sec, "粗いモデルの外への最大距離", f"{far:.3g} mm")
+        self._row(sec, "", "全体モデルを粗く解いて「粗い結果を保存」で .npz に保存し、注目部分だけの細かいモデルの"
+                           "切断面にこの条件を置きます。切断面の節点に粗いモデルの変位を内挿して与えます"
+                           "（Ansys のサブモデリングと同じ）。切断面は応力集中から離れた位置に置いてください。")
+
+    def save_coarse_result(self):
+        """サブモデル用に、今の結果（節点・要素・変位）を保存"""
+        if not self._need_result():
+            return
+        r = self.result
+        if r.mesh.elems.shape[1] not in (4, 10, 6, 15, 8, 20) or getattr(r.mesh, "is_shell", False) \
+                or getattr(r.mesh, "is_2d", False):
+            QMessageBox.information(self, "サブモデル", "ソリッドの結果だけ保存できます。")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "サブモデル用に結果を保存", "coarse.npz", "サブモデル用の結果 (*.npz)")
+        if path:
+            from ..submodel import save_coarse
+            save_coarse(path, r.mesh, r.u)
+            self.log(f"サブモデル用の結果を保存しました: {path}")
 
     def _details_joint(self, i, bc, sec):
         """ジョイントの詳細（Ansys の Joint: 種類・地面かボディか・座標系・自由な方向のばね/荷重/強制変位）"""
@@ -4058,6 +4119,8 @@ class MainWindow(QMainWindow):
             bc.options = {"behavior": "rigid" if kind == "spring" else "deformable"}
         if kind == "bolt_pretension":
             bc.options = {"body": int(self.selected_bodies[0]) if self.selected_bodies else 0}
+        if kind == "submodel":
+            bc.options = {"file": "", "offset": [0.0, 0.0, 0.0]}
         if kind == "joint":
             # 最初に選んでいる面を参照側にする（可動側は詳細の「選択中の面を可動側に」で。なければ地面とのジョイント）
             bc.options = {"type": "revolute", "ground": True, "axis": [0.0, 0.0, 1.0]}
