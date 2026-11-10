@@ -79,23 +79,27 @@ def run_extra(project, mesh, em, log=print, progress=None):
         mr = solve_cyclic_modal(mesh, mat, p.bcs, n_modes=int(o.get("n_modes", 6)), harmonics=hs, elem_materials=em,
                                 log=log, progress=progress)
         return _mode_results(mesh, mat, mr, em)
+    Kc = p.linear_contact_K(mesh, em, log) if t in ("modal", "buckling", "harmonic", "random", "spectrum") else None
     if t == "modal":
         from .modal import solve_modal
         Ks = None
         if o.get("prestress"):
             from .modal import gauss_stress_fn, stress_stiffness
-            st = solve(mesh, mat, p.bcs, log=log, elem_materials=em)
+            st = p.static_result(mesh, em, log)
             mats, eidx = em if em is not None else ([mat], np.zeros(mesh.n_elems, int))
             D = np.stack([material_D(m) for m in mats])
             Ks = stress_stiffness(mesh, gauss_stress_fn(mesh, st.u.ravel(), D, np.asarray(eidx)))
             log("プリストレス付きモーダル: 静解析の応力による剛性を含めます")
+        if Kc is not None:
+            Ks = Kc if Ks is None else Ks + Kc
         mr = solve_modal(mesh, mat, p.bcs, n_modes=int(o.get("n_modes", 6)), f_min=float(o.get("f_min", 0.0)),
                          elem_materials=em, log=log, progress=progress, K_sigma=Ks)
         return _mode_results(mesh, mat, mr, em)
     if t == "buckling":
         from .modal import solve_buckling
         mr = solve_buckling(mesh, mat, p.bcs, n_modes=int(o.get("n_buckling", 3)), elem_materials=em, log=log,
-                            progress=progress)
+                            progress=progress, K_add=Kc,
+                            static=p.static_result(mesh, em, log) if Kc is not None else None)
         out = [mr.prestress] + _mode_results(mesh, mat, mr, em)
         mr.prestress.label = "静解析（与えた荷重）"
         mr.prestress.time = 0.0
@@ -103,7 +107,8 @@ def run_extra(project, mesh, em, log=print, progress=None):
     if t == "thermal":
         from .thermal import ThermalSettings, solve_thermal
         res = solve_thermal(mesh, mat, p.bcs, ThermalSettings.from_dict(o.get("thermal", {})), elem_materials=em,
-                            log=log, progress=progress)
+                            log=log, progress=progress, contacts=p.ensure_contacts(mesh),
+                            contact_tolerance=p.contact_tolerance)
         out = []
         for r in res:
             fr = _field_result(mesh, mat, r.fields(), r.info, r.time,
@@ -117,7 +122,7 @@ def run_extra(project, mesh, em, log=print, progress=None):
         from .modal import solve_modal
         from .vibration import solve_harmonic, solve_random, solve_spectrum
         nm = int(o.get("n_modes", 20))
-        mr = solve_modal(mesh, mat, p.bcs, n_modes=nm, elem_materials=em, log=log)
+        mr = solve_modal(mesh, mat, p.bcs, n_modes=nm, elem_materials=em, log=log, K_sigma=Kc)
         if t == "harmonic":
             ba = o.get("base_acc")
             base = np.asarray(ba, float) * G if ba and any(ba) else None
@@ -153,7 +158,8 @@ def run_extra(project, mesh, em, log=print, progress=None):
         return [r]
     if t == "electrostatic":
         from .electric import solve_electrostatic
-        r = solve_electrostatic(mesh, mat, p.bcs, elem_materials=em, log=log)
+        r = solve_electrostatic(mesh, mat, p.bcs, elem_materials=em, log=log, contacts=p.ensure_contacts(mesh),
+                                contact_tolerance=p.contact_tolerance)
         return [_field_result(mesh, mat, r.fields(), r.info)]
     if t == "piezo":
         from .electric import solve_piezo_static
@@ -163,9 +169,17 @@ def run_extra(project, mesh, em, log=print, progress=None):
     if o.get("thermal_import"):
         from .thermal import ThermalSettings, solve_thermal, thermal_stress
         th = solve_thermal(mesh, mat, p.bcs, ThermalSettings.from_dict(o.get("thermal", {})), elem_materials=em,
-                           log=log)
+                           log=log, contacts=p.ensure_contacts(mesh), contact_tolerance=p.contact_tolerance)
         T = th[-1].T
-        r = thermal_stress(mesh, mat, p.bcs, T, elem_materials=em, log=log)
+        fn = None
+        if p.needs_nonlinear_solver(mesh):
+            from .nonlinear import solve_static
+            p.ensure_contacts(mesh)
+
+            def fn(bcs, emm):
+                return solve_static(mesh, mat, bcs, p.contacts, p.settings, elem_materials=emm, log=lambda *a: None,
+                                    contact_tolerance=p.contact_tolerance)[-1]
+        r = thermal_stress(mesh, mat, p.bcs, T, elem_materials=em, log=log, solve_fn=fn)
         r.extra = {"温度 [°C]": T}
         return [r]
     if any(b.kind == "bolt_pretension" for b in p.bcs):

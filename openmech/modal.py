@@ -440,7 +440,7 @@ def gauss_stress_fn(mesh: Mesh, u: np.ndarray, D, elem_mat, eps_th_m=None):
 
 
 def solve_buckling(mesh: Mesh, material: Material, bcs: list[BC], n_modes: int = 3, elem_materials=None,
-                   log=print, progress=None, static: Result | None = None) -> ModalResult:
+                   log=print, progress=None, static: Result | None = None, K_add=None) -> ModalResult:
     """線形座屈（固有値座屈）。静解析（与えた荷重）の応力から K_σ を作り (K + λ K_σ) φ = 0 を解く。
     λ = 座屈荷重係数（与えた荷重の何倍で座屈するか）。Ansys と同じく、正の係数を小さい順に返す"""
     from .solver import material_eps_th, solve
@@ -456,6 +456,8 @@ def solve_buckling(mesh: Mesh, material: Material, bcs: list[BC], n_modes: int =
         eps_th_m = None
     Ks = stress_stiffness(mesh, gauss_stress_fn(mesh, static.u.ravel(), D, elem_mat, eps_th_m))
     K = assemble_stiffness(mesh, D, elem_mat=elem_mat)
+    if K_add is not None:          # 接触（結合など）の剛性
+        K = K + K_add
     free = _free_dofs(mesh, mats[0], bcs, extra_fixed=None)
     # 強制変位で荷重をかけた場合も、座屈では拘束（0）として扱う
     Kff, Ksff = K[free][:, free], Ks[free][:, free]

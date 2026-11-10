@@ -89,7 +89,8 @@ def _nodal_grad(mesh, phi):
     return acc / cnt[:, None], ge
 
 
-def solve_electrostatic(mesh, material, bcs, elem_materials=None, log=print) -> ElectricResult:
+def solve_electrostatic(mesh, material, bcs, elem_materials=None, log=print, contacts=None,
+                        contact_tolerance: float = 0.0) -> ElectricResult:
     t0 = time.time()
     if elem_materials is not None:
         mats, em = elem_materials
@@ -98,6 +99,15 @@ def solve_electrostatic(mesh, material, bcs, elem_materials=None, log=print) -> 
         mats, em = [material], np.zeros(mesh.n_elems, dtype=np.int64)
     eps = _eps_e(mats, em)
     K = _grad_matrix(mesh, eps)
+    if contacts:
+        # 節点を共有していないボディの間は、接触面で電位をつなぐ
+        from .contact import scalar_contact_matrix
+        e_node = np.zeros(mesh.n_nodes)
+        np.maximum.at(e_node, mesh.elems.ravel(), np.repeat(np.asarray(eps, float).reshape(len(em), -1).max(1),
+                                                            mesh.elems.shape[1]))
+        Kc = scalar_contact_matrix(mesh, contacts, mats, em, e_node, contact_tolerance)
+        if Kc is not None:
+            K = K + Kc
     fixed, Q = _voltage_bcs(mesh, [b for b in bcs if b.kind in ELEC_KINDS])
     if not fixed:
         raise ValueError("静電場: 電圧（または接地）の境界条件が必要です")

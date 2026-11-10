@@ -79,6 +79,8 @@ class ContactRegion:
     # {"closure": [mm], "pressure": [MPa], "unload": 除荷の傾き [MPa/mm]（0 = 負荷曲線をたどる）,
     #  "shear": 面内のせん断剛性 [MPa/mm]（0 = 面内は拘束しない）}
     gasket: dict = field(default_factory=dict)
+    # 熱接触コンダクタンス [W/(m²·K)]（0 = プログラム制御: 熱抵抗なしとみなす大きな値）
+    conductance: float = 0.0
     auto: bool = True                   # 自動検出で作られたか
     suppressed: bool = False
 
@@ -858,3 +860,72 @@ def contact_results(pairs: list[Pairs], regions, n_nodes: int) -> dict:
         out["摩擦応力 [MPa]"][s] = tau
         out["隙間 [mm]"][s] = np.where(act, 0.0, np.where(g > 1e29, np.nan, np.maximum(g, 0)))
     return out
+
+
+# ---------------------------------------------------------------------------- 線形の解析での接触
+
+def linear_regions(regions):
+    """線形の解析（モーダル・座屈・調和応答・熱など）での接触の扱い（Ansys と同じ）:
+    結合・分離なしはそのまま、摩擦なしは「分離なし」、粗い・摩擦ありは「結合」として最初の状態で固定する"""
+    import copy
+    out = []
+    for r in regions:
+        if r.suppressed:
+            continue
+        c = copy.copy(r)
+        c.type = {"frictionless": "no_separation", "gasket": "no_separation", "rough": "bonded",
+                  "frictional": "bonded"}.get(r.type, r.type)
+        c.sliding, c.thread = "small", {}
+        if c.formulation == "augmented_lagrange":
+            c.formulation = "auto"
+        out.append(c)
+    return out
+
+
+def node_modulus(mesh, mats, elem_mat):
+    """節点ごとのヤング率（まわりの要素の最大値。法線剛性の目安に使う）"""
+    E = np.zeros(mesh.n_nodes)
+    Ee = np.array([float(m.E) for m in mats])[np.asarray(elem_mat)]
+    np.maximum.at(E, mesh.elems.ravel(), np.repeat(Ee, mesh.elems.shape[1]))
+    return E
+
+
+def linear_contact_stiffness(mesh, regions, mats, elem_mat, tol: float = 0.0):
+    """線形の解析に足す接触の剛性（3N×3N）。 接触領域が無ければ None"""
+    regs = linear_regions(regions)
+    if not regs:
+        return None
+    pairs = build_pairs(mesh, regs, node_modulus(mesh, mats, elem_mat), tol)
+    if not pairs:
+        return None
+    n = 3 * mesh.n_nodes
+    Kc, _fc = contact_system(pairs, regs, n, np.zeros(n))
+    return Kc.tocsr()
+
+
+def scalar_contact_matrix(mesh, regions, mats, elem_mat, coef_of_node, tol: float = 0.0, factor: float = 100.0,
+                          user_scale: float = 0.0):
+    """温度・電位などスカラー場の接触（N×N）: 接触面で値をそろえる（完全な熱接触 = 熱抵抗なし）。
+    面積あたりの係数は factor × 物性値 / 要素サイズ（十分大きく、条件数を壊さない程度）。
+    user_scale > 0（熱解析）のとき、接触領域の conductance [W/(m²·K)] が設定されていればその値 × user_scale を使う"""
+    regs = linear_regions(regions)
+    if not regs:
+        return None
+    E = node_modulus(mesh, mats, elem_mat)
+    pairs = build_pairs(mesh, regs, E, tol)
+    if not pairs:
+        return None
+    N = mesh.n_nodes
+    K = sp.csr_matrix((N, N))
+    for pr in pairs:
+        M = len(pr.slave)
+        rows = np.repeat(np.arange(M), 1 + pr.masters.shape[1])
+        cols = np.column_stack([pr.slave, pr.masters]).ravel()
+        vals = np.column_stack([np.ones(M), -pr.w]).ravel()
+        B = sp.csr_matrix((vals, (rows, cols)), shape=(M, N))
+        user = float(getattr(regs[pr.region], "conductance", 0.0) or 0.0) * user_scale
+        # pr.kn = 係数 × E / h なので、kn / E × 物性値 = 係数 × 物性値 / h
+        h = user if user > 0 else factor * pr.kn0 / np.maximum(E[pr.slave], 1e-300) * coef_of_node[pr.slave] \
+            / (1e3 if regs[pr.region].resolved_formulation() == "mpc" else 10.0)
+        K = K + B.T @ sp.diags(pr.area * h) @ B
+    return K.tocsr()

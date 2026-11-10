@@ -254,6 +254,37 @@ class Project:
                     or s.arc_length
                     or any(b.step_factors for b in self.bcs))
 
+    def ensure_contacts(self, mesh):
+        """節点を共有していないボディがあって接触が未設定なら、自動検出する（静解析と同じ）"""
+        if getattr(mesh, "is_shell", False) or getattr(mesh, "is_2d", False) or getattr(mesh, "is_mixed", False):
+            return []
+        if not self.contacts and mesh.elem_body is not None and len(mesh.body_ids()) > 1:
+            from .contact import detect_contacts
+            self.contacts = detect_contacts(mesh, self.contact_tolerance, self.contact_default_type,
+                                            self.contact_default_mu)
+        return [c for c in self.contacts if not c.suppressed]
+
+    def linear_contact_K(self, mesh, em, log=print):
+        """線形の解析（モーダル・座屈・調和応答など）に足す接触の剛性。 接触が無ければ None"""
+        cs = self.ensure_contacts(mesh)
+        if not cs:
+            return None
+        from .contact import linear_contact_stiffness
+        mats, elem_mat = em if em is not None else ([self.material], np.zeros(mesh.n_elems, np.int64))
+        Kc = linear_contact_stiffness(mesh, cs, mats, elem_mat, self.contact_tolerance)
+        if Kc is not None:
+            log(f"接触: {len(cs)} 領域を線形の接触として含めます（結合・分離なし。摩擦なしは分離なし、摩擦あり・粗いは結合の扱い）")
+        return Kc
+
+    def static_result(self, mesh, em, log=print):
+        """プリストレス・座屈のもとになる静解析（接触などがあれば非線形の解き方）"""
+        if self.needs_nonlinear_solver(mesh):
+            self.ensure_contacts(mesh)
+            return solve_static(mesh, self.material, self.bcs, self.contacts, self.settings, elem_materials=em,
+                                log=log, contact_tolerance=self.contact_tolerance)[-1]
+        from .solver import solve
+        return solve(mesh, self.material, self.bcs, log=log, elem_materials=em)
+
     def transient_nonlinear(self, mesh) -> bool:
         """過渡（陰解法）を非線形の解き方（接触・塑性・大変形・リモート境界条件・六面体など）で解くか"""
         from .dynamics import DynamicSettings

@@ -2679,6 +2679,10 @@ class MainWindow(QMainWindow):
             sd.setSpecialValueText("0（なし）")
             sd.valueChanged.connect(st("stabilization"))
             self._row(s, "安定化減衰係数", sd)
+        tc = dspin(c.conductance, 0.0, 1e12, 3, 100.0, "W/(m²·K)")
+        tc.setSpecialValueText("プログラム制御（熱抵抗なし）")
+        tc.valueChanged.connect(st("conductance"))
+        self._row(s, "熱接触コンダクタンス（熱解析）", tc)
         self._row(s, "ピンボール領域", combo(PINBALL_MODES, c.pinball_mode, "pinball_mode"))
         if c.pinball_mode == "radius":
             pb = dspin(c.pinball, 0.0, 1e6, 3, 0.5, "mm")

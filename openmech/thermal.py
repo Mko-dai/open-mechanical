@@ -223,14 +223,24 @@ def _scalar_solver(A, log):
 
 
 def solve_thermal(mesh: Mesh, material, bcs: list[BC], settings: ThermalSettings | None = None,
-                  elem_materials=None, log=print, progress=None) -> list[ThermalResult]:
-    """定常または過渡の熱解析。結果（過渡なら各ステップ）のリストを返す"""
+                  elem_materials=None, log=print, progress=None, contacts=None,
+                  contact_tolerance: float = 0.0) -> list[ThermalResult]:
+    """定常または過渡の熱解析。結果（過渡なら各ステップ）のリストを返す。
+    contacts（接触領域）を渡すと、節点を共有していないボディの間でも接触面で熱が流れる"""
     t0 = time.time()
     s = settings or ThermalSettings()
     bcs = [b for b in bcs if b.kind in THERMAL_KINDS]
     mats, elem_mat, k_m, rc_m = _mat_lists(mesh, material, elem_materials)
     k_e, rc_e = k_m[elem_mat], rc_m[elem_mat]
     K = conductivity_matrix(mesh, k_e)
+    if contacts:
+        from .contact import scalar_contact_matrix
+        k_node = np.zeros(mesh.n_nodes)
+        np.maximum.at(k_node, mesh.elems.ravel(), np.repeat(k_e, mesh.elems.shape[1]))
+        Kc = scalar_contact_matrix(mesh, contacts, mats, elem_mat, k_node, contact_tolerance, user_scale=1e-3)
+        if Kc is not None:
+            K = K + Kc
+            log(f"熱の接触: {len([c for c in contacts if not c.suppressed])} 領域（接触面で温度をつなぎます）")
     fixed, F0, H, rad = _assemble_bcs(mesh, bcs, getattr(mesh, "elem_body", None))
     n = mesh.n_nodes
     if not fixed and H.nnz == 0 and not rad and not s.transient:
@@ -309,7 +319,7 @@ def solve_thermal(mesh: Mesh, material, bcs: list[BC], settings: ThermalSettings
     return out
 
 
-def thermal_stress(mesh, material, bcs, T_nodes, elem_materials=None, log=print, ref_temp=None):
+def thermal_stress(mesh, material, bcs, T_nodes, elem_materials=None, log=print, ref_temp=None, solve_fn=None):
     """熱解析の温度（節点）から熱応力の静解析。要素の温度は節点平均（Ansys の「熱条件（インポート）」と同じ）"""
     from .materials import MaterialState  # noqa: F401
     from .solver import solve
@@ -333,6 +343,8 @@ def thermal_stress(mesh, material, bcs, T_nodes, elem_materials=None, log=print,
         idx[e] = cache[kk]
     log(f"熱応力: 温度の種類 {len(states):,}（{Te.min():.4g} – {Te.max():.4g} °C）")
     sbcs = [b for b in bcs if b.kind not in THERMAL_KINDS and b.kind != "thermal"]
-    r = solve(mesh, material, sbcs, log=log, elem_materials=(states, idx))
+    # solve_fn(bcs, elem_materials): 接触のあるモデルは、呼び出し側が非線形の解き方を渡す
+    r = solve_fn(sbcs, (states, idx)) if solve_fn is not None else \
+        solve(mesh, material, sbcs, log=log, elem_materials=(states, idx))
     r.info["解析"] = "熱応力（熱解析の温度）"
     return r
