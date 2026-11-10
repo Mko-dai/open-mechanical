@@ -447,6 +447,26 @@ try:
     P(f"OK  組立品: ボディ {am.body_ids().tolist()} / 接触 {len(w.project.contacts)} 領域 / 1 次 {f1:.5g} Hz"
       f"（1 本のはりの式 {fb:.5g}）/ x = 150 の温度 {Tm:.4g} °C（直線なら 25）")
     assert abs(f1 / fb - 1) < 0.05 and abs(Tm - 25.0) < 2.0, "組立品の結果が 1 ボディの値と合いません"
+    # 陽解法の落下（剛体壁）: 結合接触で 2 つのボディが一体のまま床に当たる
+    w._set_analysis_type("transient")
+    w.project.dynamic = dict(w.project.dynamic or {}, method="explicit", end_time=1e-4, dt=0.0, n_frames=5,
+                             init_velocity=[0.0, 0.0, -2000.0], large_deflection=False,
+                             wall={"normal": [0, 0, 1], "point": [0, 0, -0.05]})
+    w.project.bcs = []
+    w.invalidate()
+    w.select_node(("analysis",))
+    app.processEvents()
+    fr = w.project.run_all(w.mesh, log=lambda *a: None)
+    w._on_solved(fr)
+    app.processEvents()
+    w.grab().save(os.path.join(out, "assembly_drop.png"))
+    b0 = np.unique(am.elems[am.elem_body == am.body_ids()[0]])
+    b1 = np.unique(am.elems[am.elem_body == am.body_ids()[1]])
+    vz0, vz1 = float(fr[-1].extra["速度 Z [mm/s]"][b0].mean()), float(fr[-1].extra["速度 Z [mm/s]"][b1].mean())
+    P(f"OK  組立品の落下（陽解法・結合接触）: 結果 {len(fr)} 個 / 平均速度 Z ボディ0 {vz0:.4g}・ボディ1 {vz1:.4g} mm/s / "
+      f"最大接触力 {fr[-1].info.get('最大接触力 [N]', 0):.4g} N")
+    assert np.isfinite(vz0) and np.isfinite(vz1) and abs(vz0 - vz1) < 0.2 * 2000.0, "2 つのボディが別々に動いています"
+    w._set_analysis_type("static")
 except Exception:
     P("NG  組立品\n" + traceback.format_exc())
 # パイプ: 外周（円筒面）の摩擦なし支持＋内圧、回転速度（遠心力）

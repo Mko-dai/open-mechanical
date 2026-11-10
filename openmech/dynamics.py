@@ -276,8 +276,13 @@ class ExplicitInternal:
 # ---------------------------------------------------------------------------- 陽解法
 
 def solve_explicit(mesh, material, bcs, settings: DynamicSettings, elem_materials=None, log=print, progress=None,
-                   v0=None, monitor=None):
+                   v0=None, monitor=None, contacts=None, contact_tolerance: float = 0.0):
     """中心差分法（LS-DYNA と同じ陽解法）。集中質量・自動時間増分・質量スケーリング・剛体壁・塑性・大変形
+
+    contacts: ボディ間の接触領域。ペナルティ法（LS-DYNA の SOFT=1 と同じ考え方: 節点の質量と時間増分から
+              剛性を決めるので、時間増分を縮めずに安定）。 接触相手は最初の位置で決めて固定（微小すべり）。
+              結合 = 3 方向を結ぶ、分離なし = 法線方向を結ぶ、摩擦なし = 押し合うときだけ法線方向、
+              粗い = 接触中は接線も結ぶ、摩擦あり = クーロン摩擦。
 
     v0: 節点ごとの初速度 (N,3)（指定すると settings.init_velocity より優先）
     monitor(t, u, v): 時刻歴を記録するたびに呼ぶ（値の辞書を返すと history に加える）
@@ -338,6 +343,79 @@ def solve_explicit(mesh, material, bcs, settings: DynamicSettings, elem_material
         gap0 = (xw - wall["p"]) @ wall["n"]
         wdofs = (3 * wall["nodes"][:, None] + np.arange(3)).ravel()
         mw = m[wall["nodes"]]
+    # ボディ間の接触（ペナルティ）
+    cpairs, ties = [], []
+    creg = [c for c in (contacts or []) if not c.suppressed]
+    if creg:
+        from .contact import build_pairs, node_modulus
+        for pr in build_pairs(mesh, creg, node_modulus(mesh, mats, elem_mat), contact_tolerance):
+            reg = creg[pr.region]
+            mm = np.einsum("ij,ij->i", pr.w, m[pr.masters])
+            meff = m[pr.slave] * mm / np.maximum(m[pr.slave] + mm, 1e-300)
+            if reg.type == "bonded":
+                # 結合: 従属節点の質量と力を相手の節点に移し、加速度を内挿で決める（運動を厳密に結ぶ。ばねを使わない）
+                ties.append((pr.slave, pr.masters, pr.w))
+                continue
+            cpairs.append({"s": pr.slave, "m": pr.masters, "w": pr.w, "n": pr.n, "g0": pr.g0,
+                           "k": 0.2 * meff / dt ** 2, "type": reg.type, "mu": float(reg.mu),
+                           "ref": np.zeros((len(pr.slave), 3)), "on": np.zeros(len(pr.slave), bool)})
+        if ties:
+            tied = np.concatenate([t[0] for t in ties])
+            if len(np.unique(tied)) < len(tied) or np.isin(np.concatenate([t[1].ravel() for t in ties]), tied).any():
+                raise ValueError("陽解法の結合接触: 同じ節点が 2 つの結合に入っています（接触領域の面が重なっていないか確認してください）")
+            m_aug = m.copy()
+            for sl, ms, ww in ties:
+                for j in range(ms.shape[1]):
+                    np.add.at(m_aug, ms[:, j], ww[:, j] * m[sl])
+            minv = 1.0 / np.repeat(m_aug, 3)
+            V0 = v.reshape(-1, 3)
+            for sl, ms, ww in ties:                      # 初速度も結ぶ
+                V0[sl] = np.einsum("ij,ijk->ik", ww, V0[ms])
+        log(f"  接触: {len(creg)} 領域 / ペナルティ {sum(len(c['s']) for c in cpairs):,} 節点・"
+            f"結合 {sum(len(t[0]) for t in ties):,} 節点")
+    cforce = [0.0]
+
+    def contact_force(u):
+        """接触力（全体のベクトル）。 摩擦の基準位置（ref）は呼ぶたびに更新する"""
+        f = np.zeros(ndof)
+        F3 = f.reshape(-1, 3)
+        U = u.reshape(-1, 3)
+        tot = 0.0
+        for c in cpairs:
+            d = U[c["s"]] - np.einsum("ij,ijk->ik", c["w"], U[c["m"]])
+            n, k = c["n"], c["k"]
+            dn = np.einsum("ij,ij->i", d, n)
+            g = c["g0"] + dn
+            typ = c["type"]
+            if typ == "bonded":
+                fs = -k[:, None] * d
+                tot += float(np.abs(k * dn).sum())
+            else:
+                act = np.ones(len(g), bool) if typ == "no_separation" else (g < 0)
+                fn = np.where(act, -k * g, 0.0)                      # 法線方向の力（スレーブを押し戻す向きが正）
+                fs = fn[:, None] * n
+                tot += float(np.abs(fn).sum())
+                if typ in ("rough", "frictional"):
+                    dt_ = d - dn[:, None] * n
+                    new = act & ~c["on"]
+                    c["ref"][new] = dt_[new]                         # 接触し始めた位置を基準にする
+                    ft = -k[:, None] * (dt_ - c["ref"])
+                    if typ == "frictional":
+                        lim = c["mu"] * np.abs(fn)
+                        nt = np.linalg.norm(ft, axis=1)
+                        slip = nt > lim
+                        sc = np.where(slip, lim / np.maximum(nt, 1e-300), 1.0)
+                        ft = ft * sc[:, None]
+                        # すべった分だけ基準を動かす（摩擦力が限界値に張り付く）
+                        c["ref"][slip] = (dt_ + ft / np.maximum(k, 1e-300)[:, None])[slip]
+                    fs = fs + np.where(act[:, None], ft, 0.0)
+                c["on"] = act
+            np.add.at(F3, c["s"], fs)
+            for j in range(c["m"].shape[1]):
+                np.add.at(F3, c["m"][:, j], -c["w"][:, j, None] * fs)
+        cforce[0] = tot
+        return f
+
     aR, bR = s.alpha_damping, s.beta_damping
     # 大変形ではモーメントは面と一緒に回る（フォロワー荷重）: 面の剛体回転を毎ステップ求めて力を回す
     followers = []
@@ -368,14 +446,25 @@ def solve_explicit(mesh, material, bcs, settings: DynamicSettings, elem_material
     def accel(u, v, t):
         ku = inner.force(u) if inner is not None else Kmv(u)
         f = F0 * _ramp(t, s.ramp_time) - ku
+        if cpairs:
+            f += contact_force(u)
         if followers:
             f += follow(u) * _ramp(t, s.ramp_time)
         if aR:
             f -= aR * m3 * v
         if bR and Kmv is not None:
             f -= bR * Kmv(v)
+        if ties:
+            F3 = f.reshape(-1, 3)
+            for sl, ms, ww in ties:
+                for j in range(ms.shape[1]):
+                    np.add.at(F3, ms[:, j], ww[:, j, None] * F3[sl])
         a = f * minv
         a[cd] = 0.0
+        if ties:
+            A3 = a.reshape(-1, 3)
+            for sl, ms, ww in ties:
+                A3[sl] = np.einsum("ij,ijk->ik", ww, A3[ms])
         return a, ku
 
     a, ku = accel(u, v, 0.0)
@@ -418,7 +507,7 @@ def solve_explicit(mesh, material, bcs, settings: DynamicSettings, elem_material
             hist["時間 [s]"].append(t)
             hist["運動エネルギー [mJ]"].append(0.5 * float((m3 * v * v).sum()))
             hist["ひずみエネルギー [mJ]"].append(0.5 * float(u @ ku))   # 塑性・大変形では目安
-            hist["接触力 [N]"].append(imp / max(t - t_rec, dt))
+            hist["接触力 [N]"].append(imp / max(t - t_rec, dt) + cforce[0])
             imp, t_rec = 0.0, t
             hist["最大変位 [mm]"].append(float(np.abs(u).max()))
             if monitor is not None:
@@ -588,11 +677,14 @@ def solve_implicit(mesh, material, bcs, settings: DynamicSettings, elem_material
 
 
 def solve_dynamic(mesh, material, bcs, settings: DynamicSettings, elem_materials=None, log=print, progress=None,
-                  **kw):
+                  contacts=None, contact_tolerance: float = 0.0, **kw):
     if getattr(mesh, "is_shell", False) or getattr(mesh, "is_2d", False):
         raise ValueError("過渡解析は現在ソリッド（四面体）要素に対応しています")
-    f = solve_explicit if settings.method == "explicit" else solve_implicit
-    return f(mesh, material, bcs, settings, elem_materials=elem_materials, log=log, progress=progress, **kw)
+    if settings.method == "explicit":
+        return solve_explicit(mesh, material, bcs, settings, elem_materials=elem_materials, log=log,
+                              progress=progress, contacts=contacts, contact_tolerance=contact_tolerance, **kw)
+    return solve_implicit(mesh, material, bcs, settings, elem_materials=elem_materials, log=log, progress=progress,
+                          **kw)
 
 
 __all__ = ["DynamicSettings", "METHODS", "solve_dynamic", "solve_explicit", "solve_implicit",

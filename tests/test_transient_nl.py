@@ -82,3 +82,61 @@ def test_plastic_transient_leaves_permanent_set():
     assert np.nanmax(rs[-1].extra["相当塑性ひずみ"]) > 1e-4
     el = solve_static(m, S, bcs, dynamic=ds, **quiet)
     assert max(-r.u[:, 2].min() for r in rs) > 1.02 * max(-r.u[:, 2].min() for r in el)
+
+
+def _two_bars():
+    m1 = structured_box(10, 10, 5, 2, 2, 1).to_quadratic()
+    m2 = structured_box(10, 10, 50, 2, 2, 10, origin=(0, 0, 5.002)).to_quadratic()
+    m = Mesh(np.vstack([m1.nodes, m2.nodes]), np.vstack([m1.elems, m2.elems + m1.n_nodes]))
+    m.elem_body = np.r_[np.zeros(m1.n_elems, int), np.ones(m2.n_elems, int)]
+    m.group_faces()
+    return m
+
+
+def test_explicit_contact_bar_impact():
+    """陽解法のボディ間接触（ペナルティ）: 弾性棒が硬いブロックに衝突。 力積 2 m v、はね返りの速さ v、接触力 ρ c v A"""
+    from openmech.dynamics import solve_explicit
+    bar = Material("bar", 200000.0, 0.0, 7850.0, 250.0)
+    wall = Material("wall", 2e7, 0.0, 7850.0 * 100, 250.0)       # 硬くて重い（時間増分を縮めないよう密度も上げる）
+    m = _two_bars()
+    cs = detect_contacts(m, tolerance=0.01)
+    for c in cs:
+        c.type, c.interface = "frictionless", "none"
+    v, L, A = 1000.0, 50.0, 100.0
+    c0 = np.sqrt(200000.0 / 7.85e-9)
+    v0 = np.zeros((m.n_nodes, 3))
+    nb = np.unique(m.elems[m.elem_body == 1])
+    v0[nb, 2] = -v
+    ds = DynamicSettings(method="explicit", end_time=4e-5, n_frames=8)
+    rs = solve_explicit(m, bar, [BC("fixed", face(m, 2, 0, -1))], ds, elem_materials=([wall, bar], m.elem_body),
+                        v0=v0, contacts=cs, contact_tolerance=0.01, **quiet)
+    h = rs[-1].history
+    T, Fc = np.array(h["時間 [s]"]), np.array(h["接触力 [N]"])
+    assert np.trapezoid(Fc, T) == pytest.approx(2 * 7.85e-9 * A * L * v, rel=0.05)
+    assert rs[-1].extra["速度 Z [mm/s]"][nb].mean() == pytest.approx(v, rel=0.05)
+    on = Fc > 0.05 * Fc.max()
+    assert np.median(Fc[on]) == pytest.approx(7.85e-9 * c0 * v * A, rel=0.15)
+    assert rs[-1].u[nb, 2].min() > -0.2            # ブロックを突き抜けていない
+
+
+def test_explicit_bonded_contact_matches_single_body():
+    """陽解法の結合接触: 2 つに分けた棒の先端を引くと、1 本の棒と同じ波が伝わる"""
+    from openmech.dynamics import solve_explicit
+    a = structured_box(10, 10, 30, 2, 2, 6).to_quadratic()
+    b = structured_box(10, 10, 30, 2, 2, 6, origin=(0, 0, 30)).to_quadratic()
+    m = Mesh(np.vstack([a.nodes, b.nodes]), np.vstack([a.elems, b.elems + a.n_nodes]))
+    m.elem_body = np.r_[np.zeros(a.n_elems, int), np.ones(b.n_elems, int)]
+    m.group_faces()
+    one = structured_box(10, 10, 60, 2, 2, 12).to_quadratic()
+    cs = detect_contacts(m)
+    ds = DynamicSettings(method="explicit", end_time=3e-5, n_frames=6)
+    r2 = solve_explicit(m, S, [BC("fixed", face(m, 2, 0, -1)), BC("force", face(m, 2, 60, 1), [0, 0, 1000.0])], ds,
+                        contacts=cs, **quiet)
+    r1 = solve_explicit(one, S, [BC("fixed", face(one, 2, 0, -1)), BC("force", face(one, 2, 60, 1), [0, 0, 1000.0])],
+                        ds, **quiet)
+    for x2, x1 in zip(r2, r1):
+        t2 = x2.u[np.isclose(m.nodes[:, 2], 60.0), 2].mean()
+        t1 = x1.u[np.isclose(one.nodes[:, 2], 60.0), 2].mean()
+        assert t2 == pytest.approx(t1, rel=0.03, abs=2e-5)
+    # 下のボディにも波が伝わっている（つながっていなければ 0 のまま）
+    assert abs(r2[-1].u[np.isclose(m.nodes[:, 2], 15.0), 2].mean()) > 1e-5

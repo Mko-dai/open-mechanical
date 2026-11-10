@@ -318,13 +318,26 @@ class Project:
         ds = DynamicSettings.from_dict(self.dynamic)
         em = em if em is not None else self.elem_materials(mesh)
         if not self.transient_nonlinear(mesh):
-            self.require_connected(mesh, "過渡構造の陽解法（および剛体壁を使う陰解法）")
             from .remote import REMOTE_KINDS
+            what = "過渡構造の陽解法" if ds.method == "explicit" else "剛体壁を使う陰解法"
             bad = [b.label() for b in self.bcs if b.kind in REMOTE_KINDS or b.kind == "submodel"]
             if bad:
-                raise ValueError("過渡構造の陽解法（および剛体壁を使う陰解法）では、次の境界条件にまだ対応していません: "
-                                 + "、".join(bad))
-            return solve_dynamic(mesh, self.material, self.bcs, ds, elem_materials=em, log=log, progress=progress)
+                raise ValueError(f"{what}では、次の境界条件にまだ対応していません: " + "、".join(bad))
+            cs = []
+            if ds.method == "explicit":
+                cs = self.ensure_contacts(mesh)          # 陽解法: ボディ間の接触はペナルティ法で扱う
+                if ds.body_velocity:
+                    kw_v0 = np.tile(np.asarray(ds.init_velocity, float), (mesh.n_nodes, 1))
+                    if mesh.elem_body is not None:
+                        for b_, vb in ds.body_velocity.items():
+                            kw_v0[np.unique(mesh.elems[mesh.elem_body == int(b_)])] = np.asarray(vb, float)
+                    return solve_dynamic(mesh, self.material, self.bcs, ds, elem_materials=em, log=log,
+                                         progress=progress, contacts=cs, contact_tolerance=self.contact_tolerance,
+                                         v0=kw_v0)
+            else:
+                self.require_connected(mesh, what)
+            return solve_dynamic(mesh, self.material, self.bcs, ds, elem_materials=em, log=log, progress=progress,
+                                 contacts=cs, contact_tolerance=self.contact_tolerance)
         if not self.contacts and mesh.elem_body is not None and len(mesh.body_ids()) > 1:
             from .contact import detect_contacts
             self.contacts = detect_contacts(mesh, self.contact_tolerance, self.contact_default_type,

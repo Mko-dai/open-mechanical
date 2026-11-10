@@ -3435,7 +3435,7 @@ class MainWindow(QMainWindow):
                                                                 [v if j == i else float(self._dyn().init_velocity[j])
                                                                  for j in range(3)]))
             self._row(s2, f"初速度 {ax}", w)
-        if not ex and self.mesh is not None and len(self.mesh.body_ids()) > 1:
+        if self.mesh is not None and len(self.mesh.body_ids()) > 1:
             # ボディごとの初速度（衝突の解析用）。空欄 = 上の初速度を使う
             for bid in self.mesh.body_ids():
                 cur = (ds.body_velocity or {}).get(str(int(bid)), (ds.body_velocity or {}).get(int(bid)))
