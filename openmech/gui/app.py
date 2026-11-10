@@ -2542,6 +2542,54 @@ class MainWindow(QMainWindow):
 
     _details_contacts = _details_connections
 
+    GASKET_DEFAULT = {"closure": [0.0, 0.05, 0.1, 0.15], "pressure": [0.0, 5.0, 20.0, 60.0],
+                      "unload": 0.0, "shear": 0.0}
+
+    def _gasket_rows(self, s, i, c):
+        """ガスケット: 閉じ量-面圧の表、除荷の傾き、面内のせん断剛性"""
+        if not c.gasket:
+            c.gasket = dict(self.GASKET_DEFAULT)
+        gk = c.gasket
+
+        def fmt(v):
+            return ", ".join(f"{x:g}" for x in v)
+
+        def set_list(key, ed):
+            def f():
+                try:
+                    vals = [float(x) for x in ed.text().replace("、", ",").split(",") if x.strip()]
+                except ValueError:
+                    QMessageBox.warning(self, "ガスケット", "数値をカンマ区切りで入力してください")
+                    ed.setText(fmt(c.gasket.get(key, [])))
+                    return
+                self._contact_set(i, "gasket", dict(c.gasket, **{key: vals}))
+            return f
+        for key, lab in (("closure", "閉じ量 [mm]（カンマ区切り）"), ("pressure", "面圧 [MPa]（カンマ区切り）")):
+            ed = QLineEdit(fmt(gk.get(key, [])))
+            ed.editingFinished.connect(set_list(key, ed))
+            self._row(s, lab, ed)
+
+        def set_num(key):
+            return lambda v: self._contact_set(i, "gasket", dict(c.gasket, **{key: float(v)}))
+        un = QDoubleSpinBox()
+        un.setRange(0.0, 1e9)
+        un.setDecimals(2)
+        un.setSuffix(" MPa/mm")
+        un.setSpecialValueText("0（負荷曲線をたどる）")
+        un.setValue(float(gk.get("unload", 0.0) or 0.0))
+        un.valueChanged.connect(set_num("unload"))
+        self._row(s, "除荷の傾き", un)
+        sh = QDoubleSpinBox()
+        sh.setRange(0.0, 1e9)
+        sh.setDecimals(2)
+        sh.setSuffix(" MPa/mm")
+        sh.setSpecialValueText("0（面内は拘束しない）")
+        sh.setValue(float(gk.get("shear", 0.0) or 0.0))
+        sh.valueChanged.connect(set_num("shear"))
+        self._row(s, "面内のせん断剛性", sh)
+        self._row(s, "", "ガスケットの圧縮特性（閉じ量 → 面圧）を、2 つの面の間の層として扱います。"
+                         "除荷の傾きを入れると、除荷時はその傾きで戻り、面圧 0 で永久変形が残ります。")
+
     def _details_contact(self):
         i = self.current[1]
         c = self.project.contacts[i]
@@ -2560,6 +2608,8 @@ class MainWindow(QMainWindow):
             mu = dspin(c.mu, 0.0, 10.0, 4, 0.05)
             mu.valueChanged.connect(st("mu", True))
             self._row(s, "摩擦係数", mu)
+        if c.type == "gasket":
+            self._gasket_rows(s, i, c)
         self._row(s, "スコープモード", "自動" if c.auto else "手動")
         self._row(s, "動作", combo(BEHAVIORS, c.behavior, "behavior", False))
         self._row(s, "トリム接触", "プログラム制御")

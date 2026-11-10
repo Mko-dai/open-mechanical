@@ -23,7 +23,7 @@ import numpy as np
 import scipy.sparse as sp
 
 CONTACT_TYPES = {"bonded": "結合", "no_separation": "分離なし", "frictionless": "摩擦なし",
-                 "rough": "粗い", "frictional": "摩擦あり"}
+                 "rough": "粗い", "frictional": "摩擦あり", "gasket": "ガスケット"}
 FORMULATIONS = {"auto": "プログラム制御", "augmented_lagrange": "拡張ラグランジュ法",
                 "penalty": "ペナルティ法", "mpc": "MPC"}
 BEHAVIORS = {"auto": "プログラム制御", "asymmetric": "非対称", "symmetric": "対称"}
@@ -71,6 +71,10 @@ class ContactRegion:
     # ボルトのねじ（Ansys の「幾何補正: ボルトねじ」）: 円筒の接触面を、ねじ山の斜面として扱う
     # {"point": 軸上の点, "axis": 軸の向き, "half_angle": ねじ山の半角 [度]（メートルねじ 30）, "pitch": ピッチ [mm]}
     thread: dict = field(default_factory=dict)
+    # ガスケット（Ansys のガスケット要素と同じ考え方）: 圧縮量（閉じ量）と面圧の表
+    # {"closure": [mm], "pressure": [MPa], "unload": 除荷の傾き [MPa/mm]（0 = 負荷曲線をたどる）,
+    #  "shear": 面内のせん断剛性 [MPa/mm]（0 = 面内は拘束しない）}
+    gasket: dict = field(default_factory=dict)
     auto: bool = True                   # 自動検出で作られたか
     suppressed: bool = False
 
@@ -96,6 +100,8 @@ class ContactRegion:
         return self.type not in LINEAR_TYPES
 
     def resolved_formulation(self):
+        if self.type == "gasket":
+            return "penalty"            # ガスケットは面圧-閉じ量の表そのもの（拡張ラグランジュは使わない）
         if self.formulation != "auto":
             return self.formulation
         return "mpc" if self.type == "bonded" else "augmented_lagrange"
@@ -187,6 +193,49 @@ class Pairs:
     stab: float = 0.0           # 安定化（開いている節点にも入れる弱いばねの係数）
     max_pen: float = 0.0        # 最後の更新での最大貫通量
     Ktan: np.ndarray = None     # (M,3,3) 接線方向の剛性（摩擦: 固着 kt·P、すべり 整合接線）
+    c_max: np.ndarray = None    # ガスケット: 確定した最大閉じ量
+
+
+def gasket_curve(gk: dict):
+    """ガスケットの表（閉じ量, 面圧）を、原点から始まる単調な折れ線にして返す"""
+    c = np.asarray(gk.get("closure", []), float)
+    p = np.asarray(gk.get("pressure", []), float)
+    if len(c) == 0 or len(c) != len(p):
+        raise ValueError("ガスケットの閉じ量と面圧の表を入力してください（同じ個数）")
+    o = np.argsort(c)
+    c, p = c[o], p[o]
+    if c[0] > 0:
+        c, p = np.r_[0.0, c], np.r_[0.0, p]
+    if np.any(np.diff(c) <= 0):
+        raise ValueError("ガスケットの閉じ量が重複しています")
+    return c, p
+
+
+def gasket_pressure(gk: dict, c, c_max=None):
+    """閉じ量 c [mm] での面圧 p と接線剛性 dp/dc（面積あたり）
+
+    表の外は最後の区間の傾きで延長。 除荷（c < これまでの最大閉じ量）は傾き unload の直線で、
+    0 を下回らない（永久変形）。 c ≤ 0 は開いている（p = 0）。
+    """
+    cc, pp = gasket_curve(gk)
+    c = np.asarray(c, float)
+    slopes = np.diff(pp) / np.diff(cc)
+    k = slopes[np.clip(np.searchsorted(cc, c, side="right") - 1, 0, len(slopes) - 1)]
+    p = np.interp(c, cc, pp)
+    hi = c > cc[-1]
+    p = np.where(hi, pp[-1] + slopes[-1] * (c - cc[-1]), p)
+    ku = float(gk.get("unload", 0.0) or 0.0)
+    if ku > 0 and c_max is not None:
+        cm = np.maximum(np.asarray(c_max, float), 0.0)
+        pm = np.where(cm > cc[-1], pp[-1] + slopes[-1] * (cm - cc[-1]), np.interp(cm, cc, pp))
+        unl = c < cm - 1e-15
+        pu = pm - ku * (cm - c)
+        p = np.where(unl, pu, p)
+        k = np.where(unl, ku, k)
+    open_ = p <= 0
+    p = np.where(open_, 0.0, p)
+    k = np.where(open_, 0.0, np.maximum(k, 0.0))
+    return p, k
 
 
 def _closest_on_tri(p, a, b, c):
@@ -299,6 +348,10 @@ def _region_pairs(mesh, reg: ContactRegion, contact_faces, target_faces, E_of_no
     kt = kn.copy() if reg.type in ("bonded", "rough", "frictional") else np.zeros_like(kn)
     if reg.type == "frictional":
         kt = 0.5 * kn
+    if reg.type == "gasket":
+        _p, k0 = gasket_pressure(reg.gasket, np.array([1e-12]))
+        kn = np.full(len(slave), max(float(k0[0]), 1e-12))
+        kt = np.full(len(slave), max(float(reg.gasket.get("shear", 0.0) or 0.0), 0.0))
     M = len(slave)
     pr = Pairs(ridx, slave, masters, best_bc, n, g0, area, kn, kt)
     pr.ctris = None if (reg.thread and reg.thread.get("axis")) else ctris
@@ -310,6 +363,11 @@ def _region_pairs(mesh, reg: ContactRegion, contact_faces, target_faces, E_of_no
     pr.dt_c = np.zeros((M, 3))
     pr.tau_now = np.zeros((M, 3))
     pr.kn0 = kn.copy()
+    if reg.type == "gasket":
+        pr.c_max = np.zeros(M)          # これまでの最大閉じ量（除荷の履歴）
+        pr.active = g0 <= 0             # 最初は表の初期勾配で閉じている（面圧 0 から）
+        p0, _k = gasket_pressure(reg.gasket, np.maximum(-g0, 0.0))
+        pr.lam_n = np.where(pr.active, p0 + kn * g0, 0.0)       # λ - kn g0 = p(初期閉じ量)
     # 貫通許容値（0 = プログラム制御: 解析設定の値 × 要素サイズ）
     if reg.pen_tol_mode == "value" and reg.pen_tol > 0:
         pr.pen_tol = float(reg.pen_tol)
@@ -366,7 +424,7 @@ def pinball_radius(reg: ContactRegion, h_char: float, diag: float, det_tol: floa
         return float(reg.pinball)
     if reg.pinball_mode == "detection":
         return float(det_tol if det_tol > 0 else 0.005 * diag + 1e-9)
-    if reg.type in LINEAR_TYPES:
+    if reg.type in LINEAR_TYPES or reg.type == "gasket":
         return max(4.0 * h_char, 0.02 * diag)
     return max(4.0 * h_char, 1e-9)
 
@@ -426,6 +484,16 @@ def contact_system(pairs: list[Pairs], regions: list[ContactRegion], ndof: int, 
         Kc = Kc + Bn.T @ sp.diags(a_kn) @ Bn
         # 拡張ラグランジュの乗数と初期隙間による力:  A (λ - kn g0) n
         fc += Bn.T @ (pr.area * act * (pr.lam_n - pr.kn * pr.g0))
+        if reg.type == "gasket":
+            if np.any(pr.kt > 0):
+                P = np.eye(3)[None] - n[:, :, None] * n[:, None, :]
+                Kt3 = P * (pr.area * pr.kt)[:, None, None]
+                for c in range(3):
+                    for d in range(3):
+                        coef = Kt3[:, c, d]
+                        if np.any(coef):
+                            Kc = Kc + B[c].T @ sp.diags(coef) @ B[d]
+            continue
         if reg.type in ("bonded", "rough", "frictional"):
             st = (pr.active & pr.stick).astype(float)
             sl = (pr.active & ~pr.stick).astype(float)
@@ -459,6 +527,22 @@ def update_states(pairs: list[Pairs], regions: list[ContactRegion], u: np.ndarra
         dt = d - dn[:, None] * pr.n
         form = reg.resolved_formulation()
         use_al = form == "augmented_lagrange" and al_update
+        if reg.type == "gasket":
+            # 面圧 = 表(閉じ量)。 次の反復は今の点での接線（ニュートン法）: p ≈ p0 + k (c - c0)
+            c = -g
+            p, k = gasket_pressure(reg.gasket, c, pr.c_max)
+            new_active = p > 0
+            changed += int(np.sum(new_active != pr.active))
+            pr.active = new_active
+            kk = np.where(new_active, np.maximum(k, 1e-9 * pr.kn0), pr.kn0)
+            pr.kn = kk
+            pr.lam_n = np.where(new_active, p + kk * g, 0.0)    # λ - kn g = p
+            pr.max_pen = 0.0
+            pr.pressure = p
+            pr.gap = g
+            pr.slide = np.linalg.norm(dt, axis=1)
+            pr.tau = pr.kt * pr.slide
+            continue
         # 法線
         trial = pr.lam_n - pr.kn * g                 # 接触圧の試行値（圧縮 正）
         if reg.type in LINEAR_TYPES:
@@ -536,6 +620,9 @@ def commit_states(pairs: list[Pairs], regions, u: np.ndarray):
     """時間増分が収束したら、摩擦の履歴（摩擦応力と接線変位）を確定する"""
     U = u.reshape(-1, 3)
     for pr in pairs:
+        if regions[pr.region].type == "gasket" and pr.gap is not None:
+            pr.c_max = np.maximum(pr.c_max, -pr.gap)
+            continue
         if regions[pr.region].type != "frictional":
             continue
         d = U[pr.slave] - np.einsum("ij,ijk->ik", pr.w, U[pr.masters])

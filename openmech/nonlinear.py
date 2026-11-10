@@ -330,12 +330,12 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
 
     def save_pair_state():
         return [(p.lam_n.copy(), p.lam_t.copy(), p.active.copy(), p.stick.copy(), p.tau_c.copy(),
-                 p.dt_c.copy()) for p in pairs]
+                 p.dt_c.copy(), p.kn.copy()) for p in pairs]
 
     def load_pair_state(st):
-        for p, (a, b, c, d, e, f) in zip(pairs, st):
+        for p, (a, b, c, d, e, f, g) in zip(pairs, st):
             p.lam_n, p.lam_t, p.active, p.stick = a.copy(), b.copy(), c.copy(), d.copy()
-            p.tau_c, p.dt_c = e.copy(), f.copy()
+            p.tau_c, p.dt_c, p.kn = e.copy(), f.copy(), g.copy()
 
     def _contact(uu):
         Kc, fc = contact_system(pairs, contacts, nb, uu[:nb])

@@ -212,3 +212,40 @@ def test_bolt_thread_lead_angle_gives_torque():
     r = solve_static(m, S, bcs, [reg], AnalysisSettings(initial_substeps=2), **quiet)[-1]
     Ry = abs(r.reactions[2][1])
     assert abs(Ry / (F * np.tan(lam)) - 1) < 0.05
+
+
+def test_gasket_pressure_closure():
+    """ガスケット: 面圧が表どおり（閉じ量から読んだ値 = 加えた圧力）で、閉じ量も表から逆算した値になる"""
+    from openmech.contact import gasket_pressure
+    gk = {"closure": [0.0, 0.05, 0.1, 0.2], "pressure": [0.0, 2.0, 8.0, 30.0]}
+    m, cs = blocks()
+    for c in cs:
+        c.type, c.gasket = "gasket", dict(gk)
+    for P in (5.0, 20.0):
+        r = solve_static(m, S, _press_bcs(m, P), cs, **quiet)[-1]
+        p = r.contact["接触圧 [MPa]"]
+        clo = r.contact["貫通量 [mm]"]
+        assert np.nanmedian(p) == pytest.approx(P, rel=0.01)
+        c_exp = np.interp(P, gk["pressure"], gk["closure"])
+        assert np.nanmedian(clo) == pytest.approx(c_exp, rel=0.02)
+    # 除荷: 傾き unload の直線で戻り、0 で止まる（永久変形）
+    gk["unload"] = 400.0
+    p, k = gasket_pressure(gk, np.array([0.15, 0.12, 0.0]), np.array([0.2, 0.2, 0.2]))
+    assert p[0] == pytest.approx(30 - 400 * 0.05) and k[0] == 400
+    assert p[1] == 0.0 and p[2] == 0.0
+
+
+def test_gasket_load_unload_set():
+    """ガスケットの除荷: 押してから戻すと、除荷の傾きで戻り永久変形が残る"""
+    gk = {"closure": [0.0, 0.1, 0.2], "pressure": [0.0, 5.0, 30.0], "unload": 1000.0}
+    m, cs = blocks()
+    for c in cs:
+        c.type, c.gasket = "gasket", dict(gk)
+    bcs = _press_bcs(m, 1.0)
+    bcs[-1].step_factors = [20.0, 10.0]
+    st = AnalysisSettings(n_steps=2, step_end_times=[1.0, 2.0])
+    rs = solve_static(m, S, bcs, cs, settings=st, **quiet)
+    c1 = np.nanmedian(rs[0].contact["貫通量 [mm]"])
+    c2 = np.nanmedian(rs[-1].contact["貫通量 [mm]"])
+    assert c1 == pytest.approx(0.1 + 0.1 * 15 / 25, rel=0.02)
+    assert c2 == pytest.approx(c1 - 10.0 / 1000.0, rel=0.02)
