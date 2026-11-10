@@ -381,3 +381,24 @@ def test_arc_length_passes_limit_point():
     except RuntimeError:
         w_over = np.inf                                              # 荷重制御では収束しない（飛び移り）
     assert w_over > 2 * w[i]
+
+
+def test_stress_linearization():
+    """応力の線形化: 引張＋曲げを受ける板の厚さ方向の線で、膜 = P/A、曲げ = 6M/(b t²)、ピーク ≈ 0"""
+    from openmech.postproc import linearize_stress
+    L, b, t = 100.0, 20.0, 10.0
+    m = structured_box(L, b, t, 20, 4, 4).to_quadratic()
+    mat = Material("s", 200000.0, 0.0, 7850, 250)
+    Px, Pz = 4000.0, 100.0
+    r = solve(m, mat, [BC("fixed", [0]), BC("force", [1], [Px, 0, Pz])], log=lambda *a: None)
+    x = 50.0
+    lz = linearize_stress(m, r.stress, [x, b / 2, 0.0], [x, b / 2, t])
+    rows = {q["項目"]: q for q in lz["表"]}
+    sm = Px / (b * t)
+    sb = 6 * Pz * (L - x) / (b * t ** 2)
+    assert lz["成分"]["膜"][0] == pytest.approx(sm, rel=0.01)
+    assert abs(lz["成分"]["曲げ"][0]) == pytest.approx(sb, rel=0.02)
+    assert max(rows["膜＋曲げ"]["始点 [MPa]"], rows["膜＋曲げ"]["終点 [MPa]"]) == pytest.approx(sm + sb, rel=0.03)
+    assert max(rows["ピーク"]["始点 [MPa]"], rows["ピーク"]["終点 [MPa]"]) < 0.05 * (sm + sb)
+    with pytest.raises(ValueError):
+        linearize_stress(m, r.stress, [x, b / 2, -5.0], [x, b / 2, t + 5.0])

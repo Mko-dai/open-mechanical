@@ -212,3 +212,45 @@ def path_values(mesh, values, p0, p1, n=101):
                 out[i] = v[el[e, j]]
                 break
     return t * np.linalg.norm(p1 - p0), out
+
+
+def _vm6(s):
+    s = np.asarray(s, float)
+    return float(np.sqrt(0.5 * ((s[0] - s[1]) ** 2 + (s[1] - s[2]) ** 2 + (s[2] - s[0]) ** 2)
+                         + 3 * (s[3] ** 2 + s[4] ** 2 + s[5] ** 2)))
+
+
+def linearize_stress(mesh, stress, p0, p1, n=49):
+    """応力の線形化（Ansys の Linearized Stress。圧力容器の評価などに使う）。
+    板厚を貫く線 p0 → p1 の上の応力を、膜（平均）・曲げ（直線分布）・ピーク（残り）に分ける。
+
+        膜      σm = (1/t) ∫ σ ds
+        曲げ    σb = ±(6/t²) ∫ σ (t/2 − s) ds     （始点で +、終点で −）
+        ピーク  σp = σ − (σm + σb)
+
+    成分（全体座標の 6 成分）ごとに分けてから、相当応力（ミーゼス）にする。
+    戻り値: {"表": [行の辞書], "s": 距離, "全体": 相当応力の分布, "膜": …, "膜＋曲げ": …, "成分": {...}}"""
+    from .submodel import CoarseField
+    p0, p1 = np.asarray(p0, float), np.asarray(p1, float)
+    t = float(np.linalg.norm(p1 - p0))
+    if t <= 0:
+        raise ValueError("応力の線形化: 始点と終点が同じです")
+    n = int(n) | 1
+    sv = np.linspace(0.0, t, n)
+    P = p0[None] + (sv / t)[:, None] * (p1 - p0)[None]
+    cf = CoarseField(mesh.nodes, mesh.elems, np.zeros((mesh.n_nodes, 3)))
+    sig, dist = cf.interpolate(P, field=np.asarray(stress, float))
+    if dist.max() > 0.02 * t + 1e-9:
+        raise ValueError("応力の線形化: 線の一部がモデルの外にあります（始点と終点を板の両面の上に置いてください）")
+    trap = getattr(np, "trapezoid", None) or np.trapz
+    sm = trap(sig, sv, axis=0) / t
+    sb = 6.0 / t ** 2 * trap(sig * (t / 2 - sv)[:, None], sv, axis=0)
+    mb0, mb1 = sm + sb, sm - sb
+    rows = [{"項目": "膜", "始点 [MPa]": _vm6(sm), "終点 [MPa]": _vm6(sm)},
+            {"項目": "曲げ", "始点 [MPa]": _vm6(sb), "終点 [MPa]": _vm6(sb)},
+            {"項目": "膜＋曲げ", "始点 [MPa]": _vm6(mb0), "終点 [MPa]": _vm6(mb1)},
+            {"項目": "ピーク", "始点 [MPa]": _vm6(sig[0] - mb0), "終点 [MPa]": _vm6(sig[-1] - mb1)},
+            {"項目": "全体", "始点 [MPa]": _vm6(sig[0]), "終点 [MPa]": _vm6(sig[-1])}]
+    lin = sm[None] + (1 - 2 * sv / t)[:, None] * sb[None]
+    return {"表": rows, "s": sv, "全体": np.array([_vm6(x) for x in sig]), "膜": np.full(n, _vm6(sm)),
+            "膜＋曲げ": np.array([_vm6(x) for x in lin]), "成分": {"膜": sm, "曲げ": sb}, "厚さ": t}
