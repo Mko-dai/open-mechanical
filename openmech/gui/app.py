@@ -70,7 +70,7 @@ BC_COLORS.update({"remote_force": "#c2255c", "remote_displacement": "#b8860b", "
                   "spring": "#5f3dc4", "joint": "#0b7285", "bolt_pretension": "#862e9c", "temperature": "#e03131",
                   "heat_flux": "#f76707", "heat_flow": "#fd7e14", "convection": "#1098ad", "radiation": "#f59f00",
                   "heat_generation": "#c92a2a", "insulation": "#868e96", "voltage": "#1971c2", "ground": "#343a40",
-                  "charge": "#9c36b5", "compression_only": "#2f9e44", "submodel": "#5c940d", "cyclic": "#0c8599", "beam": "#6741d9"})
+                  "charge": "#9c36b5", "compression_only": "#2f9e44", "submodel": "#5c940d", "cyclic": "#0c8599", "beam": "#6741d9", "rotation": "#d9480f"})
 BC_UNIT = {"displacement": "mm", "force": "N", "pressure": "MPa", "moment": "N·mm", "gravity": "mm/s²",
            "thermal": "°C"}
 
@@ -139,11 +139,12 @@ BC_SPEC = {
     "joint": ([], {"point"}),
     "submodel": ([], set()),
     "cyclic": ([], {"point"}),
+    "rotation": ([("回転速度", "rad/s", 100.0, False)], {"point"}),
     "beam": ([("半径（丸棒）", "mm", 3.0, False), ("ヤング率", "MPa", 200000.0, False), ("ポアソン比", "", 0.3, False),
               ("予張力（0 = なし）", "N", 0.0, False)],
              {"behavior"}),
 }
-NO_FACE_KINDS = ("gravity", "thermal", "heat_generation", "bolt_pretension")
+NO_FACE_KINDS = ("gravity", "thermal", "heat_generation", "bolt_pretension", "rotation")
 SUPPORT_LIKE = ("fixed", "displacement", "symmetry", "frictionless", "remote_displacement", "elastic_support",
                 "cylindrical_support", "spring", "joint", "submodel", "cyclic", "beam")
 RESULT_NAME = {k: v for g in RESULT_GROUPS.values() for k, v in g}
@@ -500,7 +501,7 @@ class MainWindow(QMainWindow):
         g = R.add_group(t, "挿入")
         R.button(g, "支持", make_icon(BC_COLORS["fixed"], "支"), menu=self._bc_menu(["fixed", "displacement", "frictionless", "symmetry"]))
         R.button(g, "荷重", make_icon(BC_COLORS["force"], "荷"),
-                 menu=self._bc_menu(["force", "pressure", "moment", "gravity", "thermal"]))
+                 menu=self._bc_menu(["force", "pressure", "moment", "gravity", "rotation", "thermal"]))
         g = R.add_group(t, "出力")
         R.button(g, "レポート", make_icon("#7a5cc2", "報"), self.export_report)
         R.button(g, "VTU", make_icon("#7a5cc2", "V"), self.export_vtu)
@@ -562,7 +563,7 @@ class MainWindow(QMainWindow):
         t = R.add_tab("環境")
         g = R.add_group(t, "静的構造")
         R.button(g, "荷重", make_icon(BC_COLORS["force"], "荷"),
-                 menu=self._bc_menu(["force", "pressure", "moment", "gravity", "thermal"]))
+                 menu=self._bc_menu(["force", "pressure", "moment", "gravity", "rotation", "thermal"]))
         R.button(g, "支持", make_icon(BC_COLORS["fixed"], "支"), menu=self._bc_menu(["fixed", "displacement", "frictionless", "symmetry"]))
         for k in ["fixed", "displacement", "frictionless", "symmetry", "force", "pressure", "moment", "gravity", "thermal"]:
             R.button(g, BC_JP[k], make_icon(BC_COLORS[k], BC_JP[k][0]), lambda _=False, k=k: self.add_bc(k))
@@ -3863,6 +3864,15 @@ class MainWindow(QMainWindow):
             self._details_cyclic(i, bc, sec)
         if bc.kind == "beam":
             self._details_beam(i, bc, sec)
+        if bc.kind == "rotation":
+            cur = list((bc.options or {}).get("axis") or [0, 0, 1])
+            self._row(sec, "回転軸の向き", self._combo([("X", 0), ("Y", 1), ("Z", 2)], int(np.argmax(np.abs(cur))),
+                                              lambda v: self._bc_opt(i, "axis", [1.0 if j == int(v) else 0.0
+                                                                                  for j in range(3)])))
+            rpm = float(bc.values[0] or 0.0) * 60 / (2 * np.pi) if bc.values else 0.0
+            self._row(sec, "回転数（参考）", f"{rpm:,.5g} rpm")
+            self._row(sec, "", "モデル全体に遠心力 ρ ω² r をかけます（Ansys の回転速度）。「位置」は回転軸上の点です。"
+                               "1 rpm = 0.10472 rad/s")
         if bc.kind == "bolt_pretension":
             self._row(sec, "ボルトのボディ", self._combo(
                 [(self._body_label(b), int(b)) for b in (self.mesh.body_ids() if self.mesh is not None else [0])],
@@ -4254,6 +4264,9 @@ class MainWindow(QMainWindow):
             bc.options = {"body": int(self.selected_bodies[0]) if self.selected_bodies else 0}
         if kind == "submodel":
             bc.options = {"file": "", "offset": [0.0, 0.0, 0.0]}
+        if kind == "rotation":
+            bc.options = {"axis": [0.0, 0.0, 1.0]}
+            bc.point = [0.0, 0.0, 0.0]
         if kind == "cyclic":
             bc.options = {"high_faces": [], "sectors": 12, "axis": [0.0, 0.0, 1.0]}
             bc.point = [0.0, 0.0, 0.0]

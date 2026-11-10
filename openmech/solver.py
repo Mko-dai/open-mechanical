@@ -340,7 +340,8 @@ BC_EXTRA_JP = {"remote_force": "リモート荷重", "remote_displacement": "リ
                "temperature": "温度", "heat_flux": "熱流束", "heat_flow": "熱流量", "convection": "対流",
                "radiation": "放射", "heat_generation": "内部発熱", "insulation": "断熱",
                "voltage": "電圧", "charge": "電荷", "ground": "接地", "joint": "ジョイント",
-               "submodel": "サブモデル（切断境界）", "cyclic": "周期対称", "beam": "ビーム接続"}
+               "submodel": "サブモデル（切断境界）", "cyclic": "周期対称", "beam": "ビーム接続",
+               "rotation": "回転速度（遠心力）"}
 SUPPORT_KINDS = ("fixed", "displacement", "symmetry", "frictionless", "remote_displacement", "elastic_support",
                  "cylindrical_support", "spring", "joint", "submodel", "cyclic", "beam")
 
@@ -497,6 +498,20 @@ def build_load_and_constraints(mesh: Mesh, material: Material, bcs: list[BC], rh
             f = wi[:, None] * np.cross(omega, r)
             for c in range(3):
                 F[3 * idx + c] += f[:, c]
+        elif bc.kind == "rotation":
+            # 回転速度（Ansys の Rotational Velocity）: 遠心力 ρ ω² r（軸からの距離の向き）。
+            # 節点の加速度 ω² r_⊥ は座標の 1 次式なので、整合質量を掛けると等価節点力が正確に出る
+            from .dynamics import consistent_mass
+            w = float(bc.values[0]) if bc.values else 0.0
+            a = np.asarray((bc.options or {}).get("axis", [0.0, 0.0, 1.0]), float)
+            a = a / max(np.linalg.norm(a), 1e-300)
+            p0 = np.asarray(bc.point if len(bc.point) == 3 else [0.0, 0.0, 0.0], float)
+            x = mesh.nodes - p0
+            rp = x - np.outer(x @ a, a)
+            rho = rho_e if rho_e is not None else np.full(mesh.n_elems, material.density_t_mm3)
+            if bc.bodies and mesh.elem_body is not None:
+                rho = np.where(np.isin(mesh.elem_body, [int(b) for b in bc.bodies]), rho, 0.0)
+            F += consistent_mass(mesh, rho) @ (w * w * rp).ravel()
         elif bc.kind == "thermal" or bc.kind in BC_EXTRA_JP:
             pass   # 熱条件は材料として、リモート・ばね・円筒支持などは remote.py で扱う
         elif bc.kind == "gravity":

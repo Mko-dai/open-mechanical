@@ -74,3 +74,27 @@ def test_modal_with_oblique_symmetry():
                     **quiet).freqs
     # 3 面を垂直方向に止めた棒の 1 次（軸方向の伸び縮み、片側固定・片側自由）: f = c / (4 L)
     assert f[0] == pytest.approx(np.sqrt(200000.0 / 7.85e-9) / (4 * 40.0), rel=0.03)
+
+
+def test_rotational_velocity_thin_ring():
+    """回転する薄いリング: 周方向の応力 σ = ρ ω² r²、半径の増加 = ρ ω² r³ / E"""
+    a, t, w = 100.0, 2.0, 500.0
+    bx = structured_box(t, 1.0, t, 1, 24, 1).to_quadratic()
+    r, th = a - t / 2 + bx.nodes[:, 0], np.radians(90.0 * bx.nodes[:, 1])
+    m = Mesh(np.c_[r * np.cos(th), r * np.sin(th), bx.nodes[:, 2]], bx.elems)
+    m.group_faces()
+
+    def faces(test):
+        return [f["id"] for f in m.face_info() if test(m.nodes[m.face_nodes(f["id"])])]
+    x0 = faces(lambda X: np.allclose(X[:, 0], 0, atol=1e-6))
+    y0 = faces(lambda X: np.allclose(X[:, 1], 0, atol=1e-6))
+    z0 = faces(lambda X: np.allclose(X[:, 2], 0, atol=1e-6))
+    res = solve(m, S, [BC("symmetry", x0 + y0), BC("frictionless", z0),
+                       BC("rotation", [], [w], point=[0, 0, 0], options={"axis": [0, 0, 1]})], **quiet)
+    R = np.hypot(m.nodes[:, 0], m.nodes[:, 1])
+    ur = (res.u[:, 0] * m.nodes[:, 0] + res.u[:, 1] * m.nodes[:, 1]) / R
+    rho = 7.85e-9
+    assert ur.mean() == pytest.approx(rho * w ** 2 * a ** 3 / 200000.0, rel=0.01)
+    c, s_ = m.nodes[:, 0] / R, m.nodes[:, 1] / R
+    sig_t = res.stress[:, 0] * s_ ** 2 + res.stress[:, 1] * c ** 2 - 2 * res.stress[:, 3] * s_ * c
+    assert np.median(sig_t) == pytest.approx(rho * w ** 2 * a ** 2, rel=0.01)
