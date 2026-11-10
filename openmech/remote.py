@@ -15,7 +15,7 @@ import scipy.sparse as sp
 from .surface import surface_sets
 
 REMOTE_KINDS = ("cyclic", "remote_force", "remote_displacement", "point_mass", "elastic_support", "cylindrical_support",
-                "bearing_load", "spring", "joint")
+                "bearing_load", "spring", "joint", "beam")
 # ジョイント（Ansys の Joint と同じ種類）: 局所座標の自由な自由度（0-2 並進 x,y,z、3-5 回転 x,y,z。z が軸）
 JOINT_FREE = {"fixed": [], "revolute": [5], "cylindrical": [2, 5], "translational": [0], "slot": [0, 3, 4, 5],
               "universal": [3, 5], "spherical": [3, 4, 5], "planar": [0, 1, 5], "general": None}
@@ -44,6 +44,7 @@ class Extra:
     F_by: dict = field(default_factory=dict)       # 境界条件の番号 → {dof: 力}（非線形のステップ倍率用）
     fixed_by: dict = field(default_factory=dict)   # 境界条件の番号 → {dof: 値}
     joints: dict = field(default_factory=dict)     # 境界条件の番号 → ジョイントの情報（結果の集計用）
+    beams: dict = field(default_factory=dict)      # 境界条件の番号 → ビーム接続の情報（断面力の計算用）
 
     def Fvec_of(self, i):
         F = np.zeros(self.n)
@@ -262,6 +263,53 @@ def extra_terms(mesh, bcs, kref: float, acc=None) -> Extra:
             ex.notes.append(f"{b.label()}: 地面との固定ジョイント（固定支持と同じ）")
         ex.joints[i] = {"type": jt, "free": free, "E": E, "point": p, "nodes_b": nodes, "dof": dj, "ground": ground}
 
+    def beam(i, b):
+        """ビーム接続（Ansys の Connections → Beam）: 2 つの面（または面と地面の点）を、丸棒のはり要素 1 本でつなぐ。
+        ボルト・ピン・スポット溶接の簡易モデル用。 values = [半径 mm, ヤング率 MPa, ポアソン比]。
+        options: ground（地面とつなぐか）, ground_point（地面側の点）, faces_b（相手側の面）, behavior（面との結び方）"""
+        from .beam import _frame, _k_local
+        o = b.options or {}
+        rad = float(b.values[0]) if len(b.values) > 0 and b.values[0] else 0.0
+        Eb = float(b.values[1]) if len(b.values) > 1 and b.values[1] else 200000.0
+        nu = float(b.values[2]) if len(b.values) > 2 and b.values[2] is not None else 0.3
+        if rad <= 0:
+            raise ValueError(f"{b.label()}: ビームの半径を入力してください")
+        if not b.faces:
+            raise ValueError(f"{b.label()}: ビームをつなぐ面を選んでください")
+        ground = bool(o.get("ground", False))
+        pA = np.asarray(b.point, float) if len(b.point) == 3 else face_weights(mesh, b.faces)[2]
+        beh = o.get("behavior", "rigid")
+        dA = new_pilot(i, pA)
+        couple(i, BC(b.kind, list(b.faces), [], options={"behavior": beh}), pA, dA)
+        if ground:
+            gp = o.get("ground_point") or []
+            if len(gp) != 3:
+                raise ValueError(f"{b.label()}: 地面側の点（X, Y, Z）を入力してください")
+            pB, dB = np.asarray(gp, float), None
+        else:
+            fb = [int(f) for f in (o.get("faces_b") or [])]
+            if not fb:
+                raise ValueError(f"{b.label()}: ビームの相手側の面を選んでください（または地面とつなぐ）")
+            pB = face_weights(mesh, fb)[2]
+            dB = new_pilot(i, pB)
+            couple(i, BC(b.kind, fb, [], options={"behavior": beh}), pB, dB)
+        if np.linalg.norm(pB - pA) < 1e-9:
+            raise ValueError(f"{b.label()}: ビームの両端が同じ位置です（面どうしが離れている必要があります）")
+        L, Rm = _frame(pA, pB, None)
+        A_, I_ = np.pi * rad ** 2, np.pi * rad ** 4 / 4
+        G = Eb / (2 * (1 + nu))
+        phi = 12 * Eb * I_ / (0.9 * G * A_ * L ** 2)          # せん断変形（丸棒 κ = 0.9）: 短いビームで効く
+        kl = _k_local(Eb, G, A_, I_, I_, 2 * I_, L, phi, phi)
+        T12 = np.kron(np.eye(4), Rm)
+        kg = T12.T @ kl @ T12
+        if dB is None:
+            ex.add_block(dA + np.arange(6), dA + np.arange(6), kg[:6, :6])
+        else:
+            dofs = np.r_[dA + np.arange(6), dB + np.arange(6)]
+            ex.add_block(dofs, dofs, kg)
+        ex.beams[i] = {"dA": dA, "dB": dB, "T": T12, "k": kl, "L": L, "radius": rad, "A": A_, "I": I_}
+        ex.notes.append(f"{b.label()}: 長さ {L:.4g} mm、半径 {rad:g} mm" + ("（地面と接続）" if ground else ""))
+
     def cyclic(i, b):
         """周期対称（Ansys の Cyclic Region）: 1 セクタだけのモデルで、高い側の面の変位を
         低い側の面の変位を 360°/N 回したものに等しくする  u_high = R(α) u_low（荷重も周期的な場合 = 調和指数 0）。
@@ -345,6 +393,9 @@ def extra_terms(mesh, bcs, kref: float, acc=None) -> Extra:
             continue
         if b.kind == "cyclic":
             cyclic(i, b)
+            continue
+        if b.kind == "beam":
+            beam(i, b)
             continue
         Fb = np.zeros(3 * mesh.n_nodes)
         v = [None if x is None else float(x) for x in (list(b.values) + [None] * 6)[:6]]
@@ -445,6 +496,27 @@ def extra_terms(mesh, bcs, kref: float, acc=None) -> Extra:
                 for kk in range(3):
                     addF(d0 + kk, f[kk])
     return ex
+
+
+def beam_results(ex: Extra, u: np.ndarray) -> dict:
+    """ビーム接続の断面力（局所座標: x = 軸）。 u は追加の自由度まで含む全体の変位（多点拘束を戻したもの）"""
+    out = {}
+    for i, bd in (ex.beams if ex is not None else {}).items():
+        ue = np.zeros(12)
+        ue[:6] = u[bd["dA"]:bd["dA"] + 6]
+        if bd["dB"] is not None:
+            ue[6:] = u[bd["dB"]:bd["dB"] + 6]
+        f = bd["k"] @ (bd["T"] @ ue)              # 局所の節点力（端 A: 0-5、端 B: 6-11）
+        N = float(f[6])                           # 軸力（引張 正）
+        V = float(np.hypot(f[7], f[8]))
+        Mt = float(f[9])
+        Ma, Mb = float(np.hypot(f[4], f[5])), float(np.hypot(f[10], f[11]))
+        r, A_, I_ = bd["radius"], bd["A"], bd["I"]
+        out[i] = {"軸力 [N]": N, "せん断力 [N]": V, "ねじりモーメント [N·mm]": Mt,
+                  "曲げモーメント（端 A） [N·mm]": Ma, "曲げモーメント（端 B） [N·mm]": Mb,
+                  "軸応力 [MPa]": N / A_, "最大応力（軸＋曲げ） [MPa]": abs(N) / A_ + max(Ma, Mb) * r / I_,
+                  "伸び [mm]": float((bd["T"] @ ue)[6] - (bd["T"] @ ue)[0]), "長さ [mm]": bd["L"]}
+    return out
 
 
 def reduce_system(K, F, fixed, ex: Extra, kref: float):

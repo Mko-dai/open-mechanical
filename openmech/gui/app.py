@@ -70,7 +70,7 @@ BC_COLORS.update({"remote_force": "#c2255c", "remote_displacement": "#b8860b", "
                   "spring": "#5f3dc4", "joint": "#0b7285", "bolt_pretension": "#862e9c", "temperature": "#e03131",
                   "heat_flux": "#f76707", "heat_flow": "#fd7e14", "convection": "#1098ad", "radiation": "#f59f00",
                   "heat_generation": "#c92a2a", "insulation": "#868e96", "voltage": "#1971c2", "ground": "#343a40",
-                  "charge": "#9c36b5", "compression_only": "#2f9e44", "submodel": "#5c940d", "cyclic": "#0c8599"})
+                  "charge": "#9c36b5", "compression_only": "#2f9e44", "submodel": "#5c940d", "cyclic": "#0c8599", "beam": "#6741d9"})
 BC_UNIT = {"displacement": "mm", "force": "N", "pressure": "MPa", "moment": "N·mm", "gravity": "mm/s²",
            "thermal": "°C"}
 
@@ -139,10 +139,12 @@ BC_SPEC = {
     "joint": ([], {"point"}),
     "submodel": ([], set()),
     "cyclic": ([], {"point"}),
+    "beam": ([("半径（丸棒）", "mm", 3.0, False), ("ヤング率", "MPa", 200000.0, False), ("ポアソン比", "", 0.3, False)],
+             {"behavior"}),
 }
 NO_FACE_KINDS = ("gravity", "thermal", "heat_generation", "bolt_pretension")
 SUPPORT_LIKE = ("fixed", "displacement", "symmetry", "frictionless", "remote_displacement", "elastic_support",
-                "cylindrical_support", "spring", "joint", "submodel", "cyclic")
+                "cylindrical_support", "spring", "joint", "submodel", "cyclic", "beam")
 RESULT_NAME = {k: v for g in RESULT_GROUPS.values() for k, v in g}
 RESULT_TYPE_JP = {
     "全変形 [mm]": "全変形", "相当応力（ミーゼス） [MPa]": "相当 (von-Mises) 応力",
@@ -571,6 +573,7 @@ class MainWindow(QMainWindow):
         R.button(g, "ベアリング", make_icon(BC_COLORS["bearing_load"], "軸"), lambda: self.add_bc("bearing_load"))
         R.button(g, "ボルト予張力", make_icon(BC_COLORS["bolt_pretension"], "ボ"), lambda: self.add_bc("bolt_pretension"))
         R.button(g, "ジョイント", make_icon(BC_COLORS["joint"], "関"), lambda: self.add_bc("joint"))
+        R.button(g, "ビーム接続", make_icon(BC_COLORS["beam"], "棒"), lambda: self.add_bc("beam"))
         R.button(g, "周期対称", make_icon(BC_COLORS["cyclic"], "周"), lambda: self.add_bc("cyclic"))
         g = R.add_group(t, "サブモデル")
         R.button(g, "切断境界", make_icon(BC_COLORS["submodel"], "切"), lambda: self.add_bc("submodel"))
@@ -3849,6 +3852,8 @@ class MainWindow(QMainWindow):
             self._details_submodel(i, bc, sec)
         if bc.kind == "cyclic":
             self._details_cyclic(i, bc, sec)
+        if bc.kind == "beam":
+            self._details_beam(i, bc, sec)
         if bc.kind == "bolt_pretension":
             self._row(sec, "ボルトのボディ", self._combo(
                 [(self._body_label(b), int(b)) for b in (self.mesh.body_ids() if self.mesh is not None else [0])],
@@ -3868,6 +3873,41 @@ class MainWindow(QMainWindow):
                  "remote_force": "変形可は面を硬くしない（RBE3）。剛体は面を剛体として結ぶ"}
         if bc.kind in notes:
             self._row(sec, "", notes[bc.kind])
+
+    def _details_beam(self, i, bc, sec):
+        """ビーム接続: 相手（地面の点 か ほかの面）と、解析後の断面力"""
+        o = bc.options or {}
+        ground = bool(o.get("ground", False))
+        self._row(sec, "接続", self._combo([("面－面", False), ("面－地面", True)], ground,
+                                         lambda v: (self._bc_opt(i, "ground", bool(v)), self._later(self.build_details))))
+        if ground:
+            gp = list(o.get("ground_point") or [0.0, 0.0, 0.0])
+            w = QWidget()
+            h = QHBoxLayout(w)
+            h.setContentsMargins(0, 0, 0, 0)
+            sps = []
+            for k in range(3):
+                sp = dspin(float(gp[k]), -1e9, 1e9, 4, 1.0)
+                sps.append(sp)
+                h.addWidget(sp)
+            for sp in sps:
+                sp.valueChanged.connect(lambda *_: self._bc_opt(i, "ground_point", [x.value() for x in sps]))
+            self._row(sec, "地面側の点 X, Y, Z [mm]", w)
+            if len(o.get("ground_point") or []) != 3:
+                bc.options = dict(o, ground_point=gp)
+        else:
+            fb = list(o.get("faces_b") or [])
+            b2 = QPushButton(f"選択中の面を相手側にする（いま {len(fb)} 面）")
+            b2.clicked.connect(lambda: (self._bc_opt(i, "faces_b", [int(f) for f in self.selected_faces]),
+                                        self._later(self.build_details)))
+            self._row(sec, "相手側の面", b2)
+        self._row(sec, "", "2 つの面（の重心）を丸棒のはり 1 本でつなぎます（Ansys の Beam 接続）。ボルト・ピン・スポット溶接の"
+                           "簡易モデルに使います。挙動「剛体」は面を剛体として、「変形可」は面を硬くせずに結びます。")
+        r = self.result
+        br = getattr(r, "beams", {}).get(i) if r is not None else None
+        if br:
+            for k, v in br.items():
+                self._row(sec, k, f"{v:.5g}")
 
     def _details_cyclic(self, i, bc, sec):
         """周期対称: 低い側の面（上の「面」）・高い側の面・セクタ数・軸"""
@@ -4199,7 +4239,7 @@ class MainWindow(QMainWindow):
                     "thermal": [100.0], "symmetry": [], "frictionless": []}[kind]
         bc = BC(kind, faces, vals, "")
         if kind in BC_SPEC and "behavior" in BC_SPEC[kind][1]:
-            bc.options = {"behavior": "rigid" if kind == "spring" else "deformable"}
+            bc.options = {"behavior": "rigid" if kind in ("spring", "beam") else "deformable"}
         if kind == "bolt_pretension":
             bc.options = {"body": int(self.selected_bodies[0]) if self.selected_bodies else 0}
         if kind == "submodel":

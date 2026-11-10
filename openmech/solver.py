@@ -340,9 +340,9 @@ BC_EXTRA_JP = {"remote_force": "リモート荷重", "remote_displacement": "リ
                "temperature": "温度", "heat_flux": "熱流束", "heat_flow": "熱流量", "convection": "対流",
                "radiation": "放射", "heat_generation": "内部発熱", "insulation": "断熱",
                "voltage": "電圧", "charge": "電荷", "ground": "接地", "joint": "ジョイント",
-               "submodel": "サブモデル（切断境界）", "cyclic": "周期対称"}
+               "submodel": "サブモデル（切断境界）", "cyclic": "周期対称", "beam": "ビーム接続"}
 SUPPORT_KINDS = ("fixed", "displacement", "symmetry", "frictionless", "remote_displacement", "elastic_support",
-                 "cylindrical_support", "spring", "joint", "submodel", "cyclic")
+                 "cylindrical_support", "spring", "joint", "submodel", "cyclic", "beam")
 
 
 @dataclass
@@ -753,6 +753,10 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
                 rel[k] = u[jd["dof"] + j]
             joints[i] = {"力（全体）": Fj, "モーメント（全体）": Mj, "力（局所）": E @ Fj, "モーメント（局所）": E @ Mj,
                          "相対変位（局所）": rel[:3], "相対回転（局所） [rad]": rel[3:], "type": jd["type"]}
+    beams = {}
+    if ex is not None and ex.beams:
+        from .remote import beam_results
+        beams = beam_results(ex, u)
     u_pilot = u[nb:]
     u = u[:nb]
     stress, strain = nodal_stress(mesh, u, D, elem_mat=elem_mat, eps_th_m=eps_th_m)
@@ -775,6 +779,7 @@ def solve(mesh: Mesh, material: Material, bcs: list[BC], progress=None, log=prin
     r = Result(mesh, material, u.reshape(-1, 3), stress, strain, reactions, info, mats, elem_mat)
     r.reaction_moments = reaction_moments
     r.joints = joints
+    r.beams = beams
     if ex is not None and ex.pilots:
         r.pilots = {i: (p, u_pilot[d0 - nb:d0 - nb + 6]) for i, p, d0 in ex.pilots}
     return r

@@ -730,6 +730,9 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
                                         loads_at(t_end)[0][:nb], pairs,
                                         contacts, LD, internal_base, t_end, si + 1, settings, ps,
                                         eps_th_m * th_factor(t_end) if has_th else None))
+            if ex is not None and ex.beams:
+                from .remote import beam_results
+                results[-1].beams = beam_results(ex, u)
     info_common = {"自由度数": int(free.sum()), "節点数": mesh.n_nodes, "要素数": mesh.n_elems,
                    "要素タイプ": "Tet10（2次）" if mesh.order == 2 else "Tet4（1次）",
                    "大変形": "オン" if LD else "オフ", "接触領域数": len(contacts),

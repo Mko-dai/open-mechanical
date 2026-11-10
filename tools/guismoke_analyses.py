@@ -184,6 +184,19 @@ try:
     w._set_analysis_type("static")
 except Exception:
     P("NG  過渡（陰解法・非線形）\n" + traceback.format_exc())
+# ビーム接続（面－地面）: 右の面を丸棒で地面につないで、上面を押す
+try:
+    w._set_analysis_type("static")
+    bb = BC("beam", list(right), [3.0, 200000.0, 0.3],
+            options={"ground": True, "ground_point": [float(hi[0]) + 40.0, 25.0, 10.0], "behavior": "rigid"})
+    run("ビーム接続（面－地面）", "static", [fix, bb, BC("pressure", top, [1.0])], shot="beam")
+    w.select_node(("bc", 1))
+    app.processEvents()
+    br = w.results[-1].beams[1]
+    P(f"OK  ビーム接続: 軸力 {br['軸力 [N]']:.4g} N / せん断力 {br['せん断力 [N]']:.4g} N / "
+      f"最大応力 {br['最大応力（軸＋曲げ） [MPa]']:.4g} MPa")
+except Exception:
+    P("NG  ビーム接続\n" + traceback.format_exc())
 # サブモデル: 粗い結果を保存して、切断境界に与える
 try:
     import tempfile
