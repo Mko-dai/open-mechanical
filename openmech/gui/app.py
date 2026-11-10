@@ -2628,7 +2628,11 @@ class MainWindow(QMainWindow):
 
         s = self._section("高度な設定")
         self._row(s, "定式化", combo(FORMULATIONS, c.formulation, "formulation"))
-        self._row(s, "微小すべり", "オン（接触相手は変形前の位置で決める）")
+        if c.nonlinear and c.type != "gasket":
+            from ..contact import SLIDING
+            self._row(s, "すべり", combo(SLIDING, c.sliding, "sliding", False))
+        else:
+            self._row(s, "微小すべり", "オン（接触相手は変形前の位置で決める）")
         self._row(s, "検出方法", combo(DETECTIONS, c.detection, "detection", False))
         if c.resolved_formulation() == "augmented_lagrange" or c.formulation == "penalty":
             self._row(s, "貫通許容値", combo(TOL_MODES, c.pen_tol_mode, "pen_tol_mode"))

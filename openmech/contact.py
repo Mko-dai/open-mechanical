@@ -31,6 +31,7 @@ INTERFACE = {"adjust": "接触するよう調整", "offset": "オフセットを
 DETECTIONS = {"auto": "プログラム制御", "nodal_target": "節点（ターゲット面の法線方向）",
               "nodal_contact": "節点（接触面の法線方向）"}
 STIFFNESS_MODES = {"auto": "プログラム制御", "factor": "係数", "absolute": "絶対値"}
+SLIDING = {"auto": "プログラム制御", "small": "微小すべり", "finite": "有限すべり（接触相手を更新）"}
 UPDATE_STIFFNESS = {"auto": "プログラム制御", "never": "しない", "each_iteration": "各反復"}
 TOL_MODES = {"auto": "プログラム制御", "factor": "係数", "value": "値"}
 PINBALL_MODES = {"auto": "プログラム制御", "radius": "半径", "detection": "自動検出値"}
@@ -67,6 +68,9 @@ class ContactRegion:
     slip_tol_mode: str = "auto"         # 弾性すべり許容値（摩擦あり）: プログラム制御 / 係数 / 値 [mm]
     slip_tol: float = 0.0
     pinball_mode: str = "auto"          # ピンボール領域: プログラム制御 / 半径（pinball）/ 自動検出値
+    # すべり: small = 接触相手は変形前の位置で決めて固定 / finite = サブステップごとに変形後の位置で決め直す
+    # auto = 大変形オンのとき finite（Ansys の「微小すべり: プログラム制御」と同じ）
+    sliding: str = "auto"
     stabilization: float = 0.0          # 安定化減衰係数（0 = なし）: 開いている接触にも弱いばねを入れて浮きを防ぐ
     # ボルトのねじ（Ansys の「幾何補正: ボルトねじ」）: 円筒の接触面を、ねじ山の斜面として扱う
     # {"point": 軸上の点, "axis": 軸の向き, "half_angle": ねじ山の半角 [度]（メートルねじ 30）, "pitch": ピッチ [mm]}
@@ -98,6 +102,11 @@ class ContactRegion:
     @property
     def nonlinear(self):
         return self.type not in LINEAR_TYPES
+
+    def finite_sliding(self, large_deflection: bool) -> bool:
+        if self.type in LINEAR_TYPES or self.type == "gasket" or (self.thread and self.thread.get("axis")):
+            return False
+        return self.sliding == "finite" or (self.sliding == "auto" and bool(large_deflection))
 
     def resolved_formulation(self):
         if self.type == "gasket":
@@ -194,6 +203,16 @@ class Pairs:
     max_pen: float = 0.0        # 最後の更新での最大貫通量
     Ktan: np.ndarray = None     # (M,3,3) 接線方向の剛性（摩擦: 固着 kt·P、すべり 整合接線）
     c_max: np.ndarray = None    # ガスケット: 確定した最大閉じ量
+    # 有限すべり: 接触相手を決め直すための情報
+    finite: bool = False
+    X: np.ndarray = None        # 節点座標（変形前）
+    ttris: np.ndarray = None    # Target 側の三角形
+    adj: np.ndarray = None      # 「接触するよう調整」「オフセット」で動かした隙間の量
+    h: float = 1.0
+    pin: float = 1e30
+    nonsym: bool = False        # 接線が非対称（摩擦ですべっている節点がある）
+    ratio: np.ndarray = None    # 摩擦: すべり中の 摩擦限界 / 試行値（整合接線の係数）
+    n_fixed: bool = False       # 法線を接触面側の法線で固定（検出方法: 接触面の法線方向）
 
 
 def gasket_curve(gk: dict):
@@ -257,8 +276,75 @@ def _closest_on_tri(p, a, b, c):
     return bc
 
 
+def _project(xs, tp, tree, kq):
+    """点 xs を三角形群 tp (T,3,3) に射影: (三角形番号, 重心座標, 距離)"""
+    _, cand = tree.query(xs, k=kq)
+    cand = cand.reshape(len(xs), -1)
+    best_d = np.full(len(xs), np.inf)
+    best_bc = np.zeros((len(xs), 3))
+    best_t = np.zeros(len(xs), dtype=int)
+    for j in range(cand.shape[1]):
+        t = cand[:, j]
+        bc = _closest_on_tri(xs, tp[t, 0], tp[t, 1], tp[t, 2])
+        q = np.einsum("ij,ijk->ik", bc, tp[t])
+        d = np.linalg.norm(xs - q, axis=1)
+        better = d < best_d
+        best_d[better], best_bc[better], best_t[better] = d[better], bc[better], t[better]
+    return best_t, best_bc, best_d
+
+
+def repair_pairs(pr: Pairs, u: np.ndarray):
+    """有限すべり: 変形後の位置で接触相手（Target の三角形・内挿の重み・法線）を決め直す。
+
+    隙間は g = g0 + (u_s − Σ w u_m)·n のまま使えるよう、g0 = (X_s − Σ w X_m)·n（＋最初の調整量）に置き直す。
+    Target の外にはみ出した節点（射影が三角形の縁に張り付いた節点）は接触の対象外にする。
+    """
+    from scipy.spatial import cKDTree
+    x = pr.X + u.reshape(-1, 3)[:len(pr.X)]
+    tp = x[pr.ttris]
+    tn = np.cross(tp[:, 1] - tp[:, 0], tp[:, 2] - tp[:, 0])
+    tn /= np.maximum(np.linalg.norm(tn, axis=1, keepdims=True), 1e-300)
+    tree = cKDTree(tp.mean(axis=1))
+    xs = x[pr.slave]
+    bt, bc, _d = _project(xs, tp, tree, min(8, len(pr.ttris)))
+    masters = pr.ttris[bt]
+    n = pr.n if pr.n_fixed else tn[bt]
+    q = np.einsum("ij,ijk->ik", bc, x[masters])
+    off = xs - q
+    gn = np.einsum("ij,ij->i", off, n)
+    lateral = np.linalg.norm(off - gn[:, None] * n, axis=1)
+    # Target の外、または裏側に深く回り込んだ節点（薄い部品の反対側など）は対象外
+    outside = (lateral > 0.25 * pr.h) | (gn < -pr.pin)
+    Xq = np.einsum("ij,ijk->ik", bc, pr.X[masters])
+    g0 = np.einsum("ij,ij->i", pr.X[pr.slave] - Xq, n) + pr.adj
+    pr.masters, pr.w, pr.n = masters, bc, n
+    pr.g0 = np.where(outside, 1e30, g0)
+
+
+def repair_in_step(pr: Pairs, reg: ContactRegion, u: np.ndarray) -> int:
+    """サブステップの途中で接触相手を決め直す（収束した位置 u で）。 戻り値: Target の内・外が変わった節点の数。
+
+    摩擦のすべりは「前の収束状態からの増分」で測っているので、相手を替えてもその増分（dt − dt_c）が
+    変わらないよう、基準 dt_c を新しい相手での値に置き直す。
+    """
+    U = u.reshape(-1, 3)
+
+    def tangential():
+        d = U[pr.slave] - np.einsum("ij,ijk->ik", pr.w, U[pr.masters])
+        return d - np.einsum("ij,ij->i", d, pr.n)[:, None] * pr.n
+    fric = reg.type == "frictional"
+    inc = tangential() - pr.dt_c if fric else None
+    was_in = pr.g0 < 1e29
+    repair_pairs(pr, u)
+    if fric:
+        inc = inc - np.einsum("ij,ij->i", inc, pr.n)[:, None] * pr.n
+        pr.dt_c = tangential() - inc
+    now_in = pr.g0 < 1e29
+    return int(np.sum(was_in != now_in))
+
+
 def _region_pairs(mesh, reg: ContactRegion, contact_faces, target_faces, E_of_node, h_char,
-                  ridx, diag, det_tol=0.0):
+                  ridx, diag, det_tol=0.0, finite=False):
     from scipy.spatial import cKDTree
 
     if not contact_faces or not target_faces:
@@ -324,13 +410,29 @@ def _region_pairs(mesh, reg: ContactRegion, contact_faces, target_faces, E_of_no
     # ピンボール: これより離れた節点は接触の対象外
     pin = pinball_radius(reg, h_char, diag, det_tol)
     keep = best_d <= pin
-    if not keep.any():
+    # Target の外にはみ出した節点（最近点が三角形の縁に張り付く）は相手がいないので対象外。
+    # 接触面がターゲットより広いとき、外側の節点までターゲットの縁を支えてしまうのを防ぐ
+    lat = np.linalg.norm((xs - q) - g0[:, None] * n, axis=1)
+    keep &= lat <= 0.25 * h_char
+    if not keep.any() and not finite:
         return None
-    slave, masters, best_bc, n, g0, area = slave[keep], masters[keep], best_bc[keep], n[keep], g0[keep], area[keep]
-    if reg.interface == "adjust":
-        g0 = np.zeros_like(g0)          # 接触するよう調整（初期の隙間・食い込みを無視）
-    elif reg.interface == "offset":
-        g0 = g0 + reg.offset
+    g_geom = g0.copy()
+    if finite:
+        # 有限すべり: 今は離れている節点も、あとで近づけば接触する。すべての節点を残し、調整は近い節点だけ
+        if reg.interface == "adjust":
+            g0 = np.where(keep, 0.0, g0)
+        elif reg.interface == "offset":
+            g0 = g0 + reg.offset
+        far0 = ~keep & ((lat > 0.25 * h_char) | (g_geom < 0))      # Target の外、または裏側
+        adj = g0 - g_geom
+        g0 = np.where(far0, 1e30, g0)
+    else:
+        slave, masters, best_bc, n, g0, area = (slave[keep], masters[keep], best_bc[keep], n[keep], g0[keep],
+                                                area[keep])
+        if reg.interface == "adjust":
+            g0 = np.zeros_like(g0)          # 接触するよう調整（初期の隙間・食い込みを無視）
+        elif reg.interface == "offset":
+            g0 = g0 + reg.offset
     if reg.thread and reg.thread.get("axis"):
         slave, masters, best_bc, n, g0, area = _thread_flanks(mesh, reg.thread, slave, masters, best_bc, n, g0, area)
     # 法線剛性: Ansys と同じく 係数 × E / 要素サイズ（面積あたり）、または絶対値
@@ -355,6 +457,10 @@ def _region_pairs(mesh, reg: ContactRegion, contact_faces, target_faces, E_of_no
     M = len(slave)
     pr = Pairs(ridx, slave, masters, best_bc, n, g0, area, kn, kt)
     pr.ctris = None if (reg.thread and reg.thread.get("axis")) else ctris
+    if finite:
+        pr.finite, pr.X, pr.ttris, pr.adj, pr.h = True, mesh.nodes, ttris, adj, float(h_char)
+        pr.pin = float(pin)
+        pr.n_fixed = reg.detection == "nodal_contact"
     pr.lam_n = np.zeros(M)
     pr.lam_t = np.zeros((M, 3))
     pr.active = np.ones(M, bool) if reg.type in LINEAR_TYPES else (g0 <= 0)
@@ -429,7 +535,8 @@ def pinball_radius(reg: ContactRegion, h_char: float, diag: float, det_tol: floa
     return max(4.0 * h_char, 1e-9)
 
 
-def build_pairs(mesh, regions: list[ContactRegion], E_of_node: np.ndarray, det_tol: float = 0.0) -> list[Pairs]:
+def build_pairs(mesh, regions: list[ContactRegion], E_of_node: np.ndarray, det_tol: float = 0.0,
+                large_deflection: bool = False) -> list[Pairs]:
     lo, hi = mesh.bounds()
     diag = float(np.linalg.norm(hi - lo))
     vol = np.abs(mesh.element_volumes())
@@ -442,7 +549,8 @@ def build_pairs(mesh, regions: list[ContactRegion], E_of_node: np.ndarray, det_t
         if reg.resolved_behavior() == "symmetric":
             sides.append((reg.target_faces, reg.contact_faces))
         for cf, tf in sides:
-            pr = _region_pairs(mesh, reg, cf, tf, E_of_node, h_char, i, diag, det_tol)
+            pr = _region_pairs(mesh, reg, cf, tf, E_of_node, h_char, i, diag, det_tol,
+                               finite=reg.finite_sliding(large_deflection))
             if pr is not None:
                 if len(sides) == 2:
                     pr.area = pr.area * 0.5
@@ -510,6 +618,24 @@ def contact_system(pairs: list[Pairs], regions: list[ContactRegion], ndof: int, 
             for c in range(3):
                 fc += B[c].T @ (pr.area * (st + sl) * pr.lam_t[:, c])
     return Kc.tocsr(), fc
+
+
+def _friction_tangent(pr: Pairs, mu: float, tt: np.ndarray, d: np.ndarray):
+    """摩擦の整合接線と定数項。 摩擦応力を τ ≈ lam_t − Ktan·d（d = 相対変位）の形にする。
+
+    固着: kt·P。 すべり: kt·(μp/|試行値|)·(P − e eᵀ) ＋ μ·kn·e nᵀ。
+    最後の項は「摩擦限界 μp が法線方向の食い込みで変わる」分で、非対称になる。これを入れないと
+    面圧と摩擦が強く影響し合う問題（すべりで部品が傾く等）でニュートン法が収束しない。
+    """
+    P = np.eye(3)[None] - pr.n[:, :, None] * pr.n[:, None, :]
+    e = tt / np.maximum(np.linalg.norm(tt, axis=1, keepdims=True), 1e-300)
+    Kt3 = pr.kt[:, None, None] * pr.ratio[:, None, None] * (
+        P - np.where(pr.stick[:, None, None], 0.0, e[:, :, None] * e[:, None, :]))
+    slip = pr.active & ~pr.stick
+    Kt3 = Kt3 + (slip * mu * pr.kn)[:, None, None] * e[:, :, None] * pr.n[:, None, :]
+    pr.Ktan = Kt3
+    pr.lam_t = np.where(pr.active[:, None], tt + np.einsum("mij,mj->mi", Kt3, d), 0.0)
+    pr.nonsym = bool(slip.any())
 
 
 def update_states(pairs: list[Pairs], regions: list[ContactRegion], u: np.ndarray, al_update=True,
@@ -592,14 +718,8 @@ def update_states(pairs: list[Pairs], regions: list[ContactRegion], u: np.ndarra
             # 固着: 定数部分 τc + kt·dtc を力、kt を剛性として与える
             # すべり: 摩擦応力 μp（向きは試行値の向き）を力として与える
             # 整合接線: 固着 kt·P、すべり kt·(μp/|t|)·(P - e e^T)（すべり方向の剛性は 0）
-            P = np.eye(3)[None] - pr.n[:, :, None] * pr.n[:, None, :]
-            e = tt / np.maximum(np.linalg.norm(tt, axis=1, keepdims=True), 1e-300)
-            ratio = np.where(stick, 1.0, limit / np.maximum(tn, 1e-300))
-            Kt3 = pr.kt[:, None, None] * ratio[:, None, None] * (P - np.where(stick[:, None, None], 0.0,
-                                                                            e[:, :, None] * e[:, None, :]))
-            pr.Ktan = Kt3
-            const = tt + np.einsum("mij,mj->mi", Kt3, dt)
-            pr.lam_t = np.where(new_active[:, None], const, 0.0)
+            pr.ratio = np.where(stick, 1.0, limit / np.maximum(tn, 1e-300))
+            _friction_tangent(pr, reg.mu, tt, d)
             pr.tau_now = np.where(new_active[:, None], tt, 0.0)
             tau = np.linalg.norm(pr.tau_now, axis=1)
         else:
@@ -623,13 +743,28 @@ def commit_states(pairs: list[Pairs], regions, u: np.ndarray):
         if regions[pr.region].type == "gasket" and pr.gap is not None:
             pr.c_max = np.maximum(pr.c_max, -pr.gap)
             continue
-        if regions[pr.region].type != "frictional":
-            continue
-        d = U[pr.slave] - np.einsum("ij,ijk->ik", pr.w, U[pr.masters])
-        dn = np.einsum("ij,ij->i", d, pr.n)
-        dt = d - dn[:, None] * pr.n
-        pr.tau_c = pr.tau_now.copy()
-        pr.dt_c = np.where(pr.active[:, None], dt, dt)
+        fric = regions[pr.region].type == "frictional"
+        if fric:
+            pr.tau_c = pr.tau_now.copy()
+        if pr.finite:
+            # 有限すべり: 収束した位置で接触相手を決め直す。摩擦応力は新しい接平面に向きを合わせ、
+            # すべりの基準（dt_c）は決め直した相手との今の相対変位にする（ここからの増分ですべりを測る）
+            repair_pairs(pr, u)
+            if fric:
+                mag = np.linalg.norm(pr.tau_c, axis=1, keepdims=True)
+                tp = pr.tau_c - np.einsum("ij,ij->i", pr.tau_c, pr.n)[:, None] * pr.n
+                pr.tau_c = tp * (mag / np.maximum(np.linalg.norm(tp, axis=1, keepdims=True), 1e-300))
+        if fric:
+            d = U[pr.slave] - np.einsum("ij,ijk->ik", pr.w, U[pr.masters])
+            dn = np.einsum("ij,ij->i", d, pr.n)
+            pr.dt_c = d - dn[:, None] * pr.n
+        if pr.finite:
+            # Target の外に出た節点は外す。固着・すべりの状態はそのままにして、決め直した相手で
+            # 同じ摩擦応力になるよう、接線と定数項を作り直す（次のサブステップの最初の反復で使う）
+            pr.active = pr.active & (pr.g0 < 1e29)
+            if fric and pr.ratio is not None:
+                _friction_tangent(pr, regions[pr.region].mu, pr.tau_c, d)
+                pr.tau_now = np.where(pr.active[:, None], pr.tau_c, 0.0)
 
 
 def contact_results(pairs: list[Pairs], regions, n_nodes: int) -> dict:
@@ -644,7 +779,7 @@ def contact_results(pairs: list[Pairs], regions, n_nodes: int) -> dict:
         if reg.type in LINEAR_TYPES:
             status = np.full(len(g), ST_STICKING if reg.type == "bonded" else ST_SLIDING)
         else:
-            near = (~pr.active) & (g < 3 * np.maximum(np.abs(pr.g0), 1e-3) + 1e-3)
+            near = (~pr.active) & (g < 3 * np.maximum(np.abs(pr.g0), 1e-3) + 1e-3) & (pr.g0 < 1e29)
             status = np.where(pr.active, np.where(pr.stick & (reg.type != "frictionless"), ST_STICKING, ST_SLIDING),
                               np.where(near, ST_NEAR, ST_FAR))
         s = pr.slave
@@ -682,5 +817,5 @@ def contact_results(pairs: list[Pairs], regions, n_nodes: int) -> dict:
         out["貫通量 [mm]"][s] = np.where(act, np.maximum(-g, 0), 0)
         out["すべり距離 [mm]"][s] = np.where(status == ST_SLIDING, slide, 0.0)
         out["摩擦応力 [MPa]"][s] = tau
-        out["隙間 [mm]"][s] = np.where(act, 0.0, np.maximum(g, 0))
+        out["隙間 [mm]"][s] = np.where(act, 0.0, np.where(g > 1e29, np.nan, np.maximum(g, 0)))
     return out

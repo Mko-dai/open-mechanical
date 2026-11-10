@@ -18,7 +18,7 @@ import numpy as np
 import scipy.sparse as sp
 
 from .contact import (ContactRegion, build_pairs, commit_states, penetration_ok, contact_results, contact_system,
-                      update_states)
+                      repair_in_step, update_states)
 from .materials import Material
 from .mesh import Mesh
 from .solver import (BC, SUPPORT_KINDS, GAUSS4, GAUSS4_W, NODE_L10, NODE_L4, Result, _B_matrix, _dN_dx, _D_of,
@@ -282,7 +282,10 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
     E_node = np.zeros(mesh.n_nodes)
     Ee = np.array([m.E for m in mats])[elem_mat]
     np.maximum.at(E_node, mesh.elems.ravel(), np.repeat(Ee, mesh.elems.shape[1]))
-    pairs = build_pairs(mesh, contacts, E_node, contact_tolerance) if contacts else []
+    pairs = build_pairs(mesh, contacts, E_node, contact_tolerance,
+                        large_deflection=bool(settings.large_deflection or hyper)) if contacts else []
+    if any(p.finite for p in pairs):
+        log("接触: 有限すべり（収束したサブステップごとに、変形後の位置で接触相手を決め直します）")
     if contacts:
         log(f"接触: {len(contacts)} 領域 / 接触節点 {sum(len(p.slave) for p in pairs):,}")
     nonlinear_contact = any(c.nonlinear for c in contacts)
@@ -396,14 +399,16 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
     results: list[Result] = []
     u = np.zeros(ndof)
 
+    _PAIR_STATE = ("lam_n", "lam_t", "active", "stick", "tau_c", "dt_c", "kn", "kt", "Ktan", "ratio", "tau_now",
+                   "pressure", "gap", "slide", "tau", "masters", "w", "n", "g0", "c_max")
+
     def save_pair_state():
-        return [(p.lam_n.copy(), p.lam_t.copy(), p.active.copy(), p.stick.copy(), p.tau_c.copy(),
-                 p.dt_c.copy(), p.kn.copy()) for p in pairs]
+        return [{k: (None if getattr(p, k) is None else getattr(p, k).copy()) for k in _PAIR_STATE} for p in pairs]
 
     def load_pair_state(st):
-        for p, (a, b, c, d, e, f, g) in zip(pairs, st):
-            p.lam_n, p.lam_t, p.active, p.stick = a.copy(), b.copy(), c.copy(), d.copy()
-            p.tau_c, p.dt_c, p.kn = e.copy(), f.copy(), g.copy()
+        for p, d in zip(pairs, st):
+            for k, v in d.items():
+                setattr(p, k, None if v is None else v.copy())
 
     def _contact(uu):
         Kc, fc = contact_system(pairs, contacts, nb, uu[:nb])
@@ -445,9 +450,10 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
                 react = max(react, np.linalg.norm(fpen))
         return np.linalg.norm(Rr[free_r]), react
 
-    def equilibrium(t, u0):
-        """時刻 t の釣り合いを解く。収束しなければ ConvergenceError"""
-        u = u0.copy()
+    def equilibrium(t, u0, u_init=None):
+        """時刻 t の釣り合いを解く。収束しなければ ConvergenceError。
+        u_init: 同じ時刻を解き直すときの出発点（有限すべりで接触相手を決め直したあと）"""
+        u = (u0 if u_init is None else u_init).copy()
         cur_t[0] = t
         F, fixed = loads_at(t)
         vals = np.array([fixed.get(int(d), 0.0) for d in cdofs])
@@ -465,7 +471,7 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
         for it in range(1, max_it + 1):
             # 塑性: 1回目は前の釣り合い位置の接線で、強制変位の増分を全体に広げる（弾性予測子）。
             # 境界の節点だけを動かして評価すると局所的に大きな塑性ひずみが出てニュートン法が発散するため
-            predictor = ps is not None and it == 1
+            predictor = ps is not None and it == 1 and u_init is None
             ue = u0 if predictor else u
             fint, KT = internal(ue)
             if pairs:
@@ -501,7 +507,8 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
                 Rf_r = Rr[fre]
                 with np.errstate(all="ignore"):
                     dr = np.zeros(Kr.shape[0])
-                    dr[fre] = _linear_solve(Kff, Rf_r, lambda *a: None, method="direct")
+                    dr[fre] = _linear_solve(Kff, Rf_r, lambda *a: None,
+                                            method="superlu" if any(p.nonsym for p in pairs) else "direct")
                 du_f = (Tm @ dr)[free]
                 Rf_lin = Rf_r
                 du_lin = dr[fre]
@@ -518,7 +525,9 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
             else:
                 Kff = Kt[free][:, free].tocsc()
                 with np.errstate(all="ignore"):
-                    du_f = _linear_solve(Kff, Rf, lambda *a: None, method=method)
+                    # 摩擦ですべっている節点があると接線が非対称になるので、LU 分解で解く
+                    nonsym = any(p.nonsym for p in pairs)
+                    du_f = _linear_solve(Kff, Rf, lambda *a: None, method="superlu" if nonsym else method)
                 Rf_lin, du_lin = Rf, du_f
             if not np.all(np.isfinite(du_f)):
                 raise RuntimeError("剛性マトリクスが特異です。拘束が不足しているか、接触だけで支えられている"
@@ -579,6 +588,7 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
 
     t_prev = 0.0
     n_done = 0
+    fin_pairs = [p for p in pairs if p.finite]
     frame_t, hist = [], {}
     if dst is not None:
         import math
@@ -609,7 +619,8 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
             + ("、非線形" if nonlinear else "、線形"))
     for si, t_end in enumerate(ends):
         nsub = max(1, settings.initial_substeps if (nonlinear or settings.auto_time_stepping == "on") else 1)
-        if LD and settings.auto_time_stepping == "auto" and settings.initial_substeps <= 1:
+        if (LD or any(p.finite for p in pairs)) and settings.auto_time_stepping == "auto" \
+                and settings.initial_substeps <= 1:
             nsub = max(nsub, 5)
         if dst is not None:
             nsub = nsteps_dyn
@@ -630,6 +641,14 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
                 dst["dt"], dst["un"] = t_next - t, u.copy()
             try:
                 u_new, F_now = equilibrium(t_next, u)
+                for _pass in range(4 if fin_pairs else 0):
+                    # 有限すべり: 収束した位置で接触相手を決め直し、Target の内・外が変わった節点があれば
+                    # 同じ時刻を解き直す（接触する範囲が、すべった先の位置と合うまで）
+                    nchg = sum(repair_in_step(p, contacts[p.region], u_new) for p in fin_pairs)
+                    if nchg == 0:
+                        break
+                    update_states(fin_pairs, contacts, u_new, al_update=False, pen_tol=pen_tol)
+                    u_new, F_now = equilibrium(t_next, u, u_init=u_new)
             except ConvergenceError as e:
                 if settings.auto_time_stepping != "off" and dt / 2 >= min_dt * 0.999:
                     load_pair_state(state)

@@ -249,3 +249,49 @@ def test_gasket_load_unload_set():
     c2 = np.nanmedian(rs[-1].contact["貫通量 [mm]"])
     assert c1 == pytest.approx(0.1 + 0.1 * 15 / 25, rel=0.02)
     assert c2 == pytest.approx(c1 - 10.0 / 1000.0, rel=0.02)
+
+
+def _slider(sliding, mu, d=30.0, nsub=6):
+    """長い台（60×10×10）の上を、小さなブロック（10×10×10）が押し付けられたまま d だけすべる"""
+    from openmech.contact import ContactRegion
+    m = stack(structured_box(60, 10, 10, 12, 2, 2), structured_box(10, 10, 10, 2, 2, 2, origin=(5, 0, 10)))
+    top = face(m, 2, 20, 1)
+    c = ContactRegion(type="frictional" if mu else "frictionless", mu=mu, contact_faces=[face(m, 2, 10, 1)],
+                      target_faces=[face(m, 2, 10, -1)], sliding=sliding, auto=False)
+    bcs = [BC("fixed", [face(m, 2, 0, -1)]), BC("pressure", [top], [10.0]), BC("displacement", [top], [d, 0.0, None])]
+    bcs[1].step_factors, bcs[2].step_factors = [1.0, 1.0], [0.0, 1.0]
+    st = AnalysisSettings(n_steps=2, step_end_times=[1.0, 2.0], initial_substeps=nsub, max_substeps=200)
+    r = solve_static(m, S, bcs, [c], st, **quiet)[-1]
+    p = np.nan_to_num(r.contact["接触圧 [MPa]"])
+    xc = float((m.nodes[:, 0] * p).sum() / p.sum())
+    return r, xc
+
+
+@pytest.mark.parametrize("mu", [0.0, 0.2])
+def test_finite_sliding_contact_patch_follows(mu):
+    """有限すべり: 接触する範囲がブロックについて動く。面圧の重心 = ブロックの中心 + μH（摩擦の偶力の分）、
+    摩擦力 = μN。 微小すべりでは接触する範囲が最初の位置に残る"""
+    r, xc = _slider("finite", mu)
+    assert xc == pytest.approx(10.0 + 30.0 + mu * 10.0, abs=0.3)
+    assert r.reactions[0][2] == pytest.approx(1000.0, rel=1e-3)
+    assert r.reactions[0][0] == pytest.approx(-mu * 1000.0, abs=1.0)
+    _r0, xc0 = _slider("small", mu)
+    assert xc0 < 15.0
+
+
+def test_contact_face_wider_than_target():
+    """接触面がターゲットより広いとき、ターゲットの外の節点は接触しない（面圧 = 荷重 / ターゲットの面積）"""
+    from openmech.contact import ContactRegion
+    m = stack(structured_box(60, 10, 10, 12, 2, 2), structured_box(10, 10, 10, 2, 2, 2, origin=(25, 0, 10)))
+    c = ContactRegion(type="frictionless", contact_faces=[face(m, 2, 10, 1)], target_faces=[face(m, 2, 10, -1)],
+                      auto=False)
+    xs = [f["id"] for f in m.face_info() if abs(f["centroid"][0] - 25) < 1e-6 or abs(f["centroid"][0] - 35) < 1e-6]
+    ys = [f["id"] for f in m.face_info() if f["centroid"][2] > 10 and abs(f["normal"][1]) > 0.99]
+    r = solve_static(m, S, [BC("fixed", [face(m, 2, 0, -1)]), BC("pressure", [face(m, 2, 20, 1)], [10.0]),
+                            BC("displacement", xs, [0.0, None, None]), BC("displacement", ys, [None, 0.0, None])],
+                     [c], **quiet)[-1]
+    p = r.contact["接触圧 [MPa]"]
+    x = m.nodes[:, 0]
+    assert np.nanmax(np.nan_to_num(p)[(x < 22) | (x > 38)]) == 0.0
+    inside = (x > 26) & (x < 34) & np.isfinite(p)
+    assert np.median(p[inside]) == pytest.approx(10.0, rel=0.15)
