@@ -412,6 +412,9 @@ try:
       f"先端たわみ {tipw:.4g} mm（はりの式 {exact:.4g}、ポアソン比の分だけ小さく出ます）"
       + (f" / メッセージ: {msgs[-1]}" if msgs else ""))
     msgs.clear()
+    fr = run("ソリッド＋シェルのモーダル", "modal", [BC("fixed", [root])], {"n_modes": 3},
+             results=["全変形 [mm]"], shot="mixed_modal")
+    P(f"OK  ソリッド＋シェルのモーダル: {[round(float(r.info['振動数 [Hz]']), 1) for r in fr]} Hz")
 except Exception:
     P("NG  ソリッド＋シェル\n" + traceback.format_exc())
 P("完了")

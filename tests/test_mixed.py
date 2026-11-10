@@ -103,3 +103,25 @@ def test_mixed_mesh_and_project_run():
     from openmech.geometry import GeometryError
     with pytest.raises(GeometryError):
         split_mixed({"kind": "model", "features": [new_feature("plate"), new_feature("box")]})
+
+
+def test_mixed_modal_cantilever():
+    """ソリッド＋シェルのモーダル: 片持ちはり（根元半分ソリッド・先半分シェル）の 1 次の曲げ振動数"""
+    from openmech.mixed import MixedMesh
+    from openmech.project import Project
+    t, b = 2.0, 20.0
+    solid = structured_box(50, b, t, 25, 10, 2).to_quadratic()
+    solid.elem_body = np.zeros(solid.n_elems, int)
+    solid.group_faces()
+    shell = structured_plate(50, b, 10, 4, t, origin=(50, 0, t / 2))
+    m = MixedMesh(solid, shell, 1)
+    root = next(f["id"] for f in m.face_info() if not f.get("edge") and abs(f["centroid"][0]) < 1e-6)
+    p = Project()
+    p.material = S
+    p.analysis_type = "modal"
+    p.analysis_opts = {"n_modes": 3}
+    p.bcs = [BC("fixed", [root])]
+    rs = p.run_all(m, log=lambda *a: None)
+    f1 = 0.5596 * np.sqrt(200000.0 * (b * t ** 3 / 12) / (7.85e-9 * b * t * 100.0 ** 4))
+    assert len(rs) == 3 and rs[0].info["振動数 [Hz]"] == pytest.approx(f1, rel=0.02)
+    assert np.abs(rs[0].u).max() == pytest.approx(1.0, rel=1e-6)

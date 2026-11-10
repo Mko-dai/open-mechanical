@@ -152,27 +152,34 @@ def _shell_post(shell, u6, mats, elem_mat, reactions, info):
     return r
 
 
-def solve_mixed(solid, shell, material, bcs_solid: list[BC], bcs_shell: list[BC], solid_materials=None,
-                shell_materials=None, tie_tol=None, log=print, method="auto"):
-    """ソリッド＋シェルの線形静解析。 戻り値: (ソリッドの Result, シェルの Result)"""
+def _mixed_system(solid, shell, material, bcs_solid, bcs_shell, solid_materials, shell_materials, tie_tol, log,
+                  supports_only=False, mass=False):
+    """ソリッドとシェルの剛性（と質量）を並べ、結合の多点拘束を消去した式を作る"""
     from .shell import _frames, _shell_dofs, plane_stress_D, shell_constraints, shell_element_K
-    t0 = time.time()
     for b in bcs_solid:
         if b.kind not in SOLID_BC:
             raise ValueError(f"ソリッド＋シェルの解析では「{b.label()}」はまだ使えません")
     for b in bcs_shell:
         if b.kind not in SHELL_BC:
             raise ValueError(f"ソリッド＋シェルの解析では、シェル側の「{b.label()}」はまだ使えません")
+    if supports_only:      # モーダル: 荷重は使わず、強制変位は 0 として扱う
+        def sup(bcs):
+            out = []
+            for b in bcs:
+                if b.kind == "displacement":
+                    out.append(BC("displacement", b.faces, [None if v is None else 0.0 for v in b.values], b.name))
+                elif b.kind in ("fixed", "symmetry", "frictionless"):
+                    out.append(b)
+            return out
+        bcs_solid, bcs_shell = sup(bcs_solid), sup(bcs_shell)
     mats_s, em_s = solid_materials if solid_materials is not None else ([material], np.zeros(solid.n_elems, np.int64))
     mats_h, em_h = shell_materials if shell_materials is not None else ([material], np.zeros(shell.n_elems, np.int64))
     em_s, em_h = np.asarray(em_s, np.int64), np.asarray(em_h, np.int64)
-    # ソリッド
     D = np.stack([material_D(m) for m in mats_s])
     Ks = assemble_stiffness(solid, D, elem_mat=em_s).tocsr()
     rho_e = np.array([m.density_t_mm3 for m in mats_s])[em_s]
     Fs, fx_s = build_load_and_constraints(solid, mats_s[0], bcs_solid, rho_e=rho_e)
     ns = Ks.shape[0]
-    # シェル
     Dp = np.stack([plane_stress_D(material_D(m)) for m in mats_h])[em_h]
     Xh = shell.nodes[shell.elems]
     Ke, _R, _xy, Ah = shell_element_K(Xh, shell.thickness, Dp)
@@ -183,7 +190,6 @@ def solve_mixed(solid, shell, material, bcs_solid: list[BC], bcs_shell: list[BC]
     Fh, fx_h = shell_constraints(shell, bcs_shell, mats_h, em_h, Ah, _frames(Xh)[0][:, 2])
     used = np.zeros(nh, bool)
     used[dofs.ravel()] = True
-    # 結合（シェルの自由度を従属に）
     mpc, tied = tie_shell_to_solid(solid, shell, tie_tol, log)
     if not len(tied):
         raise ValueError("シェルの節点がソリッドの表面に乗っていません（シェルの辺・面をソリッドの面に接するように置いてください）")
@@ -202,8 +208,6 @@ def solve_mixed(solid, shell, material, bcs_solid: list[BC], bcs_shell: list[BC]
         cols.append(newidx[md])
         vals.append(cf)
     T = sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(n, len(keep)))
-    Kr = (T.T @ K @ T).tocsr()
-    Fr = T.T @ F
     fixed = {int(newidx[d]): v for d, v in fx_s.items()}
     for d, v in fx_h.items():
         if not is_slave[ns + d]:
@@ -211,13 +215,39 @@ def solve_mixed(solid, shell, material, bcs_solid: list[BC], bcs_shell: list[BC]
     for d in np.nonzero(~used)[0]:
         if not is_slave[ns + d]:
             fixed[int(newidx[ns + d])] = 0.0
+    out = dict(K=K, F=F, T=T, fixed=fixed, ns=ns, nh=nh, D=D, mats_s=mats_s, em_s=em_s, mats_h=mats_h, em_h=em_h,
+               tied=tied, bcs_solid=bcs_solid, bcs_shell=bcs_shell)
+    if mass:
+        from .dynamics import consistent_mass
+        Ms = consistent_mass(solid, rho_e)
+        # シェルの質量: 集中質量（要素の質量を 3 節点に等分）＋ 板厚による回転慣性 ρ t³ A / 12 の 1/3 ずつ
+        rho_h = np.array([m.density_t_mm3 for m in mats_h])[em_h]
+        me = rho_h * shell.thickness * Ah
+        mt = np.bincount(shell.elems.ravel(), np.repeat(me / 3, 3), shell.n_nodes)
+        mr = np.bincount(shell.elems.ravel(), np.repeat(me * shell.thickness ** 2 / 36, 3), shell.n_nodes)
+        out["M"] = sp.bmat([[Ms, None], [None, sp.diags(np.column_stack([mt, mt, mt, mr, mr, mr]).ravel())]],
+                           format="csr")
+        out["mass"] = float((rho_e * np.abs(solid.element_volumes())).sum() + me.sum())
+    return out
+
+
+def solve_mixed(solid, shell, material, bcs_solid: list[BC], bcs_shell: list[BC], solid_materials=None,
+                shell_materials=None, tie_tol=None, log=print, method="auto"):
+    """ソリッド＋シェルの線形静解析。 戻り値: (ソリッドの Result, シェルの Result)"""
+    t0 = time.time()
+    sy = _mixed_system(solid, shell, material, bcs_solid, bcs_shell, solid_materials, shell_materials, tie_tol, log)
+    K, F, T, fixed, ns = sy["K"], sy["F"], sy["T"], sy["fixed"], sy["ns"]
+    mats_s, em_s, mats_h, em_h, D, tied = sy["mats_s"], sy["em_s"], sy["mats_h"], sy["em_h"], sy["D"], sy["tied"]
+    Kr = (T.T @ K @ T).tocsr()
+    Fr = T.T @ F
     if not fixed:
         raise ValueError("拘束（固定支持 または 変位）がありません")
+    nk = Kr.shape[0]
     cd = np.array(sorted(fixed), np.int64)
     cv = np.array([fixed[int(d)] for d in cd])
-    free = np.ones(len(keep), bool)
+    free = np.ones(nk, bool)
     free[cd] = False
-    ur = np.zeros(len(keep))
+    ur = np.zeros(nk)
     ur[cd] = cv
     Kff = Kr[free][:, free].tocsc()
     rhs = Fr[free] - Kr[free][:, cd] @ cv
@@ -247,6 +277,44 @@ def solve_mixed(solid, shell, material, bcs_solid: list[BC], bcs_shell: list[BC]
     rh = _shell_post(shell, uh, mats_h, em_h, reac_h, dict(info, 節点数=shell.n_nodes, 要素数=shell.n_elems))
     rs.tied_nodes = rh.tied_nodes = tied
     return rs, rh
+
+
+def solve_mixed_modal(solid, shell, material, bcs_solid, bcs_shell, n_modes=6, solid_materials=None,
+                      shell_materials=None, tie_tol=None, log=print):
+    """ソリッド＋シェルのモーダル解析。 戻り値: (振動数 [Hz], [(ソリッドの Result, シェルの Result), …])
+    モード形は最大変位 1 に正規化（変形・応力は相対値）"""
+    import scipy.sparse.linalg as spla
+    t0 = time.time()
+    sy = _mixed_system(solid, shell, material, bcs_solid, bcs_shell, solid_materials, shell_materials, tie_tol, log,
+                       supports_only=True, mass=True)
+    T, ns = sy["T"], sy["ns"]
+    Kr = (T.T @ sy["K"] @ T).tocsr()
+    Mr = (T.T @ sy["M"] @ T).tocsr()
+    free = np.ones(Kr.shape[0], bool)
+    if sy["fixed"]:
+        free[np.fromiter(sy["fixed"].keys(), np.int64)] = False
+    Kff, Mff = Kr[free][:, free].tocsc(), Mr[free][:, free].tocsc()
+    lam_ref = float(Kff.diagonal().mean() / max(Mff.diagonal().mean(), 1e-300))
+    nm = min(int(n_modes), Kff.shape[0] - 2)
+    w2, X = spla.eigsh(Kff, k=nm, M=Mff, sigma=-1e-6 * lam_ref, which="LM")
+    o = np.argsort(w2)
+    freqs = np.sqrt(np.maximum(w2[o], 0.0)) / (2 * np.pi)
+    info = {"解析": "モーダル（ソリッド＋シェル）", "自由度数": int(free.sum()), "質量 [kg]": sy["mass"] * 1000,
+            "合計時間 [s]": round(time.time() - t0, 2)}
+    out = []
+    for j in o:
+        ur = np.zeros(Kr.shape[0])
+        ur[free] = X[:, j]
+        u = T @ ur
+        us, uh = u[:ns], u[ns:]
+        sc = 1.0 / max(np.abs(us).max(initial=0.0), np.abs(uh.reshape(-1, 6)[:, :3]).max(initial=0.0), 1e-300)
+        us, uh = us * sc, uh * sc
+        stress, strain = nodal_stress(solid, us, sy["D"], elem_mat=sy["em_s"])
+        rs = Result(solid, sy["mats_s"][0], us.reshape(-1, 3).copy(), stress, strain, {}, dict(info), sy["mats_s"],
+                    sy["em_s"])
+        rh = _shell_post(shell, uh, sy["mats_h"], sy["em_h"], {}, dict(info))
+        out.append((rs, rh))
+    return freqs, out
 
 
 # ---------------------------------------------------------------------------- 1 つのモデルとして扱う
@@ -355,11 +423,11 @@ class MixedMesh(Mesh):
         return self
 
 
-def run_mixed(project, mesh: MixedMesh, log=print) -> Result:
-    """プロジェクトの設定（材料・境界条件）で、ソリッド＋シェルのモデルを解く。 結果は MixedMesh の節点の並び"""
+def run_mixed(project, mesh: MixedMesh, log=print) -> list:
+    """プロジェクトの設定（材料・境界条件）で、ソリッド＋シェルのモデルを解く。 結果（Result のリスト）は MixedMesh の節点の並び"""
     p = project
-    if p.analysis_type != "static":
-        raise ValueError("ソリッドとシェルを混ぜたモデルは、いまは静的構造（線形）だけ解けます")
+    if p.analysis_type not in ("static", "modal"):
+        raise ValueError("ソリッドとシェルを混ぜたモデルは、いまは静的構造（線形）とモーダルだけ解けます")
     s = p.settings
     if s.large_deflection or s.arc_length or any(c for c in p.contacts if not c.suppressed):
         raise ValueError("ソリッドとシェルを混ぜたモデルは、いまは線形の静解析だけです（大変形・接触・弧長法は不可）")
@@ -392,12 +460,37 @@ def run_mixed(project, mesh: MixedMesh, log=print) -> Result:
             origin.append(("shell", i))
     em_s = p.elem_materials(mesh.solid)
     em_h = p.elem_materials(mesh.shell)
+    ns = mesh.ns
+
+    def combine(rs, rh, info):
+        r = Result(mesh, em_s[0][0], np.vstack([rs.u, rh.u]), np.vstack([rs.stress, rh.stress]),
+                   np.vstack([rs.strain, rh.strain]), {}, info, em_s[0], em_s[1])
+        r.extra = {}
+        for k, v in rh.extra.items():
+            a = np.full(mesh.n_nodes, np.nan)
+            a[ns:] = v
+            r.extra[k + "（シェル）" if "シェル" not in k else k] = a
+        r.parts = (rs, rh)
+        return r
+    if p.analysis_type == "modal":
+        o = p.analysis_opts or {}
+        if o.get("prestress"):
+            raise ValueError("ソリッド＋シェルのモーダルでは、プリストレスはまだ使えません")
+        freqs, modes = solve_mixed_modal(mesh.solid, mesh.shell, p.material, bs, bh, int(o.get("n_modes", 6)),
+                                         solid_materials=em_s, shell_materials=em_h, log=log)
+        out = []
+        table = [{"モード": i + 1, "振動数 [Hz]": float(f)} for i, f in enumerate(freqs)]
+        for i, (f, (rs, rh)) in enumerate(zip(freqs, modes)):
+            r = combine(rs, rh, dict(rs.info, 節点数=mesh.n_nodes, 要素数=mesh.n_elems))
+            r.time = float(i + 1)
+            r.info["振動数 [Hz]"] = float(f)
+            r.label = f"モード {i + 1}（{f:.5g} Hz）"
+            r.modal_table = table
+            r.mode_shape = True
+            out.append(r)
+        return out
     rs, rh = solve_mixed(mesh.solid, mesh.shell, p.material, bs, bh, solid_materials=em_s, shell_materials=em_h,
                          log=log, method=s.solver_type)
-    ns = mesh.ns
-    u = np.vstack([rs.u, rh.u])
-    stress = np.vstack([rs.stress, rh.stress])
-    strain = np.vstack([rs.strain, rh.strain])
     reactions = {}
     js = jh = 0
     for which, i in origin:
@@ -411,12 +504,7 @@ def run_mixed(project, mesh: MixedMesh, log=print) -> Result:
             jh += 1
     info = dict(rs.info, 節点数=mesh.n_nodes, 要素数=mesh.n_elems,
                 要素タイプ="ソリッド（四面体）＋シェル（3 節点 DKT＋Allman 膜）")
-    r = Result(mesh, em_s[0][0], u, stress, strain, reactions, info, em_s[0], em_s[1])
-    r.extra = {}
-    for k, v in rh.extra.items():
-        a = np.full(mesh.n_nodes, np.nan)
-        a[ns:] = v
-        r.extra[k + "（シェル）" if "シェル" not in k else k] = a
+    r = combine(rs, rh, info)
+    r.reactions = reactions
     r.time = 1.0
-    r.parts = (rs, rh)
-    return r
+    return [r]
