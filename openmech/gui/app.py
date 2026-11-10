@@ -70,7 +70,7 @@ BC_COLORS.update({"remote_force": "#c2255c", "remote_displacement": "#b8860b", "
                   "spring": "#5f3dc4", "joint": "#0b7285", "bolt_pretension": "#862e9c", "temperature": "#e03131",
                   "heat_flux": "#f76707", "heat_flow": "#fd7e14", "convection": "#1098ad", "radiation": "#f59f00",
                   "heat_generation": "#c92a2a", "insulation": "#868e96", "voltage": "#1971c2", "ground": "#343a40",
-                  "charge": "#9c36b5", "compression_only": "#2f9e44", "submodel": "#5c940d"})
+                  "charge": "#9c36b5", "compression_only": "#2f9e44", "submodel": "#5c940d", "cyclic": "#0c8599"})
 BC_UNIT = {"displacement": "mm", "force": "N", "pressure": "MPa", "moment": "N·mm", "gravity": "mm/s²",
            "thermal": "°C"}
 
@@ -138,10 +138,11 @@ BC_SPEC = {
     "charge": ([("電荷", "C", 1e-9, False)], set()),
     "joint": ([], {"point"}),
     "submodel": ([], set()),
+    "cyclic": ([], {"point"}),
 }
 NO_FACE_KINDS = ("gravity", "thermal", "heat_generation", "bolt_pretension")
 SUPPORT_LIKE = ("fixed", "displacement", "symmetry", "frictionless", "remote_displacement", "elastic_support",
-                "cylindrical_support", "spring", "joint", "submodel")
+                "cylindrical_support", "spring", "joint", "submodel", "cyclic")
 RESULT_NAME = {k: v for g in RESULT_GROUPS.values() for k, v in g}
 RESULT_TYPE_JP = {
     "全変形 [mm]": "全変形", "相当応力（ミーゼス） [MPa]": "相当 (von-Mises) 応力",
@@ -570,6 +571,7 @@ class MainWindow(QMainWindow):
         R.button(g, "ベアリング", make_icon(BC_COLORS["bearing_load"], "軸"), lambda: self.add_bc("bearing_load"))
         R.button(g, "ボルト予張力", make_icon(BC_COLORS["bolt_pretension"], "ボ"), lambda: self.add_bc("bolt_pretension"))
         R.button(g, "ジョイント", make_icon(BC_COLORS["joint"], "関"), lambda: self.add_bc("joint"))
+        R.button(g, "周期対称", make_icon(BC_COLORS["cyclic"], "周"), lambda: self.add_bc("cyclic"))
         g = R.add_group(t, "サブモデル")
         R.button(g, "切断境界", make_icon(BC_COLORS["submodel"], "切"), lambda: self.add_bc("submodel"))
         R.button(g, "粗い結果を保存", make_icon(BC_COLORS["submodel"], "保"), self.save_coarse_result)
@@ -3271,6 +3273,12 @@ class MainWindow(QMainWindow):
             chk.setChecked(bool(o.get("prestress")))
             chk.toggled.connect(lambda v: self._opt("prestress", bool(v)))
             self._row(s, "プリストレス", chk)
+            if any(b.kind == "cyclic" for b in p.bcs):
+                ed = QLineEdit(str(o.get("cyclic_harmonics", "all")))
+                ed.setPlaceholderText("all = 0〜N/2、または 0,1,2 のように指定")
+                ed.editingFinished.connect(lambda: self._opt("cyclic_harmonics", ed.text().strip() or "all"))
+                self._row(s, "周期対称の調和指数", ed)
+                self._row(s, "", "調和指数ごとに「モード数」個ずつ求めます（0 = 全セクタが同じ動き）")
             self._row(s, "", "結果の「表示時間」でモードを切り替えます。変形・応力の大きさは相対値（質量正規化）")
         if t == "buckling":
             ispin("n_buckling", o.get("n_buckling", 3), 1, 50, "モード数")
@@ -3839,6 +3847,8 @@ class MainWindow(QMainWindow):
             self._details_joint(i, bc, sec)
         if bc.kind == "submodel":
             self._details_submodel(i, bc, sec)
+        if bc.kind == "cyclic":
+            self._details_cyclic(i, bc, sec)
         if bc.kind == "bolt_pretension":
             self._row(sec, "ボルトのボディ", self._combo(
                 [(self._body_label(b), int(b)) for b in (self.mesh.body_ids() if self.mesh is not None else [0])],
@@ -3858,6 +3868,26 @@ class MainWindow(QMainWindow):
                  "remote_force": "変形可は面を硬くしない（RBE3）。剛体は面を剛体として結ぶ"}
         if bc.kind in notes:
             self._row(sec, "", notes[bc.kind])
+
+    def _details_cyclic(self, i, bc, sec):
+        """周期対称: 低い側の面（上の「面」）・高い側の面・セクタ数・軸"""
+        o = bc.options or {}
+        hf = list(o.get("high_faces") or [])
+        b2 = QPushButton(f"選択中の面を高い側にする（いま {len(hf)} 面）")
+        b2.clicked.connect(lambda: (self._bc_opt(i, "high_faces", [int(f) for f in self.selected_faces]),
+                                    self._later(self.build_details)))
+        self._row(sec, "高い側の面", b2)
+        ns = dspin(int(o.get("sectors", 12)), 2, 100000, 0, 1)
+        ns.valueChanged.connect(lambda v: self._bc_opt(i, "sectors", int(v)))
+        self._row(sec, "セクタ数（360° ÷ セクタの角度）", ns)
+        cur = list(o.get("axis") or [0, 0, 1])
+        k = int(np.argmax(np.abs(cur)))
+        self._row(sec, "回転軸の向き", self._combo([("X", 0), ("Y", 1), ("Z", 2)], k, lambda v: self._bc_opt(
+            i, "axis", [1.0 if j == int(v) else 0.0 for j in range(3)])))
+        self._row(sec, "", "1 セクタだけをモデルにして、切断面の片方（上の「面」= 低い側）ともう片方（高い側）を結びます。"
+                           "高い側の変位 = 低い側の変位を 360°/セクタ数 だけ回したもの。「位置」は軸上の点です。"
+                           "静解析は荷重もセクタごとに同じ場合、モーダルは調和指数ごとに全周の振動数を求めます"
+                           "（解析の設定で調和指数を選べます）。両面のメッシュは一致していなくても構いません。")
 
     def _details_submodel(self, i, bc, sec):
         """サブモデルの切断境界: 粗いモデルの結果ファイルと座標のずれ"""
@@ -4174,6 +4204,9 @@ class MainWindow(QMainWindow):
             bc.options = {"body": int(self.selected_bodies[0]) if self.selected_bodies else 0}
         if kind == "submodel":
             bc.options = {"file": "", "offset": [0.0, 0.0, 0.0]}
+        if kind == "cyclic":
+            bc.options = {"high_faces": [], "sectors": 12, "axis": [0.0, 0.0, 1.0]}
+            bc.point = [0.0, 0.0, 0.0]
         if kind == "joint":
             # 最初に選んでいる面を参照側にする（可動側は詳細の「選択中の面を可動側に」で。なければ地面とのジョイント）
             bc.options = {"type": "revolute", "ground": True, "axis": [0.0, 0.0, 1.0]}

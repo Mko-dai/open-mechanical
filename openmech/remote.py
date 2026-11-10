@@ -14,7 +14,7 @@ import scipy.sparse as sp
 
 from .surface import surface_sets
 
-REMOTE_KINDS = ("remote_force", "remote_displacement", "point_mass", "elastic_support", "cylindrical_support",
+REMOTE_KINDS = ("cyclic", "remote_force", "remote_displacement", "point_mass", "elastic_support", "cylindrical_support",
                 "bearing_load", "spring", "joint")
 # ジョイント（Ansys の Joint と同じ種類）: 局所座標の自由な自由度（0-2 並進 x,y,z、3-5 回転 x,y,z。z が軸）
 JOINT_FREE = {"fixed": [], "revolute": [5], "cylindrical": [2, 5], "translational": [0], "slot": [0, 3, 4, 5],
@@ -262,12 +262,89 @@ def extra_terms(mesh, bcs, kref: float, acc=None) -> Extra:
             ex.notes.append(f"{b.label()}: 地面との固定ジョイント（固定支持と同じ）")
         ex.joints[i] = {"type": jt, "free": free, "E": E, "point": p, "nodes_b": nodes, "dof": dj, "ground": ground}
 
+    def cyclic(i, b):
+        """周期対称（Ansys の Cyclic Region）: 1 セクタだけのモデルで、高い側の面の変位を
+        低い側の面の変位を 360°/N 回したものに等しくする  u_high = R(α) u_low（荷重も周期的な場合 = 調和指数 0）。
+        faces = 低い側の面、options: high_faces, sectors（セクタ数 N）, axis（軸の向き）, point（軸上の点）。
+        メッシュが両面で一致していなくてもよい（低い側の面の上で内挿する）"""
+        from .contact import _project, _tri6
+        from scipy.spatial import cKDTree
+        o = b.options or {}
+        hf = [int(f) for f in (o.get("high_faces") or [])]
+        if not b.faces or not hf:
+            raise ValueError(f"{b.label()}: 低い側と高い側の面を両方選んでください")
+        nsec = int(o.get("sectors", 0) or 0)
+        if nsec < 2:
+            raise ValueError(f"{b.label()}: セクタ数（2 以上）を入力してください")
+        a = np.asarray(o.get("axis", [0.0, 0.0, 1.0]), float)
+        a = a / np.linalg.norm(a)
+        p0 = np.asarray(b.point if len(b.point) == 3 else [0.0, 0.0, 0.0], float)
+        low_n = mesh.face_nodes(list(b.faces))
+        high_n = mesh.face_nodes(hf)
+
+        def rot(al):
+            Kx = np.array([[0, -a[2], a[1]], [a[2], 0, -a[0]], [-a[1], a[0], 0]])
+            return np.eye(3) + np.sin(al) * Kx + (1 - np.cos(al)) * (Kx @ Kx)
+        tris = np.concatenate([mesh.face_tris(int(f)) for f in b.faces])
+        tp = mesh.nodes[tris[:, :3]]
+        tree = cKDTree(tp.mean(axis=1))
+        size = float(np.sqrt(np.median(np.linalg.norm(np.cross(tp[:, 1] - tp[:, 0], tp[:, 2] - tp[:, 0]), axis=1))))
+        # 回す向き（+α か −α か）は、高い側の面が低い側の面に重なる方を選ぶ
+        both = np.intersect1d(low_n, high_n)                 # 軸上の節点（両方の面に入る）
+        hn = np.setdiff1d(high_n, both)
+        best = None
+        for sg in (1.0, -1.0):
+            R = rot(sg * 2 * np.pi / nsec)
+            xb = (mesh.nodes[hn] - p0) @ R + p0              # 高い側の節点を −α 回す（R の転置を掛ける）
+            bt, bc, d = _project(xb, tp, tree, min(8, len(tris)))
+            if best is None or np.median(d) < best[0]:
+                best = (float(np.median(d)), R, xb, bt, bc, d)
+        dmed, R, xb, bt, bc, d = best
+        if dmed > 0.05 * size or d.max() > 0.5 * size:
+            raise ValueError(f"{b.label()}: 高い側の面を 360°/{nsec} 回しても低い側の面に重なりません"
+                             f"（ずれ 中央値 {dmed:.3g} mm、最大 {d.max():.3g} mm）。軸・セクタ数・面を確認してください")
+        masters = tris[bt][:, :3]
+        w = bc
+        if tris.shape[1] == 6:
+            # 2 次要素: 6 節点三角形の形状関数で内挿（面内の座標は平らな三角形での射影を使う）
+            masters = tris[bt]
+            w = _tri6(bc[:, 1], bc[:, 2])[0]
+        low_set = set(int(x) for x in low_n)
+        for k, nd in enumerate(hn):
+            if any(3 * int(nd) + c in ex.mpc for c in range(3)):
+                raise ValueError(f"{b.label()}: 高い側の面がほかの剛体結合・ジョイントと重なっています")
+            keep = np.abs(w[k]) > 1e-9
+            mk, wk = masters[k][keep], w[k][keep]
+            for c in range(3):
+                md, cf = [], []
+                for mj, wj in zip(mk, wk):
+                    for dd in range(3):
+                        if abs(R[c, dd]) > 1e-14:
+                            md.append(3 * int(mj) + dd)
+                            cf.append(R[c, dd] * wj)
+                ex.mpc[3 * int(nd) + c] = (np.asarray(md, np.int64), np.asarray(cf, float))
+        # 軸上の節点: u = R u を満たすのは軸方向の変位だけ
+        if len(both):
+            ax = int(np.argmax(np.abs(a)))
+            if abs(abs(a[ax]) - 1) > 1e-6:
+                raise ValueError(f"{b.label()}: 軸上に節点があるときは、軸を座標軸（X・Y・Z）に平行にしてください")
+            for nd in both:
+                for c in range(3):
+                    if c != ax:
+                        ex.fixed[3 * int(nd) + c] = 0.0
+                        ex.fixed_by.setdefault(i, {})[3 * int(nd) + c] = 0.0
+        del low_set
+        ex.notes.append(f"{b.label()}: {nsec} セクタ（1 セクタ {360 / nsec:g}°）、高い側の節点 {len(hn):,} を低い側に結合")
+
     for i, b in enumerate(bcs):
         if b.kind not in REMOTE_KINDS:
             continue
         cur[0] = i
         if b.kind == "joint":
             joint(i, b)
+            continue
+        if b.kind == "cyclic":
+            cyclic(i, b)
             continue
         Fb = np.zeros(3 * mesh.n_nodes)
         v = [None if x is None else float(x) for x in (list(b.values) + [None] * 6)[:6]]

@@ -57,6 +57,9 @@ def _mode_results(mesh, material, mr, em_pair):
         else:
             r.info["振動数 [Hz]"] = float(mr.freqs[i])
             r.label = f"モード {i + 1}（{mr.freqs[i]:.5g} Hz）"
+            if getattr(mr, "harmonics", None) is not None:
+                r.info["調和指数"] = int(mr.harmonics[i])
+                r.label = f"モード {i + 1}（{mr.freqs[i]:.5g} Hz、調和指数 {int(mr.harmonics[i])}）"
         r.modal_table = table
         r.mode_shape = True          # 変形・応力は相対値（大きさに意味はない）
         out.append(r)
@@ -68,6 +71,14 @@ def run_extra(project, mesh, em, log=print, progress=None):
     o = dict(p.analysis_opts or {})
     t = p.analysis_type
     mat = p.material
+    if t == "modal" and any(b.kind == "cyclic" for b in p.bcs) and o.get("cyclic_harmonics", "all") != "0":
+        # 周期対称: 調和指数ごとに解く（"all" = 0〜N/2、または "0,1,2" のような指定）
+        from .cyclic import solve_cyclic_modal
+        h = o.get("cyclic_harmonics", "all")
+        hs = "all" if h in ("all", "", None) else [int(x) for x in str(h).replace("、", ",").split(",") if x.strip()]
+        mr = solve_cyclic_modal(mesh, mat, p.bcs, n_modes=int(o.get("n_modes", 6)), harmonics=hs, elem_materials=em,
+                                log=log, progress=progress)
+        return _mode_results(mesh, mat, mr, em)
     if t == "modal":
         from .modal import solve_modal
         Ks = None

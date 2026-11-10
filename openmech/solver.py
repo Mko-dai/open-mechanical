@@ -340,9 +340,9 @@ BC_EXTRA_JP = {"remote_force": "リモート荷重", "remote_displacement": "リ
                "temperature": "温度", "heat_flux": "熱流束", "heat_flow": "熱流量", "convection": "対流",
                "radiation": "放射", "heat_generation": "内部発熱", "insulation": "断熱",
                "voltage": "電圧", "charge": "電荷", "ground": "接地", "joint": "ジョイント",
-               "submodel": "サブモデル（切断境界）"}
+               "submodel": "サブモデル（切断境界）", "cyclic": "周期対称"}
 SUPPORT_KINDS = ("fixed", "displacement", "symmetry", "frictionless", "remote_displacement", "elastic_support",
-                 "cylindrical_support", "spring", "joint", "submodel")
+                 "cylindrical_support", "spring", "joint", "submodel", "cyclic")
 
 
 @dataclass
