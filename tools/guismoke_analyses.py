@@ -417,6 +417,79 @@ try:
     P(f"OK  ソリッド＋シェルのモーダル: {[round(float(r.info['振動数 [Hz]']), 1) for r in fr]} Hz")
 except Exception:
     P("NG  ソリッド＋シェル\n" + traceback.format_exc())
+# 組立品（節点を共有しない 2 つの直方体）: モーダルと熱で、接触（結合）が使われること
+try:
+    from openmech.geometry import new_feature
+    w.new_project()
+    app.processEvents()
+    w.project.geometry = {"kind": "model", "features": [
+        new_feature("box", dx=100.0, dy=20.0, dz=20.0),
+        new_feature("box", x=100.0, dx=100.0, dy=20.0, dz=20.0)]}
+    w.remesh(reset_camera=True)
+    app.processEvents()
+    am = w.mesh
+    inf = am.face_info()
+    x_lo = min(inf, key=lambda f: f["centroid"][0])["id"]
+    x_hi = max(inf, key=lambda f: f["centroid"][0])["id"]
+    mt = w.project.material
+    mt.conductivity, mt.specific_heat = 60.5, 434.0
+    fr = run("組立品のモーダル（接触で結合）", "modal", [BC("fixed", [x_lo])], {"n_modes": 3}, results=["全変形 [mm]"],
+             shot="assembly_modal")
+    f1 = float(fr[0].info["振動数 [Hz]"])
+    fb = 0.5596 * np.sqrt(mt.E * (20.0 ** 4 / 12) / (mt.density * 1e-12 * 400.0 * 200.0 ** 4))
+    w.select_node(("contact", 0))
+    app.processEvents()
+    fr = run("組立品の熱（接触で熱が流れる）", "thermal", [BC("temperature", [x_lo], [100.0]), BC("temperature", [x_hi], [0.0])],
+             shot="assembly_thermal")
+    T = fr[-1].extra["温度 [°C]"]
+    Tm = float(T[np.abs(am.nodes[:, 0] - 150.0) < 1e-6].mean()) if np.any(np.abs(am.nodes[:, 0] - 150.0) < 1e-6) \
+        else float(np.interp(150.0, np.sort(am.nodes[:, 0]), T[np.argsort(am.nodes[:, 0])]))
+    P(f"OK  組立品: ボディ {am.body_ids().tolist()} / 接触 {len(w.project.contacts)} 領域 / 1 次 {f1:.5g} Hz"
+      f"（1 本のはりの式 {fb:.5g}）/ x = 150 の温度 {Tm:.4g} °C（直線なら 25）")
+    assert abs(f1 / fb - 1) < 0.05 and abs(Tm - 25.0) < 2.0, "組立品の結果が 1 ボディの値と合いません"
+except Exception:
+    P("NG  組立品\n" + traceback.format_exc())
+# パイプ: 外周（円筒面）の摩擦なし支持＋内圧、回転速度（遠心力）
+try:
+    w.new_project()
+    app.processEvents()
+    w.project.geometry = {"kind": "model", "features": [new_feature("pipe", ro=40.0, ri=20.0, h=10.0)]}
+    w.remesh(reset_camera=True)
+    app.processEvents()
+    pm = w.mesh
+    inf = pm.face_info()
+    curved = sorted((f for f in inf if not f["flat"]), key=lambda f: f["area"])
+    inner, outer = curved[0]["id"], curved[-1]["id"]
+    bottom = min((f for f in inf if f["flat"]), key=lambda f: f["centroid"][2])["id"]
+    w.project.settings.weak_springs = True          # 軸まわりの回転は止めていないので、弱いバネで支える
+    mt = w.project.material
+    fr = run("円筒面の摩擦なし支持＋内圧", "static", [BC("frictionless", [outer]), BC("frictionless", [bottom]),
+                                           BC("pressure", [inner], [100.0])], shot="cyl_frictionless")
+    for i in range(3):
+        w.select_node(("bc", i))
+        app.processEvents()
+    Rr = np.hypot(pm.nodes[:, 0], pm.nodes[:, 1])
+    ur = (fr[-1].u[:, 0] * pm.nodes[:, 0] + fr[-1].u[:, 1] * pm.nodes[:, 1]) / Rr
+    A_ = -100.0 * (1 - mt.nu ** 2) / mt.E / ((1 + mt.nu) + (1 - mt.nu) * 40.0 ** 2 / 20.0 ** 2)
+    ua, ub = float(ur[np.abs(Rr - 20.0) < 1e-3].mean()), float(np.abs(ur[np.abs(Rr - 40.0) < 1e-3]).max())
+    w.add_bc("rotation")
+    app.processEvents()
+    w.select_node(("bc", len(w.project.bcs) - 1))
+    app.processEvents()
+    fr2 = run("回転速度（遠心力）", "static", [BC("frictionless", [bottom]),
+                                        BC("rotation", [], [1000.0], point=[0, 0, 0], options={"axis": [0, 0, 1]})],
+              shot="rotation")
+    ur2 = (fr2[-1].u[:, 0] * pm.nodes[:, 0] + fr2[-1].u[:, 1] * pm.nodes[:, 1]) / Rr
+    # 回転する円板（穴あき、平面応力）の外周の半径の増加
+    a_, b_, rho, om, nu, E_ = 20.0, 40.0, mt.density * 1e-12, 1000.0, mt.nu, mt.E
+    ub_th = rho * om ** 2 * b_ / (4 * E_) * ((1 - nu) * b_ ** 2 + (3 + nu) * a_ ** 2)
+    ub2 = float(ur2[np.abs(Rr - 40.0) < 1e-3].mean())
+    P(f"OK  円筒面の摩擦なし支持: 内面の半径方向の変位 {ua:.4g} mm（ラメの式 {A_ * (20 - 1600 / 20):.4g}）/ 外周の変位 {ub:.2g} mm"
+      f" ｜ 回転速度: 外周の半径の増加 {ub2:.4g} mm（回転円板の式 {ub_th:.4g}）")
+    assert abs(ua / (A_ * (20 - 1600 / 20)) - 1) < 0.05 and abs(ub2 / ub_th - 1) < 0.05, "理論値と合いません"
+    w.project.settings.weak_springs = False
+except Exception:
+    P("NG  パイプ（摩擦なし支持・回転速度）\n" + traceback.format_exc())
 P("完了")
 logf.close()
 w.close()
