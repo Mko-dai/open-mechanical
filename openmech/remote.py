@@ -328,6 +328,16 @@ def extra_terms(mesh, bcs, kref: float, acc=None) -> Extra:
         else:
             dofs = np.r_[dA + np.arange(6), dB + np.arange(6)]
             ex.add_block(dofs, dofs, kg)
+        # 質量（モーダル・過渡用）: 密度は options["density"] [kg/m³]（既定 7850）
+        from .beam import _m_local
+        rho = float(o.get("density", 7850.0) or 0.0) * 1e-12
+        if rho > 0:
+            mg = T12.T @ _m_local(rho, A_, I_, I_, L) @ T12
+            md = np.arange(dA, dA + 6) if dB is None else np.r_[dA + np.arange(6), dB + np.arange(6)]
+            mg = mg[:6, :6] if dB is None else mg
+            ex.mrows.append(np.repeat(md, len(md)))
+            ex.mcols.append(np.tile(md, len(md)))
+            ex.mvals.append(np.asarray(mg, float).ravel())
         ex.beams[i] = {"dA": dA, "dB": dB, "T": T12, "k": kl, "L": L, "radius": rad, "A": A_, "I": I_, "N0": N0}
         ex.notes.append(f"{b.label()}: 長さ {L:.4g} mm、半径 {rad:g} mm" + ("（地面と接続）" if ground else ""))
 

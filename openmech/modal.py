@@ -322,7 +322,8 @@ def solve_modal(mesh: Mesh, material: Material, bcs: list[BC], n_modes: int = 6,
     del K, M          # 大きなモデルでメモリを空ける（質量は刺激係数の計算でもう一度作る）
     t_asm = time.time() - t0
     nfree_body = not any(b.kind in SUPPORT_KINDS + ("remote_displacement", "elastic_support", "cylindrical_support",
-                                                    "spring") for b in bcs)
+                                                    "spring", "submodel")
+                         or (b.kind in ("beam", "joint") and (b.options or {}).get("ground")) for b in bcs)
     # シフト: 支持なし（剛体モード 0 Hz）でも分解できるよう負の値に
     lam_ref = float(Kff.diagonal().mean() / max(Mff.diagonal().mean(), 1e-300))
     w_min = 2 * np.pi * f_min
@@ -342,7 +343,11 @@ def solve_modal(mesh: Mesh, material: Material, bcs: list[BC], n_modes: int = 6,
     lam, vec = _eig(Kff, Mff, n_modes + extra, sigma, log, coords=coords)
     lam, vec = lam[:n_modes], vec[:, :n_modes]
     t_sol = time.time() - t1
-    lam = np.where(np.abs(lam) < 1e-9 * lam_ref, 0.0, lam)
+    # 支持がないときだけ、剛体モード（数値誤差でわずかに 0 からずれる）を 0 Hz にそろえる。
+    # 支持があるモデルでは丸めない: 硬い部品が柔らかいばね・ビームに乗っているとき、本物の低い振動数が
+    # 「剛性の平均 / 質量の平均」に比べてとても小さくなり、0 にされてしまうため
+    if nfree_body:
+        lam = np.where(np.abs(lam) < 1e-9 * lam_ref, 0.0, lam)
     freqs = np.sqrt(np.maximum(lam, 0.0)) / (2 * np.pi)
     # 質量正規化
     nrm = np.sqrt(np.einsum("ij,ij->j", vec, Mff @ vec))

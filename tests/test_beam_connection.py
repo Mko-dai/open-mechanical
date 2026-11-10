@@ -98,3 +98,24 @@ def test_beam_pretension_clamps_joint():
     dN = r2.beams[4]["軸力 [N]"] - P
     assert dN == pytest.approx(F * kb / (kb + kc), rel=0.05)
     assert r2.reactions[0][2] == pytest.approx(P + dN - F, rel=1e-3)        # 残った締め付け力
+
+
+def test_beam_mass_in_modal():
+    """ビーム接続の質量: 地面につないだビームの先の重いブロック。 1 次（横揺れ）は、ばね k = 3EI/L³（せん断込み）と
+    質量（ブロック＋ビームの等価質量 33/140）で決まる振動数に近い"""
+    from openmech.modal import solve_modal
+    heavy = Material("heavy", 2e8, 0.3, 7850.0 * 50, 1e9)
+    m = structured_box(10, 10, 10, 2, 2, 2).to_quadratic()
+    bot = face(m, 2, 0, -1)
+    L2 = 60.0
+    def freq(density):
+        beam = BC("beam", bot, [RAD, E, 0.3], options={"ground": True, "ground_point": [5.0, 5.0, -L2],
+                                                      "behavior": "rigid", "density": density})
+        return solve_modal(m, heavy, [beam], 1, **quiet).freqs[0]
+    f0, f1 = freq(0.0), freq(7850.0 * 2000)       # ビームを極端に重くすると振動数が下がる
+    assert f1 < 0.9 * f0
+    # 質量なしのビーム: ブロックの重心は先端から 5 mm 上にあるので、回転も含めた 2 自由度の系。 上限の目安だけ確認
+    k = 3 * E * I / L2 ** 3
+    mass = 7850.0 * 50 * 1e-12 * 1000.0
+    assert f0 < np.sqrt(k / mass) / (2 * np.pi)
+    assert f0 > 0.5 * np.sqrt(k / mass) / (2 * np.pi)

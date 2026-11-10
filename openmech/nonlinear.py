@@ -811,7 +811,9 @@ def _arc_length(c):
             dl = dl0 = abs(float(s.arc_initial)) * nt
         sgn = 1.0 if du_prev is None else (1.0 if float(du_prev @ dut) >= 0 else -1.0)
         ok, it = False, 0
-        for _attempt in range(10):
+        land = 0
+        for _attempt in range(16):
+            ok = False
             Du, Dl = sgn * dl / nt * dut, sgn * dl / nt
             for it in range(1, s.max_iterations + 1):
                 Rk, Ktk = resid(u + Du, lam + Dl)
@@ -832,6 +834,14 @@ def _arc_length(c):
                 r = r1 if float(Du @ (v + r1 * dutk)) >= float(Du @ (v + r2 * dutk)) else r2
                 Du, Dl = v + r * dutk, Dl + r
             if ok:
+                # 終了する荷重係数を通り過ぎたら、弧長を縮めてやり直し、ちょうどその荷重係数で終わるようにする
+                over = lam + Dl - float(s.arc_max_load)
+                if over > 1e-3 * abs(s.arc_max_load) and Dl > 0 and land < 6 and lam < s.arc_max_load:
+                    dl *= max(0.02, (float(s.arc_max_load) - lam) / Dl)
+                    land += 1
+                    if ps is not None:
+                        ps.trial = None
+                    continue
                 break
             dl *= 0.5
             if ps is not None:
@@ -859,7 +869,7 @@ def _arc_length(c):
         results.append(rr)
         if c["progress"]:
             c["progress"](min(0.95, step / s.arc_max_steps), f"弧長法 {step} 点 / 荷重係数 {lam:.4g}")
-        if lam >= s.arc_max_load or (s.arc_max_disp > 0 and umax >= s.arc_max_disp):
+        if lam >= s.arc_max_load * (1 - 1e-3) or (s.arc_max_disp > 0 and umax >= s.arc_max_disp):
             break
         dl = float(np.clip(dl * min(np.sqrt(4.0 / max(it - 1, 1)), 1.6), 0.02 * dl0, float(s.arc_growth) * dl0))
     lams = [r.time for r in results]

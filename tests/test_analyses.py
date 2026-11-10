@@ -340,6 +340,7 @@ def test_arc_length_elastica_column():
     lam = np.array([2 * r.time for r in rs]) / k
     d = np.array([-r.u[tip, 2] / L for r in rs])
     assert np.interp(1.063, lam, d) == pytest.approx(0.422, rel=0.03)
+    assert rs[-1].time == pytest.approx(0.6, rel=2e-3)        # 終了する荷重係数ちょうどで終わる
     assert np.interp(1.152, lam, d) == pytest.approx(0.593, rel=0.03)
 
 
