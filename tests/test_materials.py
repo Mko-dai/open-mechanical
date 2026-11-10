@@ -179,3 +179,29 @@ def test_hyperelastic_nearly_incompressible_bending_no_locking():
     E = 9 * K * mu / (3 * K + mu)
     exact = P * 100 ** 3 / (3 * E * 10 * 10 ** 3 / 12) + P * 100 / (5 / 6 * mu * 100)
     assert abs(-r.u[:, 2].min() / exact - 1) < 0.03
+
+
+def test_chaboche_uniaxial_and_cyclic():
+    """Chaboche（背応力 1 項、降伏応力一定）: 単軸の単調負荷 σ = k + (C/γ)(1 − e^{−γ εp})、
+    ひずみ振幅一定の繰り返しで安定したループの頂点 σ = k + (C/γ) tanh(γ Δεp / 2)"""
+    from openmech.mesh import structured_box
+    from openmech.nonlinear import AnalysisSettings, solve_static
+    from openmech.solver import BC
+    E, k, C, g = 200000.0, 200.0, 50000.0, 500.0
+    mat = Material("m", E, 0.3, 7850, k, plasticity="chaboche", chaboche=[[C, g]])
+    m = structured_box(20, 4, 4, 2, 1, 1).to_quadratic()
+
+    def run(factors):
+        bc = BC("displacement", [1], [0.2, None, None])
+        bc.step_factors = factors
+        st = AnalysisSettings(n_steps=len(factors), step_end_times=list(range(1, len(factors) + 1)),
+                              initial_substeps=40, max_substeps=400)
+        return solve_static(m, mat, [BC("symmetry", [0]), BC("symmetry", [2]), BC("symmetry", [4]), bc], settings=st,
+                            elem_materials=([mat.state()], np.zeros(m.n_elems, int)), log=lambda *a: None)
+    eps = 0.2 / 20
+    s = float(np.median(run([1.0])[-1].stress[:, 0]))
+    assert s == pytest.approx(k + C / g * (1 - np.exp(-g * (eps - s / E))), rel=0.005)
+    rs = run([1, -1, 1, -1, 1])
+    s = float(np.median(rs[-1].stress[:, 0]))
+    assert s == pytest.approx(k + C / g * np.tanh(g * (eps - s / E)), rel=0.005)
+    assert float(np.median(rs[-2].stress[:, 0])) == pytest.approx(-s, rel=0.005)      # 引張と圧縮で対称なループ

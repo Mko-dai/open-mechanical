@@ -198,6 +198,10 @@ try:
     w.select_node(("contact", len(w.project.contacts) - 1))
     app.processEvents()
     P(f"OK  ガスケットの詳細: 表 {w.project.contacts[-1].gasket}")
+    w.project.contacts[-1].type, w.project.contacts[-1].sliding = "frictional", "finite"
+    w.select_node(("contact", len(w.project.contacts) - 1))
+    app.processEvents()
+    P("OK  摩擦接触の詳細（有限すべり）")
     w.project.contacts.pop()
     w.rebuild_tree()
 except Exception:

@@ -216,7 +216,7 @@ class ExplicitInternal:
                        if getattr(m, "plastic", False)}
         ng, E = len(wts), mesh.n_elems
         self.ep = np.zeros((ng, E, 6))
-        self.alpha = np.zeros((ng, E, 6))
+        self.alpha = np.zeros((ng, E, max([6] + [m.n_alpha for m, _ in self.models.values()])))
         self.pbar = np.zeros((ng, E))
         self.sig = np.zeros((ng, E, 6))      # 表示用（大変形はコーシー応力）
         self.idx = mesh.elems

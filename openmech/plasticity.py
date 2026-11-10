@@ -42,6 +42,12 @@ class PlasticModel:
         self.sy0, self.tab, self.kin = mstate.hardening()
         self.D_M = self.K * np.outer(I_VOL, I_VOL) + 2 * self.G * P_DEV    # Mandel 弾性
         self.yields = mstate.plasticity != "none"
+        # Chaboche: 背応力を項ごとに持つ（状態 alpha の幅 = 6 × 項数）
+        self.chab = None
+        if mstate.plasticity == "chaboche":
+            self.chab = np.array([[float(r[0]), float(r[1])] for r in mstate.base.chaboche
+                                  if len(r) >= 2 and float(r[0]) > 0])
+        self.n_alpha = 6 * (len(self.chab) if self.chab is not None else 1)
         self.creep = None
         if getattr(mstate, "creeping", False):
             c = mstate.base.creep
@@ -123,6 +129,86 @@ class PlasticModel:
 
     def update(self, eps_M, ep_M, alpha_M, pbar):
         """リターンマッピング。全て Mandel。戻り値: σ_M, ep_M, alpha_M, pbar, C_M（整合接線）"""
+        if self.chab is not None:
+            return self._update_chaboche(eps_M, ep_M, alpha_M, pbar)
+        if alpha_M.shape[1] == 6:
+            return self._update6(eps_M, ep_M, alpha_M, pbar)
+        s, e, a6, pb, C = self._update6(eps_M, ep_M, alpha_M[:, :6], pbar)
+        a = alpha_M.copy()
+        a[:, :6] = a6
+        return s, e, a, pb, C
+
+    def _chab_stress(self, eps_M, ep_M, alpha_M, pbar):
+        """Chaboche の応力更新（後退オイラー）。 背応力 α_i = θ_i (α_i,n + √(2/3) C_i Δp n)、θ_i = 1/(1+γ_i Δp)。
+        Δp は 1 変数の式 √(3/2)|s_tr − Σθ_i α_i,n| − (3G + Σθ_i C_i) Δp − σy(p+Δp) = 0 から求める"""
+        nb = len(self.chab)
+        Cc, gm = self.chab[:, 0], self.chab[:, 1]
+        sig_tr = (eps_M - ep_M) @ self.D_M.T
+        sdev = sig_tr @ P_DEV.T
+        a_n = alpha_M[:, :6 * nb].reshape(len(eps_M), nb, 6)
+        q_tr = np.sqrt(1.5) * np.linalg.norm(sdev - a_n.sum(1), axis=1)
+        sy = _table_eval(self.tab, pbar)[0]
+        yl = q_tr - sy > 1e-10 * max(self.sy0, 1.0)
+        sig, ep, al, pb = sig_tr.copy(), ep_M, alpha_M, pbar
+        if not np.any(yl):
+            return sig, ep, al, pb, yl
+        idx = np.nonzero(yl)[0]
+        G, sd, an, p0 = self.G, sdev[idx], a_n[idx], pbar[idx]
+
+        def gfun(dp):
+            th = 1.0 / (1.0 + gm[None, :] * dp[:, None])
+            xt = sd - np.einsum("mi,mij->mj", th, an)
+            nx = np.linalg.norm(xt, axis=1)
+            return np.sqrt(1.5) * nx - (3 * G + th @ Cc) * dp - _table_eval(self.tab, p0 + dp)[0], xt, nx, th
+        lo = np.zeros(len(idx))
+        hi = q_tr[idx] / (3 * G) + 1e-12
+        for _ in range(60):
+            bad = gfun(hi)[0] > 0
+            if not bad.any():
+                break
+            hi = np.where(bad, 2 * hi, hi)
+        dp = 0.5 * hi * 0 + np.minimum((q_tr[idx] - sy[idx]) / (3 * G + Cc.sum()), hi)
+        for _ in range(80):
+            g0 = gfun(dp)[0]
+            lo = np.where(g0 > 0, dp, lo)
+            hi = np.where(g0 < 0, dp, hi)
+            h = 1e-7 * dp + 1e-14
+            dg = (gfun(dp + h)[0] - g0) / h
+            new = dp - g0 / np.where(dg < 0, dg, -1.0)
+            new = np.where((new <= lo) | (new >= hi), 0.5 * (lo + hi), new)
+            done = np.abs(new - dp) <= 1e-13 * np.maximum(hi, 1e-30)
+            dp = new
+            if done.all():
+                break
+        _g, xt, nx, th = gfun(dp)
+        nvec = xt / np.maximum(nx, 1e-300)[:, None]
+        dep = np.sqrt(1.5) * dp[:, None] * nvec
+        sig[idx] = sig_tr[idx] - 2 * G * dep
+        ep = ep_M.copy()
+        ep[idx] += dep
+        al = alpha_M.copy()
+        a_new = th[:, :, None] * (an + np.sqrt(2.0 / 3.0) * (Cc[None, :] * dp[:, None])[:, :, None] * nvec[:, None, :])
+        al[idx, :6 * nb] = a_new.reshape(len(idx), -1)
+        pb = pbar.copy()
+        pb[idx] = p0 + dp
+        return sig, ep, al, pb, yl
+
+    def _update_chaboche(self, eps_M, ep_M, alpha_M, pbar):
+        sig, ep, al, pb, yl = self._chab_stress(eps_M, ep_M, alpha_M, pbar)
+        C = np.broadcast_to(self.D_M, (len(eps_M), 6, 6)).copy()
+        if np.any(yl):
+            # 整合接線は応力更新の数値微分（降伏している点だけ）。 γ があると非対称になるので対称部分を使う
+            idx = np.nonzero(yl)[0]
+            h = 1e-5 * max(self.sy0, 1.0) / self.E
+            Cy = np.empty((len(idx), 6, 6))
+            for j in range(6):
+                e2 = eps_M[idx].copy()
+                e2[:, j] += h
+                Cy[:, :, j] = (self._chab_stress(e2, ep_M[idx], alpha_M[idx], pbar[idx])[0] - sig[idx]) / h
+            C[idx] = 0.5 * (Cy + Cy.transpose(0, 2, 1))
+        return sig, ep, al, pb, C
+
+    def _update6(self, eps_M, ep_M, alpha_M, pbar):
         n = len(eps_M)
         sig_tr = (eps_M - ep_M) @ self.D_M.T
         xi = sig_tr @ P_DEV.T - alpha_M
@@ -200,7 +286,7 @@ class PlasticSolid:
             self.dNdX_c, detc = _dN_dx(X, shape_dN_dxi(Lc, nn))
             self.wd_c = np.sum(self.wts) * detc
         self.ep = np.zeros((ng, E, 6))
-        self.alpha = np.zeros((ng, E, 6))
+        self.alpha = np.zeros((ng, E, max([6] + [m.n_alpha for m in self.models.values()])))
         self.pbar = np.zeros((ng, E))
         self.pcr = np.zeros((ng, E))      # 相当クリープひずみ
         self.trial = None

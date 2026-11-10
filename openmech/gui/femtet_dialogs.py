@@ -315,6 +315,12 @@ class MaterialDialog(QDialog):
         self.mtab = _table(["塑性ひずみ [-]", "応力 [MPa]"], m.ml_table, 4)
         v3.addWidget(self.mtab)
         v3.addWidget(_table_buttons(self.mtab))
+        v3.addWidget(QLabel("Chaboche（非線形移動硬化）: 背応力の項ごとに C と γ（繰り返し荷重のバウシンガー効果・"
+                            "ラチェット）。降伏応力は上の引張降伏応力。上の多直線の表を入れると等方硬化と組み合わせます"))
+        self.chtab = _table(["C [MPa]", "γ [-]"], getattr(m, "chaboche", []), 2)
+        self.chtab.setMinimumHeight(90)
+        v3.addWidget(self.chtab)
+        v3.addWidget(_table_buttons(self.chtab))
         v3.addWidget(QLabel("塑性を設定すると非線形解析（弾塑性）になります。安全率は降伏応力で評価します。"))
         tabs.addTab(t3, "強度・塑性")
         # --- 熱伝導（熱解析）
@@ -444,6 +450,9 @@ class MaterialDialog(QDialog):
             raise ValueError("多直線硬化の表（塑性ひずみ・応力）を入力してください")
         if self.plast.currentData().startswith("bilinear") and self.sy.value() <= 0:
             raise ValueError("2直線硬化には降伏応力が必要です")
+        ch = _table_rows(self.chtab, 2)
+        if self.plast.currentData() == "chaboche" and (not ch or self.sy.value() <= 0):
+            raise ValueError("Chaboche には降伏応力と、C・γ の表（1 行以上）が必要です")
         return Material(self.name.text().strip(), self.E.value(), self.nu.value(), self.rho.value(),
                         self.sy.value(), self.su.value(), elastic=model,
                         temp_table=_table_rows(self.ttab, 3),
@@ -451,7 +460,7 @@ class MaterialDialog(QDialog):
                         aniso=aniso, alpha=self.alpha.value() * 1e-6,
                         alpha_ortho=[sp.value() * 1e-6 for sp in self.ao] if any(sp.value() for sp in self.ao) else [],
                         ref_temp=self.tref.value(), plasticity=self.plast.currentData(),
-                        tangent_modulus=self.et.value(), ml_table=mt,
+                        tangent_modulus=self.et.value(), ml_table=mt, chaboche=ch,
                         conductivity=self.kc.value(), specific_heat=self.cp.value(),
                         permittivity=self.epsr.value(), piezo=self._piezo(),
                         sn_table=_table_rows(self.sntab, 2), hyper=self._hyper(), creep=self._creep(),

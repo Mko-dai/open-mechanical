@@ -12,7 +12,8 @@ import numpy as np
 
 ELASTIC_MODELS = {"isotropic": "等方弾性", "orthotropic": "直交異方性弾性", "anisotropic": "異方性弾性"}
 PLASTIC_MODELS = {"none": "なし（線形弾性）", "bilinear_iso": "等方硬化（2直線）", "multilinear_iso": "等方硬化（多直線）",
-                  "bilinear_kin": "移動硬化（2直線）", "multilinear_kin": "移動硬化（多直線）"}
+                  "bilinear_kin": "移動硬化（2直線）", "multilinear_kin": "移動硬化（多直線）",
+                  "chaboche": "Chaboche（非線形移動硬化）"}
 
 
 @dataclass
@@ -44,6 +45,9 @@ class Material:
     plasticity: str = "none"
     tangent_modulus: float = 0.0
     ml_table: list = field(default_factory=list)
+    # Chaboche（非線形移動硬化）: [[C_i MPa, γ_i], ...]  背応力 dα_i = (2/3) C_i dεp − γ_i α_i dp
+    # 降伏応力は yield_strength。 ml_table を入れると等方硬化（σy(εp) の表）と組み合わせる（Ansys の Chaboche + MISO）
+    chaboche: list = field(default_factory=list)
     # 熱（Ansys Engineering Data の「等方熱伝導率」「比熱」）
     conductivity: float = 0.0     # 熱伝導率 [W/(m·K)]（0 = 未設定）
     specific_heat: float = 0.0    # 比熱 [J/(kg·K)]
@@ -175,6 +179,14 @@ class MaterialState:
         if b.plasticity == "none":
             return 1e30, [(0.0, 1e30)], False          # クリープのみ（降伏しない）
         kin = b.plasticity.endswith("_kin")
+        if b.plasticity == "chaboche":
+            if not [r for r in b.chaboche if len(r) >= 2 and float(r[0]) > 0]:
+                raise ValueError(f"材料「{b.name}」の Chaboche の定数（C, γ）を入力してください")
+            sy = float(b.yield_strength)
+            tab = sorted(([float(r[0]), float(r[1])] for r in b.ml_table if len(r) >= 2), key=lambda r: r[0])
+            if tab and tab[0][0] > 0:
+                tab.insert(0, [0.0, tab[0][1]])
+            return (tab[0][1] if tab else sy), ([tuple(r) for r in tab] if tab else [(0.0, sy), (1.0, sy)]), False
         if b.plasticity.startswith("bilinear"):
             E = self.E
             Et = min(float(b.tangent_modulus), 0.999 * E)
