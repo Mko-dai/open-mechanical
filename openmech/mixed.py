@@ -334,6 +334,84 @@ def solve_mixed(solid, shell, material, bcs_solid: list[BC], bcs_shell: list[BC]
     return rs, rh
 
 
+def solve_mixed_nonlinear(solid, shell, material, bcs_solid, bcs_shell, contacts, settings, solid_materials=None,
+                          shell_materials=None, tie_tol=None, log=print, contact_tolerance=0.0):
+    """ソリッド＋シェルを、ソリッドの非線形の解き方（開閉・摩擦のある接触、ソリッドの塑性、複数ステップ）で解く。
+    シェルは線形の剛性を「追加の自由度」として足し、結合は多点拘束で消去する。
+    戻り値: [(ソリッドの Result, シェルの Result), ...]（ステップごと）"""
+    from .nonlinear import solve_static
+    from .shell import _frames, _shell_dofs, plane_stress_D, shell_constraints, shell_element_K
+    for b in bcs_solid:
+        if b.kind not in SOLID_BC:
+            raise ValueError(f"ソリッド＋シェルの解析では「{b.label()}」はまだ使えません")
+    for b in bcs_shell:
+        if b.kind not in SHELL_BC:
+            raise ValueError(f"ソリッド＋シェルの解析では、シェル側の「{b.label()}」はまだ使えません")
+    mats_h, em_h = shell_materials if shell_materials is not None else ([material], np.zeros(shell.n_elems, np.int64))
+    em_h = np.asarray(em_h, np.int64)
+    if any(getattr(m, "plastic", False) for m in mats_h):
+        raise ValueError("ソリッド＋シェルで開閉・摩擦のある接触や複数ステップを使うとき、シェル側の塑性はまだ使えません"
+                         "（ソリッド側の塑性は使えます）")
+    Dp = np.stack([plane_stress_D(material_D(m)) for m in mats_h])[em_h]
+    Xh = shell.nodes[shell.elems]
+    Ke, _R, _xy, Ah = shell_element_K(Xh, shell.thickness, Dp)
+    dofs = _shell_dofs(shell.elems)
+    nh = 6 * shell.n_nodes
+    Kh = sp.coo_matrix((Ke.ravel(), (np.repeat(dofs, 18, axis=1).ravel(), np.tile(dofs, (1, 18)).ravel())),
+                       shape=(nh, nh))
+    normals = _frames(Xh)[0][:, 2]
+    used = np.zeros(nh, bool)
+    used[dofs.ravel()] = True
+    mpc, tied = tie_shell_to_solid(solid, shell, tie_tol, log)
+    if not len(tied):
+        raise ValueError("シェルの節点がソリッドの表面に乗っていません（シェルの辺・面をソリッドの面に接するように置いてください）")
+    off = [0]
+
+    def setup(ex):
+        o = off[0] = ex.n
+        ex.n_extra += nh
+        ex.rows.append(Kh.row + o)
+        ex.cols.append(Kh.col + o)
+        ex.vals.append(Kh.data)
+        for d, (md, cf) in mpc.items():
+            ex.mpc[o + int(d)] = (np.asarray(md), np.asarray(cf, float))
+        ex.direct = True
+        xb, xp = [], []
+        for b in bcs_shell:
+            Fh, fx = shell_constraints(shell, [b], mats_h, em_h, Ah, normals)
+            F = np.zeros(ex.n)
+            F[o:o + nh] = Fh
+            xb.append(b)
+            xp.append((F, {o + int(d): v for d, v in fx.items() if int(d) not in mpc}))
+        idle = np.nonzero(~used)[0]
+        if len(idle):
+            xb.append(BC("fixed", [], name="（シェルの使っていない自由度）"))
+            xp.append((np.zeros(ex.n), {o + int(d): 0.0 for d in idle if int(d) not in mpc}))
+        return xb, xp
+    res = solve_static(solid, material, bcs_solid, contacts, settings, elem_materials=solid_materials, log=log,
+                       contact_tolerance=contact_tolerance, extra_setup=setup)
+    Khc = Kh.tocsr()
+    out = []
+    nbs = len(bcs_solid)
+    from .nonlinear import _step_factor
+    ends = settings.end_times()
+    for rs in res:
+        uh = rs.u_full[off[0]:off[0] + nh]
+        Rh = Khc @ uh
+        for b in bcs_shell:                 # 反力 = 内力 − その時刻の荷重
+            if b.kind not in ("fixed", "displacement", "symmetry", "frictionless"):
+                Rh = Rh - _step_factor(b, rs.time, ends) * shell_constraints(shell, [b], mats_h, em_h, Ah, normals)[0]
+        reac_h = {}
+        for i, b in enumerate(bcs_shell):
+            if b.kind in ("fixed", "displacement", "symmetry", "frictionless"):
+                reac_h[i] = Rh.reshape(-1, 6)[shell.face_nodes(b.faces), :3].sum(0)
+        rs.reactions = {i: v for i, v in rs.reactions.items() if i < nbs}
+        rh = _shell_post(shell, uh, mats_h, em_h, reac_h, dict(rs.info, 節点数=shell.n_nodes, 要素数=shell.n_elems))
+        rs.tied_nodes = rh.tied_nodes = tied
+        out.append((rs, rh))
+    return out
+
+
 def solve_mixed_modal(solid, shell, material, bcs_solid, bcs_shell, n_modes=6, solid_materials=None,
                       shell_materials=None, tie_tol=None, log=print, K_add=None):
     """ソリッド＋シェルのモーダル解析。 戻り値: (振動数 [Hz], [(ソリッドの Result, シェルの Result), …])
@@ -520,17 +598,19 @@ def run_mixed(project, mesh: MixedMesh, log=print) -> list:
         p.contacts = detect_contacts(mesh.solid, p.contact_tolerance, p.contact_default_type, p.contact_default_mu)
         cs = list(p.contacts)
     Kc = None
+    nonlin = False
     if cs:
         for c in cs:
             if any(int(f) >= mesh.nfs for f in list(c.contact_faces) + list(c.target_faces)):
                 raise ValueError(f"接触「{c.name}」: シェルの面・辺は接触に使えません（シェルはソリッドに自動で結合されます）")
-            if p.analysis_type == "static" and c.type not in LINEAR_TYPES:
-                raise ValueError(f"接触「{c.name}」: ソリッドとシェルを混ぜたモデルの静解析では、結合 と 分離なし だけ使えます"
-                                 "（摩擦なし・摩擦あり・粗いは不可）")
-        Kc = linear_contact_stiffness(mesh.solid, cs, em_s[0], em_s[1], p.contact_tolerance)
-        if Kc is not None:
-            log(f"接触: ソリッドどうしの {len(cs)} 領域を線形の接触として含めます")
-    if mesh.solid_unshared and Kc is None:
+        nonlin = p.analysis_type == "static" and (any(c.type not in LINEAR_TYPES for c in cs) or s.n_steps > 1)
+        if not nonlin:
+            Kc = linear_contact_stiffness(mesh.solid, cs, em_s[0], em_s[1], p.contact_tolerance)
+            if Kc is not None:
+                log(f"接触: ソリッドどうしの {len(cs)} 領域を線形の接触として含めます")
+    elif p.analysis_type == "static" and s.n_steps > 1:
+        nonlin = True
+    if mesh.solid_unshared and Kc is None and not nonlin:
         raise ValueError("ソリッドのボディどうしがつながっていません（接触領域を設定するか、節点共有にしてください）")
 
     def combine(rs, rh, info):
@@ -564,22 +644,40 @@ def run_mixed(project, mesh: MixedMesh, log=print) -> list:
             r.mode_shape = True
             out.append(r)
         return out
+    def finish(rs, rh, t):
+        reactions = {}
+        js = jh = 0
+        for which, i in origin:
+            if which == "solid":
+                if js in rs.reactions:
+                    reactions[i] = reactions.get(i, 0) + rs.reactions[js]
+                js += 1
+            else:
+                if jh in rh.reactions:
+                    reactions[i] = reactions.get(i, 0) + rh.reactions[jh]
+                jh += 1
+        info = dict(rs.info, 節点数=mesh.n_nodes, 要素数=mesh.n_elems,
+                    要素タイプ="ソリッド（四面体）＋シェル（3 節点 DKT＋Allman 膜）")
+        r = combine(rs, rh, info)
+        r.reactions = reactions
+        r.time = t
+        return r
+    if nonlin:
+        log("ソリッド＋シェル: ソリッドの非線形の解き方（接触の開閉・摩擦、複数ステップ）で解きます。シェルは線形です")
+        out = []
+        for rs, rh in solve_mixed_nonlinear(mesh.solid, mesh.shell, p.material, bs, bh, cs, s, solid_materials=em_s,
+                                            shell_materials=em_h, log=log, contact_tolerance=p.contact_tolerance):
+            r = finish(rs, rh, float(getattr(rs, "time", 1.0)))
+            for k in ("contact", "step", "label"):
+                if hasattr(rs, k):
+                    setattr(r, k, getattr(rs, k))
+            if getattr(rs, "contact", None):
+                for k, v in rs.contact.items():
+                    a = np.full(mesh.n_nodes, np.nan)
+                    a[:ns] = v
+                    r.extra[k] = a
+            out.append(r)
+        return out
     rs, rh = solve_mixed(mesh.solid, mesh.shell, p.material, bs, bh, solid_materials=em_s, shell_materials=em_h,
                          log=log, method=s.solver_type, K_add=Kc, settings=s)
-    reactions = {}
-    js = jh = 0
-    for which, i in origin:
-        if which == "solid":
-            if js in rs.reactions:
-                reactions[i] = reactions.get(i, 0) + rs.reactions[js]
-            js += 1
-        else:
-            if jh in rh.reactions:
-                reactions[i] = reactions.get(i, 0) + rh.reactions[jh]
-            jh += 1
-    info = dict(rs.info, 節点数=mesh.n_nodes, 要素数=mesh.n_elems,
-                要素タイプ="ソリッド（四面体）＋シェル（3 節点 DKT＋Allman 膜）")
-    r = combine(rs, rh, info)
-    r.reactions = reactions
-    r.time = 1.0
-    return [r]
+    return [finish(rs, rh, 1.0)]

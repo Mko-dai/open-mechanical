@@ -191,7 +191,7 @@ def _step_factor(bc: BC, t: float, ends: list[float]) -> float:
 
 def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[ContactRegion] | None = None,
                  settings: AnalysisSettings | None = None, elem_materials=None, log=print,
-                 progress=None, contact_tolerance: float = 0.0, dynamic=None) -> list[Result]:
+                 progress=None, contact_tolerance: float = 0.0, dynamic=None, extra_setup=None) -> list[Result]:
     """静的構造解析（接触・大変形・複数ステップ対応）。各ステップ終了時の Result のリストを返す。
 
     dynamic（DynamicSettings）を渡すと、同じ非線形の解き方に慣性力と減衰力を加えた過渡構造解析（陰解法・
@@ -245,6 +245,15 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
         for i, b in enumerate(bcs):
             if b.kind in REMOTE_KINDS:
                 per_bc[i] = (ex.Fvec_of(i), dict(ex.fixed_by.get(i, {})))
+    if extra_setup is not None:
+        # ほかの構造（シェルなど）を追加の自由度として足す: 剛性・多点拘束は ex に、荷重・拘束は境界条件の並びの後ろに
+        if ex is None:
+            from .remote import Extra
+            ex = Extra(nb)
+        xb, xp = extra_setup(ex)
+        ndof = ex.n
+        bcs = list(bcs) + list(xb)
+        per_bc = list(per_bc) + list(xp)
     per_bc = [(np.r_[Fi, np.zeros(ndof - len(Fi))] if len(Fi) < ndof else Fi, fx) for Fi, fx in per_bc]
     ends = settings.end_times()
 
@@ -731,6 +740,8 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
                                         loads_at(t_end)[0][:nb], pairs,
                                         contacts, LD, internal_base, t_end, si + 1, settings, ps,
                                         eps_th_m * th_factor(t_end) if has_th else None))
+            if extra_setup is not None:
+                results[-1].u_full = u.copy()
             if ex is not None and ex.beams:
                 from .remote import beam_results
                 results[-1].beams = beam_results(ex, u)

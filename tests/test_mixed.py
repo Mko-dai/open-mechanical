@@ -169,14 +169,6 @@ def test_mixed_with_two_solid_bodies_bonded():
     assert out[True][0] == pytest.approx(out[False][0], rel=0.01)
     assert out[True][0] == pytest.approx(P * 100.0 ** 3 / (3 * 200000.0 * b * t ** 3 / 12), rel=0.03)
     assert out[True][1] == pytest.approx(out[False][1], rel=0.01)
-    # 分離のある接触は、静解析ではエラーで知らせる
-    m = model(True)
-    p = Project()
-    p.material = S
-    p.contact_default_type = "frictionless"
-    p.bcs = [BC("fixed", [0])]
-    with pytest.raises(ValueError, match="結合 と 分離なし"):
-        p.run_all(m, log=lambda *a: None)
 
 
 @pytest.mark.parametrize("root", ["solid", "shell"])
@@ -209,3 +201,46 @@ def test_mixed_plastic_cantilever(root):
     assert w13 > 1.04 * w_el * 1.3 / 0.6
     peq = (rs if root == "solid" else rh).extra["相当塑性ひずみ"]
     assert np.nanmax(peq) > 1e-4                 # 根元が降伏している（つなぎ目のソリッドも局所的に降伏しうる）
+
+
+def test_mixed_with_frictionless_contact_between_solids():
+    """ソリッド 2 ボディ（摩擦なしの接触）＋シェル: 軸方向に押すと接触が閉じて力が伝わる。
+    先端の縮み = F L / (E A)、接触圧 = F / A。 開閉のある接触なので、ソリッドの非線形の解き方を通る"""
+    from openmech.mesh import Mesh
+    from openmech.mixed import MixedMesh
+    from openmech.project import Project
+    t, b, F = 4.0, 20.0, 1600.0
+    a = structured_box(25, b, t, 6, 5, 2).to_quadratic()
+    c = structured_box(25, b, t, 6, 5, 2, origin=(25, 0, 0)).to_quadratic()
+    solid = Mesh(np.vstack([a.nodes, c.nodes]), np.vstack([a.elems, c.elems + a.n_nodes]))
+    solid.elem_body = np.r_[np.zeros(a.n_elems, int), np.ones(c.n_elems, int)]
+    solid.node_origin = np.arange(solid.n_nodes)
+    solid.group_faces()
+    shell = structured_plate(50, b, 10, 4, t, origin=(50, 0, t / 2))
+    m = MixedMesh(solid, shell, 2)
+    info = m.face_info()
+    tip = next(f["id"] for f in info if f.get("edge") and abs(f["centroid"][0] - 100) < 1e-6)
+    root = next(f["id"] for f in info if not f.get("edge") and abs(f["centroid"][0]) < 1e-6
+                and abs(f["normal"][0]) > 0.99)
+    side = [f["id"] for f in info if not f.get("edge") and f["id"] < m.nfs
+            and (abs(f["centroid"][1]) < 1e-6 or abs(f["centroid"][2]) < 1e-6)]
+    p = Project()
+    p.material = S
+    p.contact_default_type = "frictionless"
+    p.bcs = [BC("fixed", [root]), BC("frictionless", side), BC("force", [tip], [-F, 0, 0])]
+    logs = []
+    r = p.run_all(m, log=logs.append)[-1]
+    assert any("非線形" in x for x in logs)
+    assert len(p.contacts) == 1 and p.contacts[0].type == "frictionless"
+    tipn = m.ns + np.nonzero(np.isclose(shell.nodes[:, 0], 100.0))[0]
+    # 結合（線形の解き方）と同じ縮みになる。 式 F L / (E A) より少し大きいのは、シェルの辺が線でソリッドを押すため
+    p2 = Project()
+    p2.material = S
+    p2.bcs = list(p.bcs)
+    r2 = p2.run_all(m, log=lambda *a: None)[-1]
+    assert p2.contacts[0].type == "bonded"
+    assert r.u[tipn, 0].mean() == pytest.approx(r2.u[tipn, 0].mean(), rel=0.05)      # 差は接触のペナルティのたわみ
+    assert r.u[tipn, 0].mean() == pytest.approx(-F * 100.0 / (200000.0 * b * t), rel=0.12)
+    pc = r.extra["接触圧 [MPa]"]
+    assert np.nanmax(pc) == pytest.approx(F / (b * t), rel=0.1)
+    assert r.reactions[0][0] == pytest.approx(F, rel=1e-3)
