@@ -270,6 +270,13 @@ _MEMR = np.array([0, 1, 5, 6, 7, 11, 12, 13, 17])   # 膜 + 回転（Allman）
 def shell_element_K(X, t, Dp, drill=1e-3, laminate=None):
     """要素剛性（全体座標, (E,18,18)）と 局所座標系 R、局所座標 xy、面積 A
     laminate: composite.Laminates（積層の要素は A・B・D マトリクスで膜・曲げ・連成を作る）"""
+    Kl, R, xy, A = shell_local_K(X, t, Dp, laminate)
+    T = _transform(R)
+    return np.einsum("eki,ekl,elj->eij", T, Kl, T), R, xy, A
+
+
+def shell_local_K(X, t, Dp, laminate=None):
+    """要素の局所座標での剛性 (E,18,18) と 局所座標系 R、局所座標 xy、面積 A"""
     E = len(X)
     R, xy, A = _frames(X)
     Dd = np.broadcast_to(Dp, (E, 3, 3)) if Dp.ndim == 2 else Dp
@@ -294,10 +301,86 @@ def shell_element_K(X, t, Dp, drill=1e-3, laminate=None):
     if Bc is not None:
         Kl[:, _MEMR[:, None], _BEN[None, :]] += Kmb
         Kl[:, _BEN[:, None], _MEMR[None, :]] += Kmb.transpose(0, 2, 1)
-    T = np.zeros((E, 18, 18))
-    for k in range(6):
-        T[:, 3 * k:3 * k + 3, 3 * k:3 * k + 3] = R
-    return np.einsum("eki,ekl,elj->eij", T, Kl, T), R, xy, A
+    return Kl, R, xy, A
+
+
+def _rot_exp(th):
+    """回転ベクトル (N,3) → 回転行列 (N,3,3)（ロドリゲスの式）"""
+    a = np.linalg.norm(th, axis=1)
+    S = np.zeros((len(th), 3, 3))
+    S[:, 0, 1], S[:, 0, 2], S[:, 1, 0] = -th[:, 2], th[:, 1], th[:, 2]
+    S[:, 1, 2], S[:, 2, 0], S[:, 2, 1] = -th[:, 0], -th[:, 1], th[:, 0]
+    small = a < 1e-6
+    aa = np.where(small, 1.0, a)
+    c1 = np.where(small, 1.0 - a ** 2 / 6, np.sin(aa) / aa)
+    c2 = np.where(small, 0.5 - a ** 2 / 24, (1 - np.cos(aa)) / aa ** 2)
+    return np.eye(3)[None] + c1[:, None, None] * S + c2[:, None, None] * (S @ S)
+
+
+def _rot_log(Q):
+    """回転行列 (...,3,3) → 回転ベクトル (...,3)"""
+    ax = 0.5 * np.stack([Q[..., 2, 1] - Q[..., 1, 2], Q[..., 0, 2] - Q[..., 2, 0], Q[..., 1, 0] - Q[..., 0, 1]], -1)
+    sn = np.linalg.norm(ax, axis=-1)
+    cs = 0.5 * (np.trace(Q, axis1=-2, axis2=-1) - 1.0)
+    ang = np.arctan2(sn, cs)
+    k = np.where(sn > 1e-8, ang / np.where(sn > 1e-8, sn, 1.0), 1.0 + sn ** 2 / 6)
+    return ax * k[..., None]
+
+
+class ShellCorot:
+    """大変形（大きな回転・小さなひずみ）のシェル: 共回転の定式化。
+
+    要素ごとに「いまの向き」の座標系を取り直し、剛体の動きを除いた変形（膜の伸びと、節点の回転のうち
+    要素の回転を引いた残り）にだけ線形の要素剛性を使う。 接線には膜力による幾何剛性を足す（張ると硬く、押すと座屈）。
+    節点の回転の自由度は回転ベクトル。 荷重は向きが変わらないもの（追従しない）"""
+
+    def __init__(self, mesh, t, Dp):
+        self.mesh = mesh
+        self.X = mesh.nodes
+        self.el = mesh.elems
+        self.Kl, self.R0, self.xy0, self.A = shell_local_K(self.X[self.el], t, Dp)
+        self.Bm, b, c = _allman_B(self.xy0, self.A, (1 / 3, 1 / 3, 1 / 3))
+        self.g = np.stack([b, c], 1)                                 # (E,2,3) 線形の形状関数の勾配
+        self.tD = t[:, None, None] * (np.broadcast_to(Dp, (len(self.el), 3, 3)) if Dp.ndim == 2 else Dp)
+        self.dofs = _shell_dofs(self.el)
+        self.nd = 6 * mesh.n_nodes
+        self.rows = np.repeat(self.dofs, 18, axis=1).ravel()
+        self.cols = np.tile(self.dofs, (1, 18)).ravel()
+        self.dl = np.zeros((len(self.el), 18))
+        self.Rc = self.R0
+
+    def internal(self, u):
+        U = u.reshape(-1, 6)
+        Rc, xyc, _ = _frames((self.X + U[:, :3])[self.el])
+        Q = _rot_exp(U[:, 3:])[self.el]                              # (E,3,3,3)
+        dl = np.zeros((len(self.el), 18))
+        for i in range(3):
+            dl[:, 6 * i:6 * i + 2] = xyc[:, i] - self.xy0[:, i]
+            Qd = np.einsum("eij,ejk,elk->eil", Rc, Q[:, i], self.R0)     # 要素の回転を除いた節点の回転（局所）
+            dl[:, 6 * i + 3:6 * i + 6] = _rot_log(Qd)
+        fl = np.einsum("eij,ej->ei", self.Kl, dl)
+        T = _transform(Rc)
+        fe = np.einsum("eji,ej->ei", T, fl)
+        Ke = np.einsum("eki,ekl,elj->eij", T, self.Kl, T)
+        # 幾何剛性: 膜力 N = t D ε（要素の中心）。 並進の 3 成分に同じ 3×3
+        N = np.einsum("eij,ej->ei", self.tD, np.einsum("eij,ej->ei", self.Bm, dl[:, _MEMR]))
+        gx, gy = self.g[:, 0], self.g[:, 1]
+        kg = self.A[:, None, None] * (N[:, 0, None, None] * gx[:, :, None] * gx[:, None, :]
+                                      + N[:, 1, None, None] * gy[:, :, None] * gy[:, None, :]
+                                      + N[:, 2, None, None] * (gx[:, :, None] * gy[:, None, :]
+                                                               + gy[:, :, None] * gx[:, None, :]))
+        for a_ in range(3):
+            for b_ in range(3):
+                for k in range(3):
+                    Ke[:, 6 * a_ + k, 6 * b_ + k] += kg[:, a_, b_]
+        self.dl, self.Rc = dl, Rc
+        f = np.zeros(self.nd)
+        np.add.at(f, self.dofs.ravel(), fe.ravel())
+        K = sp.coo_matrix((Ke.ravel(), (self.rows, self.cols)), shape=(self.nd, self.nd)).tocsr()
+        return f, K
+
+    def commit(self):
+        pass
 
 
 def _shell_dofs(el):
@@ -529,7 +612,23 @@ def solve_shell(mesh: ShellMesh, material, bcs: list[BC], elem_materials=None, l
         raise ValueError("積層シェルと塑性材料の組み合わせにはまだ対応していません")
     log(f"シェル: 節点 {mesh.n_nodes:,}、要素 {mesh.n_elems:,}" + ("（弾塑性）" if plastic else ""))
     extra = {}
-    if plastic:
+    large = bool(settings is not None and getattr(settings, "large_deflection", False))
+    if large and (plastic or (laminate is not None and laminate.any)):
+        raise ValueError("シェルの大変形は、いまは弾性の等方・直交異方性材料だけです（塑性・積層とは組み合わせられません）")
+    if large:
+        from .newton import solve_incremental
+        co = ShellCorot(mesh, t, Dp)
+        log("  大変形（共回転の定式化）: 荷重は向きが変わらないものとして扱います")
+        u = solve_incremental(co.internal, co.commit, F, fixed, nd, settings, log, free_mask=used)
+        fint, K = co.internal(u)
+        R = co.Rc                                   # 応力はいまの向きの座標系で求めて全体座標へ
+        em = np.einsum("eij,ej->ei", co.Bm, co.dl[:, _MEMR])
+        kap = np.einsum("eij,ej->ei", _dkt_B(xy, 1 / 3, 1 / 3), co.dl[:, _BEN])
+        out = {}
+        for name, z in (("上面", 0.5), ("下面", -0.5)):
+            out[name] = _nodal_avg(mesh, _layer_to_global(R, np.einsum("eij,ej->ei", Dp, em + (z * t)[:, None] * kap)), A)
+        R_all = fint - F
+    elif plastic:
         from .newton import solve_incremental
         from .nonlinear import AnalysisSettings
         ps = ShellPlastic(mesh, mats, elem_mat, Dp)
@@ -586,7 +685,8 @@ def solve_shell(mesh: ShellMesh, material, bcs: list[BC], elem_materials=None, l
             nodes = mesh.face_nodes(bc.faces) if bc.faces else np.asarray(bc.nodes, np.int64)
             reactions[i] = R_all.reshape(-1, 6)[nodes, :3].sum(0)
     info = {"自由度数": int(used.sum() - len(fixed)), "節点数": mesh.n_nodes, "要素数": mesh.n_elems,
-            "要素タイプ": "シェル（3節点 DKT＋Allman 膜, SHELL181 相当）" + ("・弾塑性 5 層" if plastic else ""),
+            "要素タイプ": "シェル（3節点 DKT＋Allman 膜, SHELL181 相当）" + ("・弾塑性 5 層" if plastic else "")
+            + ("・大変形" if large else ""),
             "ソルバー": "直接法", "合計時間 [s]": round(time.time() - t0, 2)}
     r = Result(mesh, mats[0], U[:, :3].copy(), stress, np.zeros_like(stress), reactions, info, mats, elem_mat)
     r.extra = {"相当応力（上面） [MPa]": vm["上面"], "相当応力（下面） [MPa]": vm["下面"],

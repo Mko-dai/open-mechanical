@@ -377,6 +377,36 @@ try:
     msgs.clear()
 except Exception:
     P("NG  積層シェル\n" + traceback.format_exc())
+# シェルの大変形（共回転）: 平板の片持ちはりに P L² / (E I) = 4 の横荷重 → 先端 w / L = 0.670、u / L = −0.329
+try:
+    w.new_project()
+    app.processEvents()
+    w.create_body("plate", dialog=True)
+    app.processEvents()
+    pj = w.project
+    pj.material = Material("ν=0 の鋼", 200000.0, 0.0, 7850.0, 250.0)
+    sm = w.mesh
+    edges = [f for f in sm.face_info() if sm.is_edge(f["id"])]
+    e_lo = min(edges, key=lambda f: f["centroid"][0])["id"]
+    e_hi = max(edges, key=lambda f: f["centroid"][0])["id"]
+    Lx = float(np.ptp(sm.nodes[:, 0]))
+    by = float(np.ptp(sm.nodes[:, 1]))
+    tt = float(sm.thickness.mean())
+    m_use = pj.elem_materials(sm)[0][0]
+    Ptot = 4 * float(m_use.E) * by * tt ** 3 / 12 / Lx ** 2
+    st0 = pj.settings
+    keep_st = (st0.large_deflection, st0.initial_substeps, st0.max_substeps)
+    st0.large_deflection, st0.initial_substeps, st0.max_substeps = True, 10, 100
+    fr = run("シェルの大変形（片持ち）", "static", [BC("fixed", [e_lo]), BC("force", [e_hi], [0, 0, Ptot])],
+             results=["全変形 [mm]"], shot="shell_large")
+    st0.large_deflection, st0.initial_substeps, st0.max_substeps = keep_st
+    tipn = np.isclose(sm.nodes[:, 0], sm.nodes[:, 0].max())
+    wl, ul = float(fr[-1].u[tipn, 2].mean()) / Lx, float(fr[-1].u[tipn, 0].mean()) / Lx
+    P(f"OK  シェルの大変形: 板 {Lx:g}×{by:g}×{tt:g}（E {float(m_use.E):g}・ν {float(m_use.nu):g}）/ 先端 w/L {wl:.4f}（解 0.670）・u/L {ul:.4f}（解 −0.329）/ "
+      f"{fr[-1].info.get('要素タイプ')}")
+    assert abs(wl - 0.670) < 0.02 and abs(ul + 0.329) < 0.02, "シェルの大変形が解と合いません"
+except Exception:
+    P("NG  シェルの大変形\n" + traceback.format_exc())
 # ソリッド＋シェル: 直方体（50×20×2）の端面に平板（シェル）を突き合わせる。 面・辺の選択、解析、結果の表示
 try:
     from openmech.geometry import new_feature

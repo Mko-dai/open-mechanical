@@ -1,5 +1,6 @@
 """シェル要素（DKT＋Allman 膜）"""
 import numpy as np
+import pytest
 
 from openmech.materials import Material
 from openmech.shell import solve_shell, structured_plate
@@ -83,3 +84,46 @@ def test_shell_symmetry_half_model():
                                     BC("symmetry", [2]), BC("symmetry", [4]), BC("pressure", [0], [q])],
                      log=lambda *x: None)
     assert abs(rq.u[:, 2].min() / rf.u[:, 2].min() - 1) < 1e-6
+
+
+def test_shell_large_deflection_cantilever():
+    """シェルの大変形（共回転の定式化）: 片持ちはりの先端に横荷重 P L² / (E I) = 4。
+    先端のたわみ w / L = 0.670、縮み u / L = −0.329（Bisshopp・Drucker の解）。 微小変形なら w / L = 1.333"""
+    from openmech.nonlinear import AnalysisSettings
+    S0 = Material("s", 200000.0, 0.0, 7850.0, 250.0)
+    m = structured_plate(100, 10, 40, 2, 1.0)
+    inf = m.face_info()
+    root = next(f["id"] for f in inf if f.get("edge") and abs(f["centroid"][0]) < 1e-6)
+    tip = next(f["id"] for f in inf if f.get("edge") and abs(f["centroid"][0] - 100) < 1e-6)
+    EI = 200000.0 * 10 / 12
+    bcs = [BC("fixed", [root]), BC("force", [tip], [0, 0, 4 * EI / 100 ** 2])]
+    tn = np.isclose(m.nodes[:, 0], 100)
+    r0 = solve_shell(m, S0, bcs, log=lambda *a: None)
+    assert r0.u[tn, 2].mean() / 100 == pytest.approx(4 / 3, rel=0.01)
+    st = AnalysisSettings(large_deflection=True, initial_substeps=10, max_substeps=100)
+    r = solve_shell(m, S0, bcs, settings=st, log=lambda *a: None)
+    assert r.u[tn, 2].mean() / 100 == pytest.approx(0.670, abs=0.003)
+    assert r.u[tn, 0].mean() / 100 == pytest.approx(-0.329, abs=0.003)
+    assert r.reactions[0] == pytest.approx([0, 0, -4 * EI / 100 ** 2], abs=0.5)
+    assert "大変形" in r.info["要素タイプ"]
+
+
+def test_shell_large_deflection_membrane_stiffening():
+    """両端をピン止めした帯板に横の圧力: 大変形では膜力が効いて、たわみが微小変形よりずっと小さくなる。
+    荷重を 2 倍にしてもたわみは 2 倍にならない（3 乗根に近い伸び方）"""
+    from openmech.nonlinear import AnalysisSettings
+    S0 = Material("s", 200000.0, 0.0, 7850.0, 250.0)
+    m = structured_plate(100, 10, 40, 2, 1.0)
+    inf = m.face_info()
+    ends = [f["id"] for f in inf if f.get("edge") and (abs(f["centroid"][0]) < 1e-6 or abs(f["centroid"][0] - 100) < 1e-6)]
+    surf = next(f["id"] for f in inf if not f.get("edge"))
+    st = AnalysisSettings(large_deflection=True, initial_substeps=10, max_substeps=100)
+    w = {}
+    for p in (0.5, 1.0):
+        bcs = [BC("displacement", ends, [0, 0, 0]), BC("pressure", [surf], [p])]
+        w[p] = np.abs(solve_shell(m, S0, bcs, settings=st, log=lambda *a: None).u[:, 2]).max()
+    lin = np.abs(solve_shell(m, S0, [BC("displacement", ends, [0, 0, 0]), BC("pressure", [surf], [1.0])],
+                             log=lambda *a: None).u[:, 2]).max()
+    assert lin == pytest.approx(5 * 10.0 * 100 ** 4 / (384 * 200000.0 * 10 / 12), rel=0.02)     # 単純支持はり
+    assert w[1.0] < 0.4 * lin
+    assert 1.2 < w[1.0] / w[0.5] < 1.5

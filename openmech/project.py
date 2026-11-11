@@ -238,8 +238,10 @@ class Project:
 
     def check_shell_supported(self):
         s = self.settings
-        if s.large_deflection or any(c for c in self.contacts if not c.suppressed):
-            raise ValueError("シェル要素・2D 要素は現在、微小変形の静解析（接触なし）に対応しています（塑性は可）")
+        if any(c for c in self.contacts if not c.suppressed):
+            raise ValueError("シェル要素・2D 要素は、接触にはまだ対応していません（塑性は可、シェルは大変形も可）")
+        if s.large_deflection and self.geometry.get("analysis_2d"):
+            raise ValueError("2D 要素は現在、微小変形の静解析に対応しています（塑性は可）")
         if any(b.kind == "thermal" for b in self.bcs) and not self.geometry.get("analysis_2d"):
             raise ValueError("シェル要素ではまだ熱条件に対応していません")
         # シェル・2D の解き方が知らない境界条件は、黙って無視せずに知らせる
