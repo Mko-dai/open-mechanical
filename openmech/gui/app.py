@@ -30,7 +30,7 @@ from PySide6.QtGui import QAction, QBrush, QColor, QFont, QIcon, QKeySequence, Q
 from PySide6.QtWidgets import (QApplication, QProgressDialog, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFrame, QSpinBox,
                                QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
                                QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
-                               QPushButton, QSplitter, QTabWidget, QToolButton, QTreeWidget,
+                               QPushButton, QScrollArea, QSizePolicy, QSplitter, QTabWidget, QToolButton, QTreeWidget,
                                QListWidget, QListWidgetItem, QSlider, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 import pyvista as pv
@@ -282,11 +282,47 @@ def letters(i):
 
 # ---------------------------------------------------------------------------- リボン
 
+class HScroll(QScrollArea):
+    """横に長いバー（リボン・ツールバー）を入れる枠。 ウィンドウが狭いときは横にスクロールできるようにして、
+    バーの幅がウィンドウの最小の幅を決めないようにする（画面より広くなって端が切れるのを防ぐ）"""
+
+    def __init__(self, inner, parent=None):
+        super().__init__(parent)
+        self.inner = inner
+        self.setWidget(inner)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setStyleSheet("QScrollArea{background:transparent;border:none}"
+                           "QScrollBar:horizontal{height:9px;background:#eef1f5;margin:0}"
+                           "QScrollBar::handle:horizontal{background:#b4bfcc;border-radius:4px;min-width:40px}"
+                           "QScrollBar::add-line:horizontal,QScrollBar::sub-line:horizontal{width:0}")
+        self.viewport().setAutoFillBackground(False)
+
+    def _h(self):
+        h = self.inner.sizeHint().height()
+        if self.inner.minimumSizeHint().width() > self.viewport().width() > 0:
+            h += 9                                  # 横のスクロールバーが出ているぶん
+        return h
+
+    def sizeHint(self):
+        return QSize(self.inner.sizeHint().width(), self._h())
+
+    def minimumSizeHint(self):
+        return QSize(80, self._h())
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self.updateGeometry()
+
+
 class Ribbon(QTabWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setDocumentMode(True)
-        self.setMaximumHeight(118)
+        self.setMaximumHeight(128)
         self.setStyleSheet("""
             QTabWidget::pane { border-top: 1px solid #c8c8c8; }
             QToolButton { border: 1px solid transparent; border-radius: 3px; padding: 2px 4px; }
@@ -300,7 +336,9 @@ class Ribbon(QTabWidget):
         lay.setContentsMargins(4, 2, 4, 2)
         lay.setSpacing(2)
         lay.addStretch()
-        self.addTab(w, title)
+        sc = HScroll(w)
+        sc.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.addTab(sc, title)
         return w
 
     def add_group(self, tab, title):
@@ -422,8 +460,8 @@ class MainWindow(QMainWindow):
         gfx = QWidget()
         g = QGridLayout(gfx)
         g.setContentsMargins(0, 0, 0, 0)
-        g.addWidget(self._graphics_toolbar(), 0, 0)
-        g.addWidget(self._attr_bar(), 1, 0)
+        g.addWidget(HScroll(self._graphics_toolbar()), 0, 0)
+        g.addWidget(HScroll(self._attr_bar()), 1, 0)
         g.addWidget(self._sketch_bar(), 2, 0)
         g.addWidget(self.plotter.interactor, 3, 0)
         self.overlay = QLabel(self.plotter.interactor)
@@ -460,15 +498,22 @@ class MainWindow(QMainWindow):
 
         # ---- ステータスバー
         self.sel_status = QLabel("選択なし")
+        self.sel_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)     # 長い文でウィンドウを広げない
         self.progress = QProgressBar()
         self.progress.setMaximumWidth(220)
         self.progress.setVisible(False)
         sb = self.statusBar()
-        sb.addWidget(self.sel_status)
+        sb.addWidget(self.sel_status, 1)
         sb.addPermanentWidget(self.progress)
         sb.addPermanentWidget(QLabel("メートル法 (mm, t, N, s, mV, mA)　度　rad/s　摂氏"))
         self._build_menu()
         self.rebuild_tree()
+        # 画面より大きくならないように: 中身の最小の大きさに引っぱられず、画面に収まる大きさで開く
+        self.setMinimumSize(760, 480)
+        scr = QApplication.primaryScreen()
+        if scr is not None:
+            av = scr.availableGeometry()
+            self.resize(min(1500, av.width()), min(950, av.height() - 30))
 
     def _titled(self, title, w):
         box = QWidget()
