@@ -151,3 +151,37 @@ def test_shell_large_deflection_follower_pressure():
     assert -0.86 < out[10][0] < -0.80 and -0.68 < out[10][1] < -0.61
     assert abs(out[10][2][0]) > 0.7 * out[10][3]                    # 巻いた板にかかる圧力は長さ方向の成分が大きい
     assert np.hypot(out[10][2][0], out[10][2][2]) < out[10][3]      # 向きがばらけるので、合力は p A より小さい
+
+
+def test_shell_large_deflection_with_laminate_and_plasticity():
+    """大変形＋積層・大変形＋塑性。 等方材料 1 層の積層は、積層なしの大変形と同じ答え。
+    塑性は、降伏より下では弾性の大変形と同じで、降伏を超えるとたわみが増えて塑性ひずみが出る"""
+    from openmech.composite import Laminates
+    from openmech.nonlinear import AnalysisSettings
+    S0 = Material("s", 200000.0, 0.0, 7850.0, 250.0)
+    m = structured_plate(100, 10, 30, 2, 1.0)
+    inf = m.face_info()
+    root = next(f["id"] for f in inf if f.get("edge") and abs(f["centroid"][0]) < 1e-6)
+    tip = next(f["id"] for f in inf if f.get("edge") and abs(f["centroid"][0] - 100) < 1e-6)
+    EI = 200000.0 * 10 / 12
+    st = AnalysisSettings(large_deflection=True, initial_substeps=10, max_substeps=100)
+    tn = np.isclose(m.nodes[:, 0], 100)
+    q = dict(settings=st, log=lambda *a: None)
+    bcs = [BC("fixed", [root]), BC("force", [tip], [0, 0, 2 * EI / 100 ** 2])]
+    w0 = solve_shell(m, S0, bcs, **q).u[tn, 2].mean()
+    L = Laminates(np.zeros(m.n_elems, int), [{"plies": [(S0.state(), 1.0, 0.0)]}])
+    rl = solve_shell(m, S0, bcs, laminate=L, **q)
+    assert rl.u[tn, 2].mean() == pytest.approx(w0, rel=2e-3)
+    assert "複合材 破損指標" in rl.extra
+    # 塑性: 降伏モーメント My = σy b t² / 6 = 416.7 N mm → 先端荷重 4.17 N で根元が降伏
+    pl = Material("p", 200000.0, 0.0, 7850.0, 250.0, plasticity="bilinear_iso", tangent_modulus=2000.0)
+    em = ([pl.state()], np.zeros(m.n_elems, int))
+    r1 = solve_shell(m, pl, [BC("fixed", [root]), BC("force", [tip], [0, 0, 2.5])], elem_materials=em, **q)
+    e1 = solve_shell(m, S0, [BC("fixed", [root]), BC("force", [tip], [0, 0, 2.5])], **q)
+    assert r1.u[tn, 2].mean() == pytest.approx(e1.u[tn, 2].mean(), rel=5e-3)
+    assert r1.extra["相当塑性ひずみ"].max() < 1e-6
+    r2 = solve_shell(m, pl, [BC("fixed", [root]), BC("force", [tip], [0, 0, 5.8])], elem_materials=em, **q)
+    e2 = solve_shell(m, S0, [BC("fixed", [root]), BC("force", [tip], [0, 0, 5.8])], **q)
+    assert r2.u[tn, 2].mean() > 1.05 * e2.u[tn, 2].mean()
+    assert r2.extra["相当塑性ひずみ"].max() > 1e-4
+    assert r2.reactions[0][2] == pytest.approx(-5.8, abs=0.05)

@@ -334,11 +334,12 @@ class ShellCorot:
     要素の回転を引いた残り）にだけ線形の要素剛性を使う。 接線には膜力による幾何剛性を足す（張ると硬く、押すと座屈）。
     節点の回転の自由度は回転ベクトル"""
 
-    def __init__(self, mesh, t, Dp):
+    def __init__(self, mesh, t, Dp, laminate=None, plastic=None):
         self.mesh = mesh
         self.X = mesh.nodes
         self.el = mesh.elems
-        self.Kl, self.R0, self.xy0, self.A = shell_local_K(self.X[self.el], t, Dp)
+        self.plastic = plastic                # ShellPlastic（塑性: 局所の内力・接線をここから取る）
+        self.Kl, self.R0, self.xy0, self.A = shell_local_K(self.X[self.el], t, Dp, laminate)
         self.Bm, b, c = _allman_B(self.xy0, self.A, (1 / 3, 1 / 3, 1 / 3))
         self.g = np.stack([b, c], 1)                                 # (E,2,3) 線形の形状関数の勾配
         self.tD = t[:, None, None] * (np.broadcast_to(Dp, (len(self.el), 3, 3)) if Dp.ndim == 2 else Dp)
@@ -358,10 +359,14 @@ class ShellCorot:
             dl[:, 6 * i:6 * i + 2] = xyc[:, i] - self.xy0[:, i]
             Qd = np.einsum("eij,ejk,elk->eil", Rc, Q[:, i], self.R0)     # 要素の回転を除いた節点の回転（局所）
             dl[:, 6 * i + 3:6 * i + 6] = _rot_log(Qd)
-        fl = np.einsum("eij,ej->ei", self.Kl, dl)
+        if self.plastic is not None:
+            fl, Kl = self.plastic.local(dl)
+        else:
+            Kl = self.Kl
+            fl = np.einsum("eij,ej->ei", Kl, dl)
         T = _transform(Rc)
         fe = np.einsum("eji,ej->ei", T, fl)
-        Ke = np.einsum("eki,ekl,elj->eij", T, self.Kl, T)
+        Ke = np.einsum("eki,ekl,elj->eij", T, Kl, T)
         # 幾何剛性: 膜力 N = t D ε（要素の中心）。 並進の 3 成分に同じ 3×3
         N = np.einsum("eij,ej->ei", self.tD, np.einsum("eij,ej->ei", self.Bm, dl[:, _MEMR]))
         gx, gy = self.g[:, 0], self.g[:, 1]
@@ -380,7 +385,8 @@ class ShellCorot:
         return f, K
 
     def commit(self):
-        pass
+        if self.plastic is not None:
+            self.plastic.commit()
 
 
 def _shell_dofs(el):
@@ -519,9 +525,19 @@ class ShellPlastic:
         self.cols = np.tile(self.dofs, (1, 18)).ravel()
 
     def internal(self, u):
+        fl, Kl = self.local(np.einsum("eij,ej->ei", self.T, u[self.dofs]))
+        fe = np.einsum("eki,ek->ei", self.T, fl)
+        Ke = np.einsum("eki,ekl,elj->eij", self.T, Kl, self.T)
+        nd = 6 * self.mesh.n_nodes
+        f = np.zeros(nd)
+        np.add.at(f, self.dofs.ravel(), fe.ravel())
+        K = sp.coo_matrix((Ke.ravel(), (self.rows, self.cols)), shape=(nd, nd)).tocsr()
+        return f, K
+
+    def local(self, ul):
+        """要素の局所座標での変位 (E,18) → 内力 (E,18) と接線 (E,18,18)（大変形では共回転の変形分を渡す）"""
         from .newton import plane_stress_return
         E = self.mesh.n_elems
-        ul = np.einsum("eij,ej->ei", self.T, u[self.dofs])
         um, ub = ul[:, _MEMR], ul[:, _BEN]
         fl = np.zeros((E, 18))
         Kl = np.zeros((E, 18, 18))
@@ -559,13 +575,7 @@ class ShellPlastic:
                 Kl[:, _BEN[:, None], _BEN[None, :]] += np.einsum("e,eki,ekl,elj->eij", w * zz * zz, Bb, C, Bb)
         del idx_m
         self.trial = st + [sig_out]
-        fe = np.einsum("eki,ek->ei", self.T, fl)
-        Ke = np.einsum("eki,ekl,elj->eij", self.T, Kl, self.T)
-        nd = 6 * self.mesh.n_nodes
-        f = np.zeros(nd)
-        np.add.at(f, self.dofs.ravel(), fe.ravel())
-        K = sp.coo_matrix((Ke.ravel(), (self.rows, self.cols)), shape=(nd, nd)).tocsr()
-        return f, K
+        return fl, Kl
 
     def commit(self):
         self.ep, self.al, self.pb, self.ez = [x.copy() for x in self.trial[:4]]
@@ -613,11 +623,11 @@ def solve_shell(mesh: ShellMesh, material, bcs: list[BC], elem_materials=None, l
     log(f"シェル: 節点 {mesh.n_nodes:,}、要素 {mesh.n_elems:,}" + ("（弾塑性）" if plastic else ""))
     extra = {}
     large = bool(settings is not None and getattr(settings, "large_deflection", False))
-    if large and (plastic or (laminate is not None and laminate.any)):
-        raise ValueError("シェルの大変形は、いまは弾性の等方・直交異方性材料だけです（塑性・積層とは組み合わせられません）")
+    ul_post = None
     if large:
         from .newton import solve_incremental
-        co = ShellCorot(mesh, t, Dp)
+        ps = ShellPlastic(mesh, mats, elem_mat, Dp) if plastic else None
+        co = ShellCorot(mesh, t, Dp, laminate=laminate, plastic=ps)
         # 圧力は変形後の面に垂直にかけ続ける（追従荷重、Ansys と同じ）。 力・重力は向きが変わらない
         pe = np.zeros(mesh.n_elems)
         for bc in bcs:
@@ -642,12 +652,14 @@ def solve_shell(mesh: ShellMesh, material, bcs: list[BC], elem_materials=None, l
         if follower is not None:
             F = F + follower(u)
         R = co.Rc                                   # 応力はいまの向きの座標系で求めて全体座標へ
-        em = np.einsum("eij,ej->ei", co.Bm, co.dl[:, _MEMR])
-        kap = np.einsum("eij,ej->ei", _dkt_B(xy, 1 / 3, 1 / 3), co.dl[:, _BEN])
-        out = {}
-        for name, z in (("上面", 0.5), ("下面", -0.5)):
-            out[name] = _nodal_avg(mesh, _layer_to_global(R, np.einsum("eij,ej->ei", Dp, em + (z * t)[:, None] * kap)), A)
         R_all = fint - F
+        if plastic:
+            sig = ps.trial[4]
+            out = {"上面": _layer_to_global(R, sig[:, -1].mean(0)), "下面": _layer_to_global(R, sig[:, 0].mean(0))}
+            out = {k: _nodal_avg(mesh, v, A) for k, v in out.items()}
+            extra["相当塑性ひずみ"] = _nodal_avg(mesh, ps.pb.max(axis=(0, 1))[:, None], A)[:, 0]
+        else:
+            ul_post = co.dl                         # 剛体の動きを除いた変形（局所）
     elif plastic:
         from .newton import solve_incremental
         from .nonlinear import AnalysisSettings
@@ -679,7 +691,10 @@ def solve_shell(mesh: ShellMesh, material, bcs: list[BC], elem_materials=None, l
         if not np.all(np.isfinite(uf)) or _rel_res(Kff, uf, rhs) > 1e-4:
             raise RuntimeError("解が求まりませんでした。拘束が不足していないか確認してください（シェルは辺に支持を設定します）。")
         u[free] = uf
-        ul = np.einsum("eij,ej->ei", _transform(R), u[dofs])
+        ul_post = np.einsum("eij,ej->ei", _transform(R), u[dofs])
+        R_all = K @ u - F
+    if ul_post is not None:
+        ul = ul_post
         em = np.einsum("eij,ej->ei", _allman_B(xy, A, (1 / 3, 1 / 3, 1 / 3))[0], ul[:, _MEMR])
         kap = np.einsum("eij,ej->ei", _dkt_B(xy, 1 / 3, 1 / 3), ul[:, _BEN])
         out = {}
@@ -694,7 +709,6 @@ def solve_shell(mesh: ShellMesh, material, bcs: list[BC], elem_materials=None, l
             fi, layer, rows = laminate.ply_results(em, kap, mesh.n_elems)
             extra["複合材 破損指標"] = _nodal_avg(mesh, fi[:, None], A)[:, 0]
             ply_rows = rows
-        R_all = K @ u - F
     vm = {k: _mises(v) for k, v in out.items()}
     top_bigger = vm["上面"] >= vm["下面"]
     stress = np.where(top_bigger[:, None], out["上面"], out["下面"])
