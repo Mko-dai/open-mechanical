@@ -1,9 +1,10 @@
 import math
 
 import numpy as np
+import pytest
 
 from openmech.dynamics import (DynamicSettings, _tet_mass_ref, consistent_mass, element_dt, lumped_mass,
-                               solve_dynamic)
+                               solve_dynamic, solve_explicit)
 from openmech.materials import Material
 from openmech.mesh import structured_box
 from openmech.solver import BC, material_D
@@ -115,3 +116,35 @@ def test_explicit_plastic_bar_yields_at_yield_stress():
     sx = fr[-1].stress[:, 0]
     assert abs(np.median(sx) / 250 - 1) < 0.03
     assert fr[-1].extra["相当塑性ひずみ"].max() > 0.001
+
+
+def test_explicit_remote_spring_point_mass_and_remote_bcs():
+    """陽解法のリモート境界条件: ボディ－地面のばね＋点質量でばね・質量系の周期になる。
+    リモート荷重は面への力と同じ答え、リモート変位は面をその変位にする"""
+    steel = Material("s", 200000.0, 0.3, 7850.0, 250.0)
+    m = structured_box(10, 10, 10, 2, 2, 2).to_quadratic()
+    M, k, v0 = 1.0, 1000.0, 100.0                       # kg, N/mm, mm/s
+    mt = M * 1e-3 + 7850e-12 * 1000.0
+    w = np.sqrt(k / mt)
+    bcs = [BC("spring", [0], [k, 0.0], options={"ground": [-1.0, 5.0, 5.0]}), BC("point_mass", [1], [M, 0, 0, 0])]
+    ds = DynamicSettings(method="explicit", end_time=np.pi / (2 * w), n_frames=4, init_velocity=[v0, 0, 0])
+    logs = []
+    rs = solve_explicit(m, steel, bcs, ds, log=logs.append)
+    assert rs[-1].u[:, 0].mean() == pytest.approx(v0 / w, rel=0.02)          # 1/4 周期で振幅 v0 / ω
+    assert abs(rs[-1].extra["速度 X [mm/s]"].mean()) < 0.05 * v0
+    assert rs[-1].info["質量 [kg]"] == pytest.approx(mt * 1000, rel=1e-6) if "質量 [kg]" in rs[-1].info else True
+    # リモート荷重（面の中心に力）= 面への力
+    ds2 = DynamicSettings(method="explicit", end_time=2e-5, n_frames=2)
+    a = solve_explicit(m, steel, [BC("fixed", [0]), BC("force", [1], [1000.0, 0, 0])], ds2, log=lambda *x: None)[-1]
+    b = solve_explicit(m, steel, [BC("fixed", [0]), BC("remote_force", [1], [1000.0, 0, 0, 0, 0, 0])], ds2,
+                       log=lambda *x: None)[-1]
+    assert np.abs(a.u - b.u).max() < 1e-6 * np.abs(a.u).max()
+    # リモート変位: 面を 0.01 mm 動かし、z まわりに 1e-3 rad 回す
+    ds3 = DynamicSettings(method="explicit", end_time=2e-5, n_frames=2, ramp_time=1e-5)
+    r = solve_explicit(m, steel, [BC("fixed", [0]), BC("remote_displacement", [1], [0.01, 0, 0, 0, 0, 1e-3],
+                                                         point=[10.0, 5.0, 5.0])], ds3, log=lambda *x: None)[-1]
+    fn = np.isclose(m.nodes[:, 0], 10.0)
+    assert np.allclose(r.u[fn, 0], 0.01 - 1e-3 * (m.nodes[fn, 1] - 5.0), atol=1e-9)
+    assert np.allclose(r.u[fn, 1], 0.0, atol=1e-9)
+    with pytest.raises(ValueError, match="まだ使えません"):
+        solve_explicit(m, steel, [BC("fixed", [0]), BC("joint", [1], [])], ds2, log=lambda *x: None)

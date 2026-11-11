@@ -322,7 +322,9 @@ class Project:
         if not self.transient_nonlinear(mesh):
             from .remote import REMOTE_KINDS
             what = "過渡構造の陽解法" if ds.method == "explicit" else "剛体壁を使う陰解法"
-            bad = [b.label() for b in self.bcs if b.kind in REMOTE_KINDS or b.kind == "submodel"]
+            # 陽解法: リモート荷重・リモート変位・ばね・弾性支持・点質量・ベアリング荷重は面の節点に直接かけて扱える
+            no = (("joint", "beam", "cylindrical_support", "cyclic") if ds.method == "explicit" else REMOTE_KINDS)
+            bad = [b.label() for b in self.bcs if b.kind in no or b.kind == "submodel"]
             if bad:
                 raise ValueError(f"{what}では、次の境界条件にまだ対応していません: " + "、".join(bad))
             cs = []

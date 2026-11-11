@@ -293,6 +293,9 @@ def solve_explicit(mesh, material, bcs, settings: DynamicSettings, elem_material
     from .parallel import ParallelMatvec
     t0 = time.time()
     s = settings
+    from .remote import REMOTE_KINDS
+    remote_bcs = [b for b in bcs if b.kind in REMOTE_KINDS]
+    bcs = [b for b in bcs if b.kind not in REMOTE_KINDS]
     mats, elem_mat, D, rho_e, F0, fixed = _prepare(mesh, material, bcs, elem_materials)
     plastic = any(getattr(m, "plastic", False) for m in mats)
     inner = None
@@ -327,9 +330,64 @@ def solve_explicit(mesh, material, bcs, settings: DynamicSettings, elem_material
     if s.dt and 0 < s.dt < dt:
         dt = float(s.dt)
     m = np.bincount(mesh.elems.ravel(), (m_e[:, None] * wloc[None, :]).ravel(), mesh.n_nodes)
+    ndof = 3 * mesh.n_nodes
+    # リモート荷重・リモート変位・ばね・弾性支持・点質量・ベアリング荷重: 追加の自由度は使わず、面の節点に直接かける
+    Ksp, rsprings = None, []
+    if remote_bcs:
+        from .remote import _distribute_load, extra_terms, face_weights
+        acc_g = next((np.asarray(b.values, float) for b in bcs if b.kind == "gravity"), None)
+        w2max = np.zeros(mesh.n_nodes)                    # ばねの固有振動数の目安（節点ごとの k / m）
+        for b in remote_bcs:
+            vals = list(b.values) + [None] * 6
+            vz = [0.0 if x is None else float(x) for x in vals]
+            if b.kind in ("remote_force", "remote_displacement", "point_mass", "spring"):
+                if not b.faces:
+                    raise ValueError(f"{b.label()}: 面を選んでください")
+                nodes_f, wts, cen, _, _ = face_weights(mesh, b.faces)
+                wn = wts / wts.sum()
+                pt = np.asarray(b.point, float) if len(b.point) == 3 else cen
+            if b.kind == "remote_force":
+                _distribute_load(mesh, b.faces, vz[:3], vz[3:6], pt, F0)
+                if (b.options or {}).get("behavior", "deformable") == "rigid":
+                    log(f"  {b.label()}: 陽解法では面を剛体にせず、力とモーメントを面の節点に配ります（変形可と同じ）")
+            elif b.kind == "bearing_load":
+                for d_, v_ in extra_terms(mesh, [b], 1.0).F.items():
+                    F0[d_] += v_
+            elif b.kind == "elastic_support":
+                Kb = extra_terms(mesh, [b], 1.0).K().tocsr()[:ndof][:, :ndof]
+                Ksp = Kb if Ksp is None else Ksp + Kb
+            elif b.kind == "spring":
+                g = np.asarray((b.options or {}).get("ground", list(pt + np.array([0, 0, -1.0]))), float)
+                e = (g - pt) / max(np.linalg.norm(g - pt), 1e-300)
+                rsprings.append((nodes_f, wn, vz[0] * np.outer(e, e)))
+                w2max[nodes_f] += vz[0] * wn / m[nodes_f] * len(nodes_f) * wn       # k wᵢ² n / mᵢ（安全側）
+                if vz[1]:
+                    for k_ in range(3):
+                        np.add.at(F0, 3 * nodes_f + k_, wn * vz[1] * e[k_])
+            elif b.kind == "point_mass":
+                m[nodes_f] += vz[0] * 1e-3 * wn                  # kg → t。 面の節点に面積比で配る（回転慣性は使わない）
+                mass0 += vz[0] * 1e-3
+                if acc_g is not None:
+                    for k_ in range(3):
+                        np.add.at(F0, 3 * nodes_f + k_, vz[0] * 1e-3 * wn * acc_g[k_])
+            elif b.kind == "remote_displacement":
+                if any(x is None for x in vals[3:6]):
+                    raise ValueError(f"{b.label()}: 陽解法のリモート変位は、回転 3 成分を指定してください（0 で回転なし）")
+                rot = np.cross(np.asarray(vz[3:6]), mesh.nodes[nodes_f] - pt)     # 小さな回転: θ × r
+                for k_ in range(3):
+                    if vals[k_] is not None:
+                        for n_, r_ in zip(nodes_f, rot[:, k_]):
+                            fixed[3 * int(n_) + k_] = vz[k_] + float(r_)
+            else:
+                raise ValueError(f"陽解法では「{b.label()}」はまだ使えません（ジョイント・ビーム接続・円筒支持・周期対称）")
+        if Ksp is not None:
+            w2max += np.asarray(abs(Ksp).sum(axis=1)).ravel().reshape(-1, 3).max(1) / m
+        wm = float(np.sqrt(w2max.max()))
+        if wm * dt > 1.6:
+            log(f"  ばね・弾性支持が硬いので、時間増分を {dt:.3e} → {1.6 / wm:.3e} s に縮めます")
+            dt = 1.6 / wm
     m3 = np.repeat(m, 3)
     minv = 1.0 / m3
-    ndof = 3 * mesh.n_nodes
     cd = np.fromiter(fixed.keys(), dtype=np.int64)
     cv = np.fromiter(fixed.values(), dtype=float)
     nsteps = int(math.ceil(s.end_time / dt))
@@ -476,6 +534,12 @@ def solve_explicit(mesh, material, bcs, settings: DynamicSettings, elem_material
             f += contact_force(u)
         if followers:
             f += follow(u) * _ramp(t, s.ramp_time)
+        if Ksp is not None:
+            f -= Ksp @ u
+        if rsprings:
+            F3s, U3s = f.reshape(-1, 3), u.reshape(-1, 3)
+            for nodes_s, wn_s, K3 in rsprings:
+                F3s[nodes_s] -= wn_s[:, None] * (K3 @ (wn_s @ U3s[nodes_s]))[None, :]
         if aR:
             f -= aR * m3 * v
         if bR and Kmv is not None:
