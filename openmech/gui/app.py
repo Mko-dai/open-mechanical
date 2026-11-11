@@ -286,9 +286,10 @@ class HScroll(QScrollArea):
     """横に長いバー（リボン・ツールバー）を入れる枠。 ウィンドウが狭いときは横にスクロールできるようにして、
     バーの幅がウィンドウの最小の幅を決めないようにする（画面より広くなって端が切れるのを防ぐ）"""
 
-    def __init__(self, inner, parent=None):
+    def __init__(self, inner, parent=None, fixed=True):
         super().__init__(parent)
         self.inner = inner
+        self.fixed = fixed                        # 高さを中身に合わせて固定する（リボンのタブの中では固定しない）
         self.setWidget(inner)
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.NoFrame)
@@ -315,7 +316,17 @@ class HScroll(QScrollArea):
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
-        self.updateGeometry()
+        if self.fixed:
+            h = self._h()
+            if h != self.height():
+                self.setFixedHeight(h)
+        else:
+            self.updateGeometry()
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        if self.fixed:
+            self.setFixedHeight(self._h())
 
 
 class Ribbon(QTabWidget):
@@ -336,7 +347,7 @@ class Ribbon(QTabWidget):
         lay.setContentsMargins(4, 2, 4, 2)
         lay.setSpacing(2)
         lay.addStretch()
-        sc = HScroll(w)
+        sc = HScroll(w, fixed=False)
         sc.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.addTab(sc, title)
         return w
@@ -464,6 +475,7 @@ class MainWindow(QMainWindow):
         g.addWidget(HScroll(self._attr_bar()), 1, 0)
         g.addWidget(self._sketch_bar(), 2, 0)
         g.addWidget(self.plotter.interactor, 3, 0)
+        g.setRowStretch(3, 1)                     # 余った高さはすべて 3D 表示へ
         self.overlay = QLabel(self.plotter.interactor)
         self.overlay.setStyleSheet("background: rgba(255,255,255,215); color:#111; padding:6px;"
                                    "border:1px solid #bbb; font-size:12px;")

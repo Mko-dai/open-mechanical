@@ -221,6 +221,8 @@ def test_surface_body_split():
         inf = m.face_info()
         root = [f["id"] for f in inf if m.is_edge(f["id"]) and abs(f["centroid"][0]) < 1e-6]
         end = [f["id"] for f in inf if m.is_edge(f["id"]) and abs(f["centroid"][0] - 100) < 1e-6]
-        r = solve_shell(m, S, [BC("fixed", root), BC("force", end, [0, 0, -10.0])], log=lambda *a: None)
+        r = solve_shell(m, Material("s", 200000.0, 0.3, 7850.0, 250.0), [BC("fixed", root),
+                                                                           BC("force", end, [0, 0, -10.0])],
+                        log=lambda *a: None)
         return r.u[:, 2].min()
     assert tip(m2) == pytest.approx(tip(m0), rel=0.01)
