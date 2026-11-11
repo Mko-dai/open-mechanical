@@ -215,8 +215,17 @@ def _build_shell_features(gmsh, features):
             for j in range(nkey - k0):
                 thick[k0 + j] = thick.get(tg[j], 1.0)
             continue
+        if t == "split":                      # 切断: 面を平面で 2 つに分ける（板厚は元のボディと同じ）
+            made = {}
+            nkey = _edit_bodies(gmsh, f, bodies, nkey, dim=2, made=made)
+            for kn, ko in made.items():
+                thick[kn] = thick.get(ko, 1.0)
+            for k in [k for k, v in bodies.items() if not v]:      # 片側だけ残して何も残らなかったボディ
+                bodies.pop(k)
+            continue
         if t in EDIT_FEATURES:
-            raise GeometryError(f"サーフェス（シェル・2D）では「{FEATURES[t][0]}」にまだ対応していません（移動・回転・ミラーは可）")
+            raise GeometryError(f"サーフェス（シェル・2D）では「{FEATURES[t][0]}」にまだ対応していません"
+                                "（移動・回転・ミラー・切断は可）")
         if t not in SHELL_FEATURES:
             raise GeometryError("ソリッドとシェル（サーフェス）を同じモデルで混ぜることには、まだ対応していません")
         tool = _make_surface(gmsh, f)
@@ -554,8 +563,9 @@ def _edge_filter(gmsh, f, vol_tags):
     return out
 
 
-def _edit_bodies(gmsh, f, bodies, nkey):
-    """ボディの編集フィーチャーを実行。新しく作ったボディの分だけ nkey を進めて返す"""
+def _edit_bodies(gmsh, f, bodies, nkey, dim=3, made=None):
+    """ボディの編集フィーチャーを実行。新しく作ったボディの分だけ nkey を進めて返す。
+    dim: ボディの次元（ソリッド 3、サーフェス 2）。 made: 切断で新しくできたボディ {新しいキー: 元のキー} を入れる辞書"""
     occ = gmsh.model.occ
     t = f["type"]
     g = lambda k, d=0.0: float(f.get(k, d))  # noqa: E731
@@ -588,17 +598,21 @@ def _edit_bodies(gmsh, f, bodies, nkey):
             plus = occ.intersect(occ.copy(bodies[k]), plus_box)[0]
             minus_box = _halfspace(occ, bodies[k], axis, g("offset"), True)
             minus = occ.cut(bodies[k], minus_box)[0]
-            plus = [dt for dt in plus if dt[0] == 3]
-            minus = [dt for dt in minus if dt[0] == 3]
+            plus = [dt for dt in plus if dt[0] == dim]
+            minus = [dt for dt in minus if dt[0] == dim]
             if keep.startswith("＋"):
                 occ.remove(minus, recursive=True)
                 bodies[k] = plus
             elif keep.startswith("−"):
                 occ.remove(plus, recursive=True)
                 bodies[k] = minus
+            elif not plus or not minus:          # 切断面がボディを通っていない: そのまま
+                bodies[k] = minus or plus
             else:
                 bodies[k] = minus
                 bodies[nkey] = plus
+                if made is not None:
+                    made[nkey] = k
                 nkey += 1
         return nkey
     if t == "stretch":

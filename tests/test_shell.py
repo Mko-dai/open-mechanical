@@ -185,3 +185,42 @@ def test_shell_large_deflection_with_laminate_and_plasticity():
     assert r2.u[tn, 2].mean() > 1.05 * e2.u[tn, 2].mean()
     assert r2.extra["相当塑性ひずみ"].max() > 1e-4
     assert r2.reactions[0][2] == pytest.approx(-5.8, abs=0.05)
+
+
+def test_surface_body_split():
+    """サーフェス（平板）の切断: Y = 40 で 2 つのボディに分かれ、切った線の節点は共有される。
+    片側だけ残すこともでき、板厚は元のボディと同じ。 解析の答えは切る前と同じ"""
+    from openmech.geometry import build_mesh, gmsh_available, new_feature
+    if not gmsh_available():
+        pytest.skip("gmsh がありません")
+    plate = new_feature("plate", du=100.0, dv=50.0, t=2.0)
+
+    def mesh(*feats):
+        return build_mesh({"kind": "model", "features": [plate, *feats]}, size=5.0, log=lambda *a: None)
+
+    def area(m, body=None):
+        X = m.nodes[m.elems[:, :3]]
+        a = 0.5 * np.linalg.norm(np.cross(X[:, 1] - X[:, 0], X[:, 2] - X[:, 0]), axis=1)
+        return a.sum() if body is None else a[m.elem_body == body].sum()
+
+    m0 = mesh()
+    m2 = mesh(new_feature("split", axis="Y", offset=40.0))
+    assert m2.is_shell and sorted(np.unique(m2.elem_body).tolist()) == [0, 1]
+    assert sorted([round(area(m2, 0)), round(area(m2, 1))]) == [1000, 4000]
+    assert np.allclose(m2.thickness, 2.0)
+    on_cut = np.isclose(m2.nodes[:, 1], 40.0)
+    nb0 = np.unique(m2.elems[m2.elem_body == 0])
+    nb1 = np.unique(m2.elems[m2.elem_body == 1])
+    assert on_cut.sum() > 10 and set(np.nonzero(on_cut)[0]) <= (set(nb0) & set(nb1))      # 切った線の節点は共有
+    mp = mesh(new_feature("split", axis="Y", offset=40.0, keep="＋側を残す"))
+    assert area(mp) == pytest.approx(1000.0) and mp.nodes[:, 1].min() == pytest.approx(40.0)
+    mm = mesh(new_feature("split", axis="Y", offset=40.0, keep="−側を残す"))
+    assert area(mm) == pytest.approx(4000.0) and mm.nodes[:, 1].max() == pytest.approx(40.0)
+
+    def tip(m):
+        inf = m.face_info()
+        root = [f["id"] for f in inf if m.is_edge(f["id"]) and abs(f["centroid"][0]) < 1e-6]
+        end = [f["id"] for f in inf if m.is_edge(f["id"]) and abs(f["centroid"][0] - 100) < 1e-6]
+        r = solve_shell(m, S, [BC("fixed", root), BC("force", end, [0, 0, -10.0])], log=lambda *a: None)
+        return r.u[:, 2].min()
+    assert tip(m2) == pytest.approx(tip(m0), rel=0.01)
