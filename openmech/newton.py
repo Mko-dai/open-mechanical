@@ -10,10 +10,11 @@ class _NotConverged(RuntimeError):
     pass
 
 
-def solve_incremental(internal, commit, F_ext, fixed, ndof, settings, log=print, free_mask=None):
+def solve_incremental(internal, commit, F_ext, fixed, ndof, settings, log=print, free_mask=None, follower=None):
     """internal(u) -> (f_int, K)。commit() で積分点の状態を確定。
 
     荷重は 0 → F_ext、強制変位は 0 → 値 に直線で増やす（サブステップ）。収束しなければ増分を半分に。
+    follower(u) -> 変形後の形で決まる荷重（面に垂直なままの圧力など。全荷重のときの値）。 接線には入れない
     戻り値: u
     """
     cd = np.array(sorted(fixed), dtype=np.int64)
@@ -38,6 +39,8 @@ def solve_incremental(internal, commit, F_ext, fixed, ndof, settings, log=print,
             ue = u0 if pred else u
             fint, K = internal(ue)
             R = F - fint
+            if follower is not None:
+                R = R + t1 * follower(ue)
             if pred and len(cd):
                 R = R - K[:, cd] @ (vals - u0[cd])
             Kff = K[free][:, free].tocsc()
@@ -50,6 +53,8 @@ def solve_incremental(internal, commit, F_ext, fixed, ndof, settings, log=print,
             if it > 1 or True:
                 fint2, _ = internal(u)
                 R2 = F - fint2
+                if follower is not None:
+                    R2 = R2 + t1 * follower(u)
                 ref = max(np.linalg.norm(F[free]), np.linalg.norm(R2[~free]), 0.01)
                 crit = np.linalg.norm(R2[free]) / ref
                 if crit <= tol:

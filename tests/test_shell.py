@@ -127,3 +127,27 @@ def test_shell_large_deflection_membrane_stiffening():
     assert lin == pytest.approx(5 * 10.0 * 100 ** 4 / (384 * 200000.0 * 10 / 12), rel=0.02)     # 単純支持はり
     assert w[1.0] < 0.4 * lin
     assert 1.2 < w[1.0] / w[0.5] < 1.5
+
+
+def test_shell_large_deflection_follower_pressure():
+    """大変形の圧力は変形後の面に垂直なまま（追従荷重）。 片持ちの帯板に一様な圧力 q L³ / (E I) = 1 と 10。
+    小さい荷重では線形の q L⁴ / (8 E I)、大きい荷重では板が巻いて、反力に長さ方向の成分が出る"""
+    from openmech.nonlinear import AnalysisSettings
+    S0 = Material("s", 200000.0, 0.0, 7850.0, 250.0)
+    m = structured_plate(100, 10, 40, 2, 1.0)
+    inf = m.face_info()
+    root = next(f["id"] for f in inf if f.get("edge") and abs(f["centroid"][0]) < 1e-6)
+    surf = next(f["id"] for f in inf if not f.get("edge"))
+    EI = 200000.0 * 10 / 12
+    st = AnalysisSettings(large_deflection=True, initial_substeps=10, max_substeps=100)
+    tn = np.isclose(m.nodes[:, 0], 100)
+    out = {}
+    for k in (1, 10):
+        p = k * EI / 1e6 / 10
+        r = solve_shell(m, S0, [BC("fixed", [root]), BC("pressure", [surf], [p])], settings=st, log=lambda *a: None)
+        out[k] = (r.u[tn, 2].mean() / 100, r.u[tn, 0].mean() / 100, r.reactions[0], p * 1000.0)
+    assert out[1][0] == pytest.approx(-0.125, rel=0.02)
+    assert abs(out[1][2][0]) < 0.2 * out[1][3]                      # まだほとんど真横の力
+    assert -0.86 < out[10][0] < -0.80 and -0.68 < out[10][1] < -0.61
+    assert abs(out[10][2][0]) > 0.7 * out[10][3]                    # 巻いた板にかかる圧力は長さ方向の成分が大きい
+    assert np.hypot(out[10][2][0], out[10][2][2]) < out[10][3]      # 向きがばらけるので、合力は p A より小さい

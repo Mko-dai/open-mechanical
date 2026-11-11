@@ -332,7 +332,7 @@ class ShellCorot:
 
     要素ごとに「いまの向き」の座標系を取り直し、剛体の動きを除いた変形（膜の伸びと、節点の回転のうち
     要素の回転を引いた残り）にだけ線形の要素剛性を使う。 接線には膜力による幾何剛性を足す（張ると硬く、押すと座屈）。
-    節点の回転の自由度は回転ベクトル。 荷重は向きが変わらないもの（追従しない）"""
+    節点の回転の自由度は回転ベクトル"""
 
     def __init__(self, mesh, t, Dp):
         self.mesh = mesh
@@ -618,9 +618,29 @@ def solve_shell(mesh: ShellMesh, material, bcs: list[BC], elem_materials=None, l
     if large:
         from .newton import solve_incremental
         co = ShellCorot(mesh, t, Dp)
-        log("  大変形（共回転の定式化）: 荷重は向きが変わらないものとして扱います")
-        u = solve_incremental(co.internal, co.commit, F, fixed, nd, settings, log, free_mask=used)
+        # 圧力は変形後の面に垂直にかけ続ける（追従荷重、Ansys と同じ）。 力・重力は向きが変わらない
+        pe = np.zeros(mesh.n_elems)
+        for bc in bcs:
+            if bc.kind == "pressure":
+                for fid in bc.faces:
+                    if not mesh.is_edge(fid):
+                        pe[mesh.face_ids == int(fid)] += float(bc.values[0])
+        follower = None
+        if np.any(pe != 0):
+            F, fixed = shell_constraints(mesh, [b for b in bcs if b.kind != "pressure"], mats, elem_mat, A, normals)
+            tdof = (6 * mesh.elems[:, :, None] + np.arange(3)).reshape(-1)
+
+            def follower(uu):
+                xe = (mesh.nodes + uu.reshape(-1, 6)[:, :3])[mesh.elems]
+                fn = -pe[:, None] * np.cross(xe[:, 1] - xe[:, 0], xe[:, 2] - xe[:, 0]) / 6.0      # −p A n / 3
+                out_ = np.zeros(nd)
+                np.add.at(out_, tdof, np.repeat(fn[:, None, :], 3, axis=1).ravel())
+                return out_
+        log("  大変形（共回転の定式化）: 圧力は変形後の面に垂直（追従）、力・重力は向きが変わりません")
+        u = solve_incremental(co.internal, co.commit, F, fixed, nd, settings, log, free_mask=used, follower=follower)
         fint, K = co.internal(u)
+        if follower is not None:
+            F = F + follower(u)
         R = co.Rc                                   # 応力はいまの向きの座標系で求めて全体座標へ
         em = np.einsum("eij,ej->ei", co.Bm, co.dl[:, _MEMR])
         kap = np.einsum("eij,ej->ei", _dkt_B(xy, 1 / 3, 1 / 3), co.dl[:, _BEN])
