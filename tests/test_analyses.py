@@ -402,3 +402,25 @@ def test_stress_linearization():
     assert max(rows["ピーク"]["始点 [MPa]"], rows["ピーク"]["終点 [MPa]"]) < 0.05 * (sm + sb)
     with pytest.raises(ValueError):
         linearize_stress(m, r.stress, [x, b / 2, -5.0], [x, b / 2, t + 5.0])
+
+
+def test_arc_length_with_remote_force():
+    """弧長法＋リモート荷重（追加の自由度と多点拘束）: 柱の座屈後のつり合い経路が、面への力で与えたときと同じ"""
+    from openmech.nonlinear import AnalysisSettings, solve_static
+    E, L, b = 200000.0, 100.0, 4.0
+    mat = Material("s", E, 0.3, 7850, 1e9)
+    m = structured_box(L, b, b, 30, 2, 2).to_quadratic()
+    Pe = np.pi ** 2 * E * (b ** 4 / 12) / (4 * L ** 2)
+    st = AnalysisSettings(large_deflection=True, arc_length=True, arc_initial=0.1, arc_max_steps=200,
+                          arc_max_load=0.56, arc_growth=40)
+    tip = np.argmin(np.linalg.norm(m.nodes - [L, b / 2, b / 2], axis=1))
+    out = {}
+    for kind in ("force", "remote"):
+        load = (BC("force", [1], [-2 * Pe, 0.0, -2e-3 * Pe]) if kind == "force" else
+                BC("remote_force", [1], [-2 * Pe, 0.0, -2e-3 * Pe, 0, 0, 0], point=[L, b / 2, b / 2]))
+        rs = solve_static(m, mat, [BC("fixed", [0]), load], settings=st, log=lambda *a: None)
+        assert rs[-1].time == pytest.approx(0.56, rel=2e-3)
+        out[kind] = (np.array([r.time for r in rs]), np.array([-r.u[tip, 2] / L for r in rs]))
+    assert out["force"][1][-1] > 0.3                         # 座屈して大きくたわんでいる
+    for lam in (0.52, 0.54, 0.56):
+        assert np.interp(lam, *out["remote"]) == pytest.approx(np.interp(lam, *out["force"]), rel=0.03)

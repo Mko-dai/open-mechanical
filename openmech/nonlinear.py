@@ -450,7 +450,7 @@ def solve_static(mesh: Mesh, material: Material, bcs: list[BC], contacts: list[C
         return Kc, fc
 
     # 多点拘束の変換 u = T ũ（独立自由度 ũ）。収束の判定もこの独立自由度の残差 Tᵀ R で行う
-    Tm0 = None
+    Tm0 = Tm0T = free_r = _newidx = None
     if ex is not None and ex.mpc:
         from .remote import reduce_system as _rs
         Tm0 = _rs(sp.identity(ndof, format="csr"), np.zeros(ndof), {}, ex, 1.0)[3]
@@ -777,15 +777,23 @@ def _arc_length(c):
     s, log, mesh = c["settings"], c["log"], c["mesh"]
     ends, free, nb, ndof = c["ends"], c["free"], c["nb"], c["ndof"]
     pairs, contacts, ps, LD, W = c["pairs"], c["contacts"], c["ps"], c["LD"], c["W"]
-    if c["ex"] is not None:
-        raise ValueError("弧長法は、リモート境界条件・ジョイント・ビーム接続とはまだ組み合わせられません")
+    # リモート境界条件・ばね・ビーム接続など（追加の自由度）: ばねの剛性は W に入っている。
+    # 多点拘束（剛体のリモートポイントなど）は u = T q で消去した式で解く
+    Tm = c["Tm0"]
+    if Tm is not None:
+        TmT, free_r = c["Tm0T"], c["free_r"]
+        nk = np.asarray(c["_newidx"])[c["cdofs"]]
+        if np.any(nk < 0):
+            raise ValueError("弧長法は、変形可のリモート変位（従属する面の拘束）とはまだ組み合わせられません")
     nlc = bool(pairs) and any(k.nonlinear for k in contacts)      # 開閉・摩擦のある接触: 反復ごとに状態を更新する
     pen_tol, save_st, load_st = c["pen_tol"], c["save_pair_state"], c["load_pair_state"]
     c["cur_t"][0] = ends[-1]
     Fref, fixed = c["loads_at"](ends[-1])
     if any(abs(v) > 0 for v in fixed.values()):
         raise ValueError("弧長法では 0 以外の強制変位は使えません（力・圧力・重力で荷重を与えてください）")
-    if not np.any(Fref[free]):
+    def rnorm(R):
+        return float(np.linalg.norm(R[free])) if Tm is None else float(np.linalg.norm((TmT @ R)[free_r]))
+    if rnorm(Fref) == 0:
         raise ValueError("弧長法には荷重（力・圧力など）が必要です")
     Kc, fc = (c["_contact"](np.zeros(ndof)) if pairs else (None, 0.0))
     internal = c["internal"]
@@ -803,6 +811,14 @@ def _arc_length(c):
         return R, Kt
 
     def solver(Kt):
+        if Tm is not None:
+            lur = splu((TmT @ Kt @ Tm).tocsc()[free_r][:, free_r])
+
+            def solr(b):
+                q = np.zeros(len(free_r))
+                q[free_r] = lur.solve((TmT @ b)[free_r])
+                return Tm @ q
+            return solr
         lu = splu(Kt[free][:, free].tocsc())
 
         def sol(b):
@@ -811,7 +827,7 @@ def _arc_length(c):
             return x
         return sol
 
-    fn = float(np.linalg.norm(Fref[free]))
+    fn = rnorm(Fref)
     u, lam, dl, dl0, du_prev = np.zeros(ndof), 0.0, None, None, None
     lam_peak, results, hist = 0.0, [], []
     t0 = time.time()
@@ -837,7 +853,7 @@ def _arc_length(c):
                 nchg = update_states(pairs, contacts, (u + Du)[:nb], al_update=False, pen_tol=pen_tol)[0] if nlc else 0
                 Rk, Ktk = resid(u + Du, lam + Dl)
                 ref = max(max(abs(lam + Dl), lam_peak) * fn, 1e-2)
-                if it > 1 and nchg == 0 and np.linalg.norm(Rk[free]) <= s.force_convergence * ref:
+                if it > 1 and nchg == 0 and rnorm(Rk) <= s.force_convergence * ref:
                     ok = True
                     break
                 sol = solver(Ktk)
@@ -879,7 +895,7 @@ def _arc_length(c):
             ps.commit()
         umax = float(np.abs(u[:nb]).max())
         hist.append({"時間": round(lam, 6), "反復": it, "荷重係数": float(lam), "最大変位 [mm]": umax,
-                     "力の残差比": float(np.linalg.norm(Rk[free]) / ref), "変位の変化比": 0.0,
+                     "力の残差比": rnorm(Rk) / ref, "変位の変化比": 0.0,
                      "接触状態の変化": 0, "最大貫通 [mm]": 0.0})
         log(f"  弧長法 {step}: 荷重係数 {lam:.5g} / 最大変位 {umax:.5g} mm / 反復 {it}")
         rr = _make_result(mesh, c["mats"], c["elem_mat"], c["D"], u[:nb], c["bcs"], per_bc, lam * Fref[:nb], pairs,
