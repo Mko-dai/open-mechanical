@@ -22,7 +22,11 @@ def main(argv=None):
     f = sub.add_parser("faces", help="メッシュを作って面の一覧を表示")
     f.add_argument("project")
     sub.add_parser("gui", help="GUI を起動")
+    c = sub.add_parser("selfcheck", help="必要なライブラリがそろっていて、メッシュと解析が動くかを確かめる")
+    c.add_argument("--out", default="")
     a = ap.parse_args(argv)
+    if a.cmd == "selfcheck":
+        return selfcheck(a.out)
 
     if a.cmd in (None, "gui"):
         from .gui.app import main as gui_main
@@ -46,6 +50,48 @@ def main(argv=None):
         print(f"{k}: {v:.5g}" if isinstance(v, float) else f"{k}: {v}")
     print(f"結果を {a.out}/ に保存しました（result.vtu, result.csv, report.html）")
     return 0
+
+
+def selfcheck(out=""):
+    """配布版の動作確認: ライブラリの読み込み、メッシュ作成、片持ちはりの解析（式と比べる）。 結果を out にも書く"""
+    import traceback
+    lines, code = [], 0
+    try:
+        import gmsh
+        import numpy as np
+        import pyamg
+        import pyvista
+        import pyvistaqt  # noqa: F401
+        import scipy
+        from PySide6 import QtCore, QtWidgets  # noqa: F401
+        lines.append(f"Python {sys.version.split()[0]} / numpy {np.__version__} / scipy {scipy.__version__} / "
+                     f"gmsh {gmsh.__version__} / Qt {QtCore.qVersion()} / pyvista {pyvista.__version__} / "
+                     f"pyamg {pyamg.__version__}")
+        from .geometry import build_mesh, new_feature
+        from .materials import Material
+        from .solver import BC, solve
+        m = build_mesh({"kind": "model", "features": [new_feature("box", dx=100.0, dy=20.0, dz=20.0)]}, size=5.0,
+                       log=lambda *x: None)
+        inf = m.face_info()
+        lo = min(inf, key=lambda f: f["centroid"][0])["id"]
+        hi = max(inf, key=lambda f: f["centroid"][0])["id"]
+        r = solve(m, Material("steel", 200000.0, 0.3, 7850.0, 250.0),
+                  [BC("fixed", [lo]), BC("force", [hi], [0.0, 0.0, -1000.0])], log=lambda *x: None)
+        w, ref = float(-r.u[:, 2].min()), 1000.0 * 100.0 ** 3 / (3 * 200000.0 * 20.0 ** 4 / 12)
+        lines.append(f"メッシュ 節点 {m.n_nodes:,} / 片持ちはりのたわみ {w:.5f} mm（はりの式 {ref:.5f}）")
+        if abs(w / ref - 1) > 0.05:
+            raise RuntimeError("解析の答えが式と合いません")
+        from .gui import app as _gui  # noqa: F401    画面の部品が読み込めること
+        lines.append("OK")
+    except Exception:
+        lines.append("NG\n" + traceback.format_exc())
+        code = 1
+    text = "\n".join(lines)
+    print(text)
+    if out:
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+    return code
 
 
 if __name__ == "__main__":

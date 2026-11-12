@@ -5745,6 +5745,8 @@ def _setup_crash_log():
     """異常終了したときの原因を logs/crash.log に残す"""
     import faulthandler
     d = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "logs")
+    if getattr(sys, "frozen", False):          # 配布版: 実行ファイルの中には書けないので、ホームのフォルダへ
+        d = os.path.join(os.path.expanduser("~"), "open-mechanical", "logs")
     os.makedirs(d, exist_ok=True)
     f = open(os.path.join(d, "crash.log"), "a", buffering=1)
     f.write(f"\n=== 起動 {datetime.datetime.now():%Y-%m-%d %H:%M:%S}  Python {sys.version.split()[0]} ===\n")

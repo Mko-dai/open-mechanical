@@ -1,0 +1,59 @@
+# 配布版（インストール不要）を作って Releases に置く。 自動テストではありません。
+# 手動で実行（Actions → 配布版を作る → Run workflow）するか、v で始まるタグを付けたときだけ動きます。
+name: 配布版を作る
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows
+          - os: macos-latest
+            name: mac-apple-silicon
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: ライブラリを入れる
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy scipy gmsh PySide6 pyvista pyvistaqt pyamg threadpoolctl pyinstaller
+      - name: 配布版を作る
+        run: pyinstaller packaging/open-mechanical.spec --noconfirm
+      - name: 動作確認（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist\open-mechanical\open-mechanical.exe" -ArgumentList "selfcheck","--out","$PWD\selfcheck.txt" -Wait -PassThru
+          Get-Content selfcheck.txt
+          if ($p.ExitCode -ne 0) { exit 1 }
+          Compress-Archive -Path dist\open-mechanical -DestinationPath open-mechanical-windows.zip
+      - name: 動作確認（Mac）
+        if: runner.os == 'macOS'
+        run: |
+          dist/open-mechanical.app/Contents/MacOS/open-mechanical selfcheck --out "$PWD/selfcheck.txt" || (cat selfcheck.txt; exit 1)
+          cat selfcheck.txt
+          ditto -c -k --sequesterRsrc --keepParent dist/open-mechanical.app open-mechanical-mac-apple-silicon.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: open-mechanical-${{ matrix.name }}
+          path: open-mechanical-*.zip
+      - name: Releases に置く
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'dist-latest' }}"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "配布版 ($TAG)" \
+            --notes "インストール不要の配布版です。zip を展開して open-mechanical を起動してください。Windows は open-mechanical.exe、Mac は open-mechanical.app（初回は右クリック →「開く」）。" \
+            --target "${{ github.sha }}" || true
+          gh release upload "$TAG" open-mechanical-*.zip --clobber
