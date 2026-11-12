@@ -29,6 +29,17 @@ Ansys Mechanical の代わりに使える、**無料の静的構造解析ソフ�
 - **.x_t / .x_b（Parasolid）**：Siemens の独自形式で、無償で読めるライブラリが存在しません。
   CAD から **STEP** で書き出して読み込んでください（CAD の面がそのまま選択できます）。
 
+## 配布版（インストール不要）
+
+Python やライブラリを入れられない PC 向けに、すべてを 1 つにまとめた配布版があります。
+
+- 置き場所: GitHub の [Releases「配布版 (dist-latest)」](https://github.com/Mko-dai/open-mechanical/releases/tag/dist-latest)
+- Windows: `open-mechanical-windows.zip` を展開して `open-mechanical.exe` を起動
+- Mac（Apple シリコン）: `open-mechanical-mac-apple-silicon.zip` を展開して `open-mechanical.app` を右クリック →「開く」
+- 作り直し: GitHub の Actions →「配布版を作る」→ Run workflow（手動で実行したときだけ動きます。自動テストではありません）
+- 動作確認: `open-mechanical.exe selfcheck --out check.txt`（ライブラリの読み込み・メッシュ・片持ちはりの解析を確かめて結果を書き出す）
+- 署名はしていないので、初回の起動時に OS の警告が出ます。異常終了の記録はホームの `open-mechanical/logs/crash.log`
+
 ## そのあと追加した機能と、画面のどこにあるか
 
 上の表は最初の版のものです。その後に入った機能を、使う場所ごとにまとめます。
